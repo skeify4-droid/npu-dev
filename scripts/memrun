@@ -1,0 +1,19 @@
+#!/bin/bash
+# Run a heavy job under /usr/bin/time -l and log its peak RSS and wall time.
+# Usage: scripts/memrun <logname> <command...>
+#   Log goes to $EDA_HOME/logs/<logname>.mem.log and the job's stdout/stderr to <logname>.log
+#   (both under logs/ in the repo if EDA_HOME is unset, so they stay with the project).
+set -uo pipefail
+[ $# -ge 2 ] || { echo "usage: $0 <logname> <command...>"; exit 2; }
+NAME=$1; shift
+LOGDIR=${MEMRUN_LOGDIR:-$(cd "$(dirname "$0")/.." && pwd)/logs}
+mkdir -p "$LOGDIR"
+OUT="$LOGDIR/$NAME.log"; MEM="$LOGDIR/$NAME.mem.log"
+/usr/bin/time -l "$@" >"$OUT" 2>"$MEM.tmp"
+RC=$?
+RSS=$(awk '/maximum resident set size/ {printf "%.3f", $1/1073741824}' "$MEM.tmp")
+WALL=$(awk '/ real / {print $1}' "$MEM.tmp")
+{ echo "name=$NAME rc=$RC wall_s=$WALL peak_rss_GB=$RSS"; echo "cmd=$*"; } | tee "$MEM"
+grep -v -E '^\s+[0-9.]+ real|maximum resident|^\s+[0-9]+\s+(page|involuntary|voluntary|swaps|block|messages|signals)' "$MEM.tmp" >>"$OUT"
+rm -f "$MEM.tmp"
+exit $RC

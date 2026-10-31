@@ -51,8 +51,8 @@ Measured from `/Volumes/EVO970PLUS/claude/env_setup`:
    VM uses it, so native jobs get the RAM back when the VM is idle. If macOS starts swapping during P&R, lower the cap to 10 GB.
 2. Verilator: `-j 4`, `--output-split 20000`, `-O1` for `MID`. Trace only selected scopes (`--trace-fst` plus
    `$dumpvars` on a scope). Never build `FULL`.
-3. Yosys: synthesize each leaf once with `hierarchy` kept. Flatten only up to the cell count Phase 0
-   calibration shows to be safe (expected roughly 0.3–0.5 M cells for 6 GB; to be measured).
+3. Yosys: synthesize each leaf once with `hierarchy` kept. Measured in Phase 0 (`docs/reports/capacity.md`): flat
+   synthesis peaks at about 5 GB for 0.9 M cells (32×32 MAC array), so the flat cap is about 0.9 M cells. P&R in the VM peaks at 5.9 GB for a 16×16 array (0.27 mm², Nangate45), so the P&R block cap is about 230 k cells.
 4. Perf simulator: stream traces to disk (zstd). Keep RSS ≤ 4 GB. Aggregate on the fly.
 5. LLM workloads use **only `config.json`** (layer shapes). Weights are never downloaded.
 
@@ -212,7 +212,7 @@ start until they are met.
 - Yosys (native, on sv2v output) with ASAP7 and Nangate45 liberty: every leaf at real size where it fits
   (PE, VPU lane, router, DMA, HBM controller logic, sequencer). Arrays are synthesized at 8×8 / 16×16 / 32×32 and extrapolated.
 - ORFS P&R in the VM (12 GB cap) on selected blocks. Phase 0 calibration sets the largest block size that fits:
-  1. PE cluster 16×16, or 32×32 if calibration shows it fits (the main compute density and Fmax evidence)
+  1. PE cluster 16×16 (calibrated: 13.7 min and 5.9 GB in the 12 GB VM; 32×32 extrapolates to over 14 GB and is out; the main compute density and Fmax evidence)
   2. Scratchpad bank: logic plus `fakeram7_*` macros (new sizes from `fakeram.cfg`)
   3. NoC router
   4. VPU lane slice

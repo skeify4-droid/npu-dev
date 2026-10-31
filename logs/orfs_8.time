@@ -1,0 +1,23 @@
+	Command being timed: "make -C /Volumes/EVO970PLUS/eda/orfs/flow YOSYS_EXE=/Volumes/EVO970PLUS/eda/yosys-linux/bin/yosys OPENROAD_EXE=/Volumes/EVO970PLUS/eda/openroad/bin/openroad DESIGN_CONFIG=/Volumes/EVO970PLUS/claude/npu-dev/syn/orfs/pe_pr_8.mk WORK_HOME=/Volumes/EVO970PLUS/claude/npu-dev/work/orfs_8"
+	User time (seconds): 823.96
+	System time (seconds): 7.06
+	Percent of CPU this job got: 440%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:08.85
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2418096
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 2066
+	Minor (reclaiming a frame) page faults: 1430077
+	Voluntary context switches: 1064227
+	Involuntary context switches: 213867
+	Swaps: 0
+	File system inputs: 810424
+	File system outputs: 1387799
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

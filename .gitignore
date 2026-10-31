@@ -1,0 +1,15 @@
+.DS_Store
+build/
+work/
+*.vcd
+*.fst
+*.fst.hier
+obj_dir/
+syn/results/
+sim/perf/build/
+__pycache__/
+.pytest_cache/
+*.pyc
+logs/*.log
+logs/*.mem.log
+syn/gen/
