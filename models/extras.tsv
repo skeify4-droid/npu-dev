@@ -1,0 +1,5 @@
+slug	kind	path
+mimo_v2_6_flash	drafter	dflash/config.json
+mimo_v2_6_pro	drafter	dflash/config.json
+minimax_m3_1_flash	drafter	dspark/config.json
+mistral_large_4	params	params.json

@@ -12,7 +12,7 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
 - Work directories for OpenROAD must be on the SSD (`/Volumes/EVO970PLUS/...`), not `/tmp`.
 
 ## Tools
-- Lint: `make lint`. Unit: `make unit`. Formal: `make formal`. Synthesis: `make syn BLOCK=<module>`.
+- Lint: `make lint`. Unit: `make unit`. Python tests: `make pytest`. Model descriptors: `make models` (`make fetch-models` needs network). Formal: `make formal`. Synthesis: `make syn BLOCK=<module>`.
 - Simulator (Icarus) and Verilator run on macOS. Yosys and Icarus take `sv2v` output for complex SV.
 - OpenROAD: `eda-run` / `orfs-make` (VM). Do not change the pinned OpenROAD/ORFS/Yosys commits.
 
@@ -28,3 +28,7 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
 
 ## Git
 - Commit only when asked. Keep `logs/` and `build/` out of git.
+
+## Models
+- `models/configs/` are HF snapshots, `models/descriptors/` and `docs/reports/model_survey.md` are generated (`make models`). Don't edit them by hand; change `sw/npumodel/ingest.py`.
+- Schema: `docs/spec/model_descriptor.md`. What was verified beyond config.json: `docs/reports/model_features.md`. Hyper-connection / gather requirements: `docs/spec/hyper_connections.md`. A new model needs an adapter in `ingest.py` plus a row in `models/repos.tsv`.

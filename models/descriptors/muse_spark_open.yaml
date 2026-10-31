@@ -1,0 +1,80 @@
+schema_version: 1
+name: Muse Spark Open
+slug: muse_spark_open
+hf_repo: unsloth/Muse-Spark-Open-816B-A42B
+config_sha256: 4e91fd887cd1f61e
+arch:
+  model_type: muse_spark
+  architectures: [MuseSparkForConditionalGeneration]
+dims: {hidden: 8192, vocab: 202048, n_layers: 62, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: 20.0,
+  encoder_layers: null}
+weights:
+  total_bytes: 1644333137920
+  dtypes: {expert: bf16, dense: bf16, embed: bf16, table: bf16}
+  notes: BF16 as published; weights fetched from the unsloth mirror (original repo is gated).
+attn_types:
+  swa: {kind: gqa, n_heads: 128, n_kv_heads: 16, head_dim: 64, rope_dim: 64, out_gate: elem, qk_norm: true,
+    window: 2048}
+  full: {kind: gqa, n_heads: 128, n_kv_heads: 16, head_dim: 64, rope_dim: 64, out_gate: elem, qk_norm: true}
+ffn_types:
+  moe:
+    kind: moe
+    n_experts: 256
+    top_k: 8
+    d_expert: 4096
+    n_shared: 0
+    d_shared: 0
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true, routed_scale: 1.0, d_in: 4096}
+    d_in: 4096
+layers:
+- {n: 1, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+mtp: null
+drafter: null
+extras: {}
+published: {total_b: 816, active_b: 42, source: README}
+sources: [transformers modeling_muse_spark.py, README]
+flags:
+- {id: narrow_expert_width, severity: warn, detail: Experts run at moe_hidden_size=4096 (model dim 8192)
+    behind pre/post projections with a centered RMSNorm.}
+- {id: published_bf16, severity: warn, detail: Only BF16 weights are published (1.64 TB); FP8/FP4 deployment
+    needs our own quantization.}
+- {id: router_sigmoid_bias, severity: info, detail: Router is sigmoid(logits x output_multiplier) with
+    a selection-only correction bias and normalized top-k (confirmed in transformers modeling_muse_spark.py).}
+- {id: residual_gate, severity: info, detail: 'Learned per-channel residual gates (alpha*x + beta*f(x),
+    temperature 0.3) replace the plain residual add.'}
+- {id: custom_scaling, severity: info, detail: 'Unit-scale QK norm x 5.473, elementwise sigmoid output
+    gate with output norm, logit soft-cap 20.0.'}
+- {id: modalities, severity: info, detail: Vision/audio towers excluded.}
+derived: {params_total_b: 820.0, params_active_b: 44.4, params_expert_b: 798.9, params_table_b: 0.0, expected_weight_gb: 1640.0,
+  published_weight_gb: 1644.3, weight_check_ratio: 0.997, published_total_ratio: 1.005, published_active_ratio: 1.058}

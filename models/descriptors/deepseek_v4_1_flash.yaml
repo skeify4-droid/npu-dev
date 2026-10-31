@@ -1,0 +1,194 @@
+schema_version: 1
+name: DeepSeek V4.1 Flash
+slug: deepseek_v4_1_flash
+hf_repo: deepseek-ai/DeepSeek-V4.1-Flash
+config_sha256: 8be45ce0476004a3
+arch:
+  model_type: deepseek_v41
+  architectures: [DeepseekV41ForCausalLM]
+dims: {hidden: 5120, vocab: 129280, n_layers: 40, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: 20}
+weights:
+  total_bytes: 510286023000
+  dtypes: {expert: mxfp4, dense: fp8, embed: bf16, table: mxfp8, hc: fp32}
+  notes: Dense FP8 (32x32 UE8M0 scales), experts FP4 (scale per 32), Engram FP8 (scale per 32); mHC weights
+    FP32.
+attn_types:
+  swa: {kind: gqa, n_heads: 64, n_kv_heads: 1, head_dim: 512, kv_k_eq_v: true, rope_dim: 64, q_lora_rank: 1280,
+    o_lora_rank: 1024, o_groups: 8, window: 128, window_dtype: fp8}
+  csa_r2_full:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 1
+    head_dim: 512
+    kv_k_eq_v: true
+    rope_dim: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    window: 128
+    window_dtype: fp8
+    kv_compress_ratio: 2
+    kv_role: own
+    kv_dtype: nvfp4
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 512, index_role: own, key_dtype: mxfp4,
+      q_in: 1280, k_in: 512}
+  csa_r2_reuse:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 1
+    head_dim: 512
+    kv_k_eq_v: true
+    rope_dim: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    window: 128
+    window_dtype: fp8
+    kv_compress_ratio: 2
+    kv_role: reuse
+    kv_dtype: nvfp4
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 512, index_role: reuse, key_dtype: mxfp4,
+      q_in: 1280, k_in: 512}
+  csa_r1_full:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 1
+    head_dim: 512
+    kv_k_eq_v: true
+    rope_dim: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    window: 128
+    window_dtype: fp8
+    kv_compress_ratio: 1
+    kv_role: own
+    kv_dtype: nvfp4
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 512, index_role: own, key_dtype: mxfp4,
+      q_in: 1280, k_in: 512}
+  csa_r1_reuse:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 1
+    head_dim: 512
+    kv_k_eq_v: true
+    rope_dim: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    window: 128
+    window_dtype: fp8
+    kv_compress_ratio: 1
+    kv_role: reuse
+    kv_dtype: nvfp4
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 512, index_role: reuse, key_dtype: mxfp4,
+      q_in: 1280, k_in: 512}
+  csa_r1_reindex:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 1
+    head_dim: 512
+    kv_k_eq_v: true
+    rope_dim: 64
+    q_lora_rank: 1280
+    o_lora_rank: 1024
+    o_groups: 8
+    window: 128
+    window_dtype: fp8
+    kv_compress_ratio: 1
+    kv_role: reuse
+    kv_dtype: nvfp4
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 512, index_role: reindex, key_dtype: mxfp4,
+      q_in: 1280, k_in: 512, candidate_pool: 16384}
+ffn_types:
+  moe:
+    kind: moe
+    n_experts: 384
+    top_k: 6
+    d_expert: 2304
+    n_shared: 1
+    d_shared: 2304
+    router: {scoring: sqrtsoftplus, correction_bias: true, norm_topk: true, routed_scale: 1.5}
+  moe_dspark:
+    kind: moe
+    n_experts: 128
+    top_k: 3
+    d_expert: 2304
+    n_shared: 1
+    d_shared: 2304
+    router: {scoring: sqrtsoftplus, correction_bias: true, norm_topk: true, routed_scale: 1.5}
+layers:
+- {n: 2, attn: swa, ffn: moe}
+- {n: 1, attn: csa_r2_full, ffn: moe}
+- {n: 5, attn: csa_r2_reuse, ffn: moe}
+- {n: 1, attn: csa_r2_full, ffn: moe}
+- {n: 5, attn: csa_r2_reuse, ffn: moe}
+- {n: 1, attn: csa_r2_full, ffn: moe}
+- {n: 5, attn: csa_r2_reuse, ffn: moe}
+- {n: 1, attn: csa_r1_full, ffn: moe}
+- {n: 3, attn: csa_r1_reuse, ffn: moe}
+- {n: 1, attn: csa_r1_reindex, ffn: moe}
+- {n: 3, attn: csa_r1_reuse, ffn: moe}
+- {n: 1, attn: csa_r1_reindex, ffn: moe}
+- {n: 3, attn: csa_r1_reuse, ffn: moe}
+- {n: 1, attn: csa_r1_reindex, ffn: moe}
+- {n: 3, attn: csa_r1_reuse, ffn: moe}
+- {n: 1, attn: csa_r1_reindex, ffn: moe}
+- {n: 3, attn: csa_r1_reuse, ffn: moe}
+mtp: {n_layers: 3, attn: swa, ffn: moe_dspark}
+drafter: null
+extras:
+  hyper_connections: {variant: mhc_sinkhorn, mult: 4, sinkhorn_iters: 20}
+  tables:
+  - name: engram_L1
+    layer: 1
+    entries: 384006168
+    dim: 256
+    lookups_per_token: 24
+    lookup: hashed_ngram_gather
+    ngram_sizes: [2, 3, 4]
+    proj_params: 157286400
+  - name: engram_L14
+    layer: 14
+    entries: 384016682
+    dim: 256
+    lookups_per_token: 24
+    lookup: hashed_ngram_gather
+    ngram_sizes: [2, 3, 4]
+    proj_params: 157286400
+published: {total_b: 748, active_b: 16, source: 'tech report abstract: 552B backbone + 196B Engram; 16B
+    active in decode, 8B in prefill'}
+sources: [deepseek-ai/DeepSeek-V4.1-Flash/inference/model.py, deepseek-ai/DeepSeek-V4.1-Flash/inference/engram.py,
+  'deepseek-ai/DeepSeek-V4.1-Flash/DeepSeek_V41_Tech_Report.pdf (sec 2.2, 2.3)', 'README: 890 B/token
+    global KV']
+flags:
+- {id: hyper_connections, severity: required, detail: 'mHC with 4 residual streams: per sublayer an fp32
+    [24 x 4d] mixing projection, Sinkhorn (20 iters on a 4x4 matrix), pre-collapse and post-expand. The
+    coefficients computed by one sublayer are consumed by the next (Single-Pass mHC). See docs/spec/hyper_connections.md.'}
+- {id: engram_tables, severity: required, detail: 'Hashed n-gram embedding on layers [1, 14]: 24 FP8 rows
+    of 256 per token per layer from a 768 M-row table (197 G elements, MXFP8), then a linear projection
+    and a per-stream sigmoid gate into the residual. Needs a hashed-gather DMA.'}
+- {id: causal_encoder_decoder, severity: required, detail: 'CED: layers 0..19 are the encoder, 20..39
+    the decoder. Prefill runs only the encoder (8B active vs 16B in decode); decoder global KV is projected
+    from the encoder''s last hidden state; decoder SWA KV is rebuilt by replaying only the last 128 prompt
+    tokens (SWA Bounded Replay). The scheduler and compiler need per-phase layer ranges.'}
+- {id: csa2_modes, severity: required, detail: 'Every attention layer attends over a 128-token raw window
+    plus top-512 entries of the global cache. Full layers (ids [2, 8, 14, 20]) build the cache and the
+    indexer; Reindex layers (ids [24, 28, 32, 36]) rescore the shared index keys with their own query;
+    Reuse layers read the previous top-k. Reindex layers only search a 16384-position candidate pool (Hierarchical
+    Sparse Indexer).'}
+- {id: fp4_kv_cache, severity: required, detail: 'Global KV is FP4 E2M1 with an E4M3 scale per 16 channels
+    (0.5625 B/element); indexer K/Q are FP4 with an E8M0 scale per 32; the 128-token window stays FP8.
+    890 B of global KV per token, reproduced by this descriptor.'}
+- {id: dspark_in_weights, severity: warn, detail: '3 DSpark draft layers are in the main weights (128
+    experts, top-3, FP4), block size 5, with a Markov head and a confidence head. Modeled as MTP layers;
+    the draft/verify schedule is not.'}
+- {id: router_sqrtsoftplus, severity: info, detail: Router score = sqrt(softplus(logit)); a bias selects
+    experts but does not scale them; top-k weights normalized then x1.5.}
+- {id: mqa_kv_equals_v, severity: info, detail: 'MQA with one 512-wide KV head; K and V are the same vector.
+    Grouped low-rank output projection (o_lora 1024, 8 groups).'}
+- {id: vision_tower, severity: info, detail: Vision tower excluded (text decode only).}
+derived: {params_total_b: 762.7, params_active_b: 16.9, params_expert_b: 557.2, params_table_b: 196.6,
+  expected_weight_gb: 509.1, published_weight_gb: 510.3, weight_check_ratio: 0.998, params_active_prefill_b: 7.6,
+  published_total_ratio: 1.02, published_active_ratio: 1.058}

@@ -103,16 +103,30 @@ hard requirement, not an extra.
 
 ### 2.3 LLM features the hardware and compiler must support
 
-These come from the predecessor families of the target models. **I could not verify the exact configs of the
-listed releases; several are newer than my training data.** Phase 1 step 1 reads each model's `config.json`
-before any of this is frozen.
+Phase 1 step 1 read each model's `config.json`, then its published code, README and technical report where they exist
+(`docs/reports/model_features.md`, `docs/reports/model_survey.md`). The list below is what the 11 real models need,
+not what their predecessors needed. Descriptors are checked against the published weight sizes (within 6%) and
+parameter counts (within 5%).
 
 - MoE: top-k routing, shared experts, fine-grained experts (DeepSeek, GLM, Ling, Qwen3-Next, Mistral Large lines).
   The design needs fast top-k in the VPU, a gather/scatter DMA, and expert-parallel all-to-all.
-- Attention variants: GQA; MLA (latent KV compression and weight absorption, DeepSeek line); sparse/indexer attention
-  (DeepSeek V3.2 DSA-style top-k token selection); linear/recurrent hybrids (Qwen3-Next Gated DeltaNet, MiniMax
-  lightning attention); sliding-window hybrids (MiMo line); Step-3 MFA.
-- Multi-token prediction / speculative decode heads (DeepSeek, GLM, MiMo lines).
+- Attention variants (as found in the real configs): GQA/MQA; MLA with weight absorption (GLM, Ling, Mistral); sparse attention with an
+  indexer (DeepSeek CSA2, GLM DSA, Mistral, Step, Qwen QSA) or block top-k (MiniMax MSA); linear attention (KDA in Ling and GLM-Flash,
+  Gated DeltaNet in Qwen); sliding-window hybrids (MiMo, Step, Muse, DeepSeek's 128-token window).
+- Multi-token prediction / speculative decode: MTP layers inside the weights (DeepSeek DSpark layers, GLM, Step, Ling, Qwen,
+  MiMo's dense MTP) and separate draft models (MiMo DFlash, MiniMax DSpark, Mistral DSpark). Draft/verify schedules are
+  Phase 1 sweep parameters.
+- **Hyper-connections (decided: supported).** DeepSeek V4.1 Flash and GLM-5.3-Flash run mHC (4 residual streams, an fp32
+  `[24 x 4d]` mixer and a 20-iteration Sinkhorn per sublayer); Qwen3.8-Flash-Next runs a different gated low-rank mixer that
+  costs 9.5% of its decode compute. Requirements: residual stream resident on-chip, fused `HC_*` tile ops, Sinkhorn on the VPU/SFU,
+  a mixer-precision experiment, and 80 small all-reduces per step under tensor parallelism. See `docs/spec/hyper_connections.md`.
+- **Hashed n-gram gather (decided: supported).** DeepSeek Engram (24 FP8 rows per token on 2 layers, a 197 G-element table) and Qwen's
+  n-gram embedding (16 BF16 rows, a 51 G-element table). Indices depend on token ids only, so they are computed on the host/CP and
+  the gather is prefetched; the DMA needs a `GATHER_ROWS` mode with unaligned rows and MXFP8 dequantization. The tables are the
+  main capacity cost (DeepSeek's alone exceeds one die's HBM).
+- **KV cache variety.** DeepSeek V4.1: FP4 global KV, MQA with K = V, CSA2 modes (Full / Reindex / Reuse), a hierarchical indexer and a
+  causal encoder-decoder split (prefill runs 20 of 40 layers): 890 B of global KV per token. Mistral shares one MLA latent cache across
+  the last 9 NoPE layers. Linear-attention layers (KDA, Gated DeltaNet in 4 of 11 models) have constant-size state instead of KV.
 - Long context (128K–1M): paged KV cache, so the DMA needs page-table-indirect addressing.
 - Norms and activations: RMSNorm, SwiGLU, RoPE (incl. partial/YaRN), softmax with online max (FlashAttention-style tiling).
 
@@ -155,10 +169,11 @@ start until they are met.
 - Exit: `make lint unit` green on a trivial block. Calibration table in `docs/reports/capacity.md`.
 
 ### Phase 1: Workload characterization and analytical model (M)
-1. Fetch `config.json` for all 11 models (DeepSeek V4.1 Flash, GLM-5.3, GLM-5.3-Flash, MiMo-V2.6-Pro, MiMo-V2.6-Flash,
+1. **Done (2026-10-31).** Fetch `config.json` for all 11 models (DeepSeek V4.1 Flash, GLM-5.3, GLM-5.3-Flash, MiMo-V2.6-Pro, MiMo-V2.6-Flash,
    Ling 3.1 Flash, MiniMax-M3.1-Flash, Step 5 Preview, Mistral Large 4, Muse Spark Open, Qwen3.8-Flash-Next).
    Normalize them into a descriptor schema: layer pattern, attention type per layer, MoE (E, k, shared, d_ff),
    vocab size, MTP, and dtype of the published weights. Flag any model whose features fall outside the schema.
+   Result: `sw/npumodel`, `models/descriptors/`, `docs/reports/model_survey.md`, `docs/reports/model_features.md`.
 2. Build an op-graph generator for prefill and decode (batch, context length, KV dtype as parameters).
 3. Build a roofline / analytical model: FLOPs, bytes, KV footprint, capacity per die, all-to-all volume per parallelism scheme (TP/EP/PP/DP).
 4. Sweep: stacks/die, dies/package, packages, dtype (FP8 vs MXFP4 weights), batch, context.
@@ -168,8 +183,9 @@ start until they are met.
 
 ### Phase 2: Architecture and micro-architecture spec (M)
 - `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
-  MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE). Decoupled access/execute queues per core.
-- `numerics.md`: FP8/BF16/MXFP4 formats, rounding (RNE), saturation, accumulation order, NaN/Inf policy.
+  MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE; hyper-connection ops HC_MIX / HC_SINKHORN / HC_PRE / HC_POST /
+  HC_GATED_MIX; DMA_GATHER_ROWS with unaligned rows and MXFP8 dequantization). Decoupled access/execute queues per core.
+- `numerics.md`: FP8/BF16/MXFP4/NVFP4 formats, rounding (RNE), saturation, accumulation order, NaN/Inf policy; the hyper-connection mixer-precision experiment.
 - `memmap.md`: global address map (HBM address interleaving across stacks/PCs/banks, scratchpad, global SRAM, remote die/package windows).
 - `noc.md`: topology, routing (XY), virtual channels for deadlock freedom (request/response separation), credit flow control.
 - `hbm.md`: controller architecture (per-PC queues, FR-FCFS scheduler, open/close page policy, refresh,
@@ -319,7 +335,9 @@ Session hygiene:
 
 | Risk | Mitigation |
 |---|---|
-| Target model configs differ from predecessor assumptions, or are not public yet | Phase 1 step 1 comes first. The descriptor schema is extensible. Unknown layer types fall back to a generic op with FLOP/byte annotations. |
+| Target model configs differ from predecessor assumptions, or are not public yet | Done for config, code and READMEs (11 of 11 public). Descriptors are validated against weight sizes and published parameter counts. Open items are listed in `docs/reports/model_features.md`. Unknown layer types fall back to a generic op with FLOP/byte annotations. |
+| Hyper-connection mixer in BF16 is not accurate enough, or the per-step Sinkhorn latency hurts small-batch decode | Phase 2 numerics experiment against the fp32 reference; VPU fp32 FMA as the fallback; the simulator models the 80 small all-reduces per step. |
+| Engram/n-gram tables (197 GB for DeepSeek) push the package count up | Phase 1 step 3 capacity analysis includes tables; gather indices are prefetchable so remote placement costs capacity, not latency. |
 | Verilator or Yosys runs out of memory | Phase 0 calibration caps, the `TINY`/`MID` configs, hierarchical synthesis, `memrun` logging |
 | Yosys SV front end gaps | sv2v in the flow. RTL stays in a conservative SV subset (no classes or interfaces in synthesizable code; packages and structs allowed). |
 | VM RAM for P&R | 12 GB VM cap. Block sizes come from Phase 0 calibration. Nothing heavy runs natively during P&R; lower the cap to 10 GB if macOS swaps. |

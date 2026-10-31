@@ -1,0 +1,99 @@
+schema_version: 1
+name: Step 5 Preview
+slug: step_5_preview
+hf_repo: stepfun-ai/Step-5-Preview
+config_sha256: e535c5c9e6385e5c
+arch:
+  model_type: step5_vl
+  architectures: [Step5ForConditionalGeneration]
+dims: {hidden: 4096, vocab: 128896, n_layers: 92, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 644100979280
+  dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
+  notes: FP8 e4m3 128x128 block scales.
+attn_types:
+  swa: {kind: gqa, n_heads: 64, n_kv_heads: 4, head_dim: 192, out_gate: head, window: 512, rope_dim: 192}
+  full:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 4
+    head_dim: 192
+    out_gate: head
+    rope_dim: 64
+    sparse: {kind: indexer, n_heads: 16, head_dim: 256, topk: 512, index_role: own, region_block: 8}
+ffn_types:
+  dense: {kind: dense, d_ff: 13824}
+  moe:
+    kind: moe
+    n_experts: 352
+    top_k: 8
+    d_expert: 1536
+    n_shared: 1
+    d_shared: 1536
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true, routed_scale: 3.0}
+layers:
+- {n: 3, attn: swa, ffn: dense}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: dense}
+mtp: {n_layers: 3, attn: swa, ffn: moe}
+drafter: null
+extras: {}
+published: {total_b: 600, active_b: 27, source: README}
+sources: [stepfun-ai/Step-5-Preview/inference/model.py, README]
+flags:
+- {id: sparse_full_attention, severity: warn, detail: 'Full-attention layers use a 16-head indexer (proxy
+    dim 256) with block compression ''csa_block_compress'' (top-512, region 8). The reference code uses
+    weighted-ReLU scores; the compression details are approximated as a plain indexer.'}
+- {id: head_wise_attn_gate, severity: info, detail: Per-head sigmoid gate on attention output.}
+- {id: fp32_residual, severity: info, detail: fp32 residual stream and fp32 norms (fp32_residual_connection).}
+- {id: mtp_layers_in_layer_types, severity: info, detail: layer_types has 95 entries = 92 main + 3 MTP
+    layers (MTP is in the main weights).}
+- {id: router_sigmoid_bias, severity: info, detail: Sigmoid routing with a selection-only bias (confirmed
+    in inference/model.py).}
+- {id: modalities, severity: info, detail: Vision tower excluded.}
+derived: {params_total_b: 618.9, params_active_b: 27.4, params_expert_b: 604.6, params_table_b: 0.0, expected_weight_gb: 619.9,
+  published_weight_gb: 644.1, weight_check_ratio: 0.962, published_total_ratio: 1.031, published_active_ratio: 1.015}

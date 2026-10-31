@@ -4,8 +4,9 @@ SHELL := /bin/bash
 ROOT  := $(abspath .)
 RTL_DIR := rtl
 BUILD := $(ROOT)/build
-PY    ?= python3
 ENV_SETUP ?= /Volumes/EVO970PLUS/claude/env_setup
+EDA_HOME  ?= /Volumes/EVO970PLUS/eda
+PY    ?= $(if $(wildcard $(EDA_HOME)/venv/bin/python),$(EDA_HOME)/venv/bin/python,python3)
 ifneq ($(wildcard $(ENV_SETUP)/env.sh),)
   include $(ENV_SETUP)/config.sh
   export EDA_HOME
@@ -15,9 +16,9 @@ endif
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit formal e2e syn clean
+.PHONY: help lint unit pytest models fetch-models formal e2e syn clean
 help:
-	@echo "targets: lint unit formal e2e syn clean"
+	@echo "targets: lint unit pytest models fetch-models formal e2e syn clean"
 
 # Lint every RTL file, -Wall, as its own top (block lint).
 lint:
@@ -37,6 +38,19 @@ unit: $(BUILD)
 	  grep -q "^PASS" $(BUILD)/$$name.out || { echo "unit FAILED: $$name"; exit 1; }; \
 	done
 	@echo "unit: ALL PASS"
+
+# Python tests (descriptor schema and ingestion). Needs the venv from env_setup.
+pytest:
+	$(PY) -m pytest -q tb/unit/test_descriptors.py
+
+# Re-ingest config snapshots into models/descriptors and regenerate docs/reports/model_survey.md.
+models:
+	PYTHONPATH=sw $(PY) -m npumodel.ingest
+	PYTHONPATH=sw $(PY) -m npumodel.report
+
+# Re-download config.json snapshots from Hugging Face (network). Review the diff before committing.
+fetch-models:
+	scripts/fetch_configs.sh
 
 formal:
 	@echo "formal: no properties yet (tb/formal empty)"

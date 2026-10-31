@@ -1,0 +1,130 @@
+schema_version: 1
+name: Mistral Large 4
+slug: mistral_large_4
+hf_repo: mistralai/Mistral-Large-4-1T-A52B
+config_sha256: 3081fb94f5001f34
+arch:
+  model_type: mistral_large4
+  architectures: [MistralLarge4ForConditionalGeneration]
+dims: {hidden: 6144, vocab: 204800, n_layers: 72, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: 30.0,
+  encoder_layers: null}
+weights:
+  total_bytes: 1060554587912
+  dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
+  notes: FP8 128x128 block scales. Weights shipped as consolidated-*.safetensors (no index).
+attn_types:
+  mla_own_own:
+    kind: mla
+    n_heads: 64
+    q_lora_rank: null
+    kv_lora_rank: 512
+    qk_nope_dim: 64
+    qk_rope_dim: 64
+    v_head_dim: 128
+    kv_role: own
+    kv_dtype: fp8
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 2048, index_role: own, key_dtype: fp8}
+  mla_own_reuse:
+    kind: mla
+    n_heads: 64
+    q_lora_rank: null
+    kv_lora_rank: 512
+    qk_nope_dim: 64
+    qk_rope_dim: 64
+    v_head_dim: 128
+    kv_role: reuse
+    kv_dtype: fp8
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 2048, index_role: own, key_dtype: fp8}
+  mla_reuse_own:
+    kind: mla
+    n_heads: 64
+    q_lora_rank: null
+    kv_lora_rank: 512
+    qk_nope_dim: 64
+    qk_rope_dim: 64
+    v_head_dim: 128
+    kv_role: own
+    kv_dtype: fp8
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 2048, index_role: reuse, key_dtype: fp8}
+  mla_reuse_reuse:
+    kind: mla
+    n_heads: 64
+    q_lora_rank: null
+    kv_lora_rank: 512
+    qk_nope_dim: 64
+    qk_rope_dim: 64
+    v_head_dim: 128
+    kv_role: reuse
+    kv_dtype: fp8
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 2048, index_role: reuse, key_dtype: fp8}
+ffn_types:
+  dense: {kind: dense, d_ff: 24576}
+  moe:
+    kind: moe
+    n_experts: 128
+    top_k: 4
+    d_expert: 6144
+    n_shared: 1
+    d_shared: 6144
+    router: {scoring: softmax, correction_bias: false, norm_topk: true, routed_scale: 1.0}
+layers:
+- {n: 1, attn: mla_own_own, ffn: dense}
+- {n: 16, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 2, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 2, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 2, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 2, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 2, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+- {n: 1, attn: mla_own_own, ffn: moe}
+- {n: 2, attn: mla_reuse_own, ffn: moe}
+- {n: 1, attn: mla_own_reuse, ffn: moe}
+mtp: null
+drafter: {kind: dspark, in_main_weights: unknown, n_layers: 3, hidden: 6144, d_ff: 24576, attn: mla, dtype: bf16,
+  block: 3, markov_rank: 512, source: params.json + README}
+extras: {}
+published: {total_b: 1000, active_b: 52, source: 'README: ~1T total, 49B active (52B incl. embeddings)'}
+sources: [params.json, transformers modeling_mistral_large4.py, README]
+flags:
+- {id: dsa_indexer, severity: warn, detail: 'Indexed sparse attention, top-2048, FP8 indexer and FP8 KV;
+    44 layers own an indexer (params.json dsa.sharing equals indexer_types).'}
+- {id: kv_sharing, severity: warn, detail: 'params.json kv_sharing: layers [39, 43, 47, 51, 55, 59, 63,
+    67, 71] read layer 35''s latent KV (their own q/attention still run). Modeled with kv_role=reuse.'}
+- {id: separate_drafter, severity: warn, detail: 'DSpark draft head: 3 dense BF16 MLA layers, block 3,
+    Markov rank 512; ships next to the target weights.'}
+- {id: router_softmax, severity: info, detail: Router is softmax over fp32 logits with normalized top-k
+    weights and no selection bias (confirmed in transformers modeling_mistral_large4.py).}
+- {id: nope_layers, severity: info, detail: '18 layers use no positional rotation (pattern ''rope,rope,rope,nope'').'}
+- {id: softmax_scaling, severity: info, detail: Query scaling by position (ssmax) and tanh logit soft-capping
+    at 30.}
+- {id: modalities, severity: info, detail: Vision tower excluded.}
+derived: {params_total_b: 1049.4, params_active_b: 51.1, params_expert_b: 1029.2, params_table_b: 0.0,
+  expected_weight_gb: 1051.9, published_weight_gb: 1060.6, weight_check_ratio: 0.992, published_total_ratio: 1.049,
+  published_active_ratio: 0.982}

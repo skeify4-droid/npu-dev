@@ -1,0 +1,58 @@
+schema_version: 1
+name: MiniMax-M3.1-Flash
+slug: minimax_m3_1_flash
+hf_repo: MiniMaxAI/MiniMax-M3.1-Flash
+config_sha256: df6a3668e2de5b8d
+arch:
+  model_type: minimax_m3_vl
+  architectures: [MiniMaxM3SparseForConditionalGeneration]
+dims: {hidden: 6144, vocab: 200064, n_layers: 60, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 250103411200
+  dtypes: {expert: mxfp4, dense: mxfp8, embed: bf16, table: fp8}
+  notes: MXFP8 dense per quantization_config; expert tensors are packed 4-bit (see flag).
+attn_types:
+  gqa_sparse:
+    kind: gqa
+    n_heads: 64
+    n_kv_heads: 4
+    head_dim: 128
+    rope_dim: 64
+    qk_norm: true
+    sparse: {kind: block_topk, n_heads: 4, head_dim: 128, topk: 2048, block_size: 128, index_role: own}
+ffn_types:
+  dense: {kind: dense, d_ff: 12288}
+  moe:
+    kind: moe
+    n_experts: 128
+    top_k: 4
+    d_expert: 3072
+    n_shared: 1
+    d_shared: 3072
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true, routed_scale: 2.0}
+layers:
+- {n: 3, attn: gqa_sparse, ffn: dense}
+- {n: 57, attn: gqa_sparse, ffn: moe}
+mtp: null
+drafter: {kind: dspark, in_main_weights: false, n_layers: 5, hidden: 6144, d_ff: 12288, n_heads: 64, n_kv_heads: 4,
+  head_dim: 128, window: 4096, block: 7, markov_rank: 256, confidence_head: true, source: dspark/config.json}
+extras: {}
+published: {total_b: 428, active_b: 23, source: README}
+sources: [README, dspark/config.json]
+flags:
+- {id: block_sparse_attention, severity: warn, detail: 'MiniMax Sparse Attention: 16 blocks of 128 chosen
+    by a 4-head indexer (score=max), plus init and local blocks; in every layer. Paper arXiv 2606.13392
+    not yet read.'}
+- {id: separate_drafter, severity: warn, detail: 'DSpark draft head (5 layers, dense FFN 12288, block
+    7, Markov head, confidence head) ships in dspark/ and is not in the main weights.'}
+- {id: experts_stored_fp4, severity: warn, detail: 'quantization_config says MXFP8, but expert tensors
+    are packed 4-bit (U8). The README confirms quantization-aware training of the routed experts and attention
+    paths. Modeled as MXFP4 experts; the total-size check lands 6% under, so some tensors are larger than
+    modeled.'}
+- {id: swiglu_oai, severity: info, detail: 'hidden_act=swigluoai (alpha 1.702, limit 7.0): clamped SwiGLU
+    variant.'}
+- {id: gemma_norm, severity: info, detail: Gemma-style RMSNorm (1+w) and per-head QK norm.}
+- {id: modalities, severity: info, detail: Vision tower excluded.}
+derived: {params_total_b: 426.2, params_active_b: 24.7, params_expert_b: 413.1, params_table_b: 0.0, expected_weight_gb: 235.3,
+  published_weight_gb: 250.1, weight_check_ratio: 0.941, published_total_ratio: 0.996, published_active_ratio: 1.076}

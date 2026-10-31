@@ -1,0 +1,93 @@
+schema_version: 1
+name: Qwen3.8-Flash-Next
+slug: qwen3_8_flash_next
+hf_repo: Qwen/Qwen3.8-Flash-Next
+config_sha256: 889658f2508e8c61
+arch:
+  model_type: qwen4_exp
+  architectures: [Qwen4ExpForConditionalGeneration]
+dims: {hidden: 2560, vocab: 248320, n_layers: 48, max_ctx: 262144, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 359999963128
+  dtypes: {expert: bf16, dense: bf16, embed: bf16, table: bf16, hc: bf16}
+  notes: BF16 as published.
+attn_types:
+  gdn: {kind: linear, variant: gdn, n_k_heads: 16, n_v_heads: 48, k_dim: 128, v_dim: 128, conv_kernel: 4,
+    out_gate: full}
+  full:
+    kind: gqa
+    n_heads: 24
+    n_kv_heads: 2
+    head_dim: 256
+    rope_dim: 64
+    out_gate: elem
+    sparse: {kind: indexer, n_heads: 4, head_dim: 128, topk: 2048, index_role: own, key_pool: 4}
+ffn_types:
+  moe:
+    kind: moe
+    n_experts: 512
+    top_k: 10
+    d_expert: 640
+    n_shared: 1
+    d_shared: 640
+    router: {scoring: softmax, correction_bias: false, norm_topk: true}
+layers:
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 3, attn: gdn, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+mtp: {n_layers: 1, attn: full, ffn: moe}
+drafter: null
+extras:
+  hyper_connections: {variant: gated_lowrank, mult: 4, lowrank: 320}
+  tables:
+  - name: ngram_embedding
+    layer: 1
+    entries: 320000000
+    dim: 160
+    lookups_per_token: 16
+    lookup: hashed_ngram_gather
+    ngram_sizes: [2, 3]
+    proj_params: 32768000
+published: {total_b: 180, active_b: 6, source: 'README: 125B (6B active) + 51B n-gram embedding + 4B MTP'}
+sources: ['transformers modeling_qwen4_exp.py (GatedResidual, NGramEmbedding, QSAIndexer, TopKRouter)',
+  README]
+flags:
+- {id: hyper_connections, severity: required, detail: 'Gated low-rank hyper-connection (no Sinkhorn):
+    4 streams, per sublayer a grouped RMSNorm, a [4d -> 320 -> 4d] SiLU/sigmoid mixer that collapses the
+    streams by a mean, and a [4d -> 4] sigmoid injection gate. A different design from mHC. See docs/spec/hyper_connections.md.'}
+- {id: ngram_embedding, severity: required, detail: 'Per-layer embedding on layer 1: 16 hashed 2/3-gram
+    heads of 160 (BF16) from a 320 M-row table = 51 B elements (README: ''51B n-gram embedding''), then
+    key/value projections into the 4 streams. Needs a hashed-gather DMA.'}
+- {id: gated_deltanet, severity: warn, detail: '36 Gated-DeltaNet linear-attention layers (README: 3 x
+    (GDN -> MoE) then 1 x (sparse attention -> MoE)).'}
+- {id: qsa_indexer, severity: warn, detail: 'Qwen Sparse Attention on the 12 full-attention layers: MQA
+    indexer (4 query heads, 1 key head, dim 128) over keys compressed by 4; budget 2048 tokens = 512 blocks.'}
+- {id: router_softmax, severity: info, detail: 'Router is softmax with normalized top-k, no selection
+    bias (confirmed in transformers modeling_qwen4_exp.py).'}
+- {id: published_bf16, severity: warn, detail: Only BF16 weights published; FP8/FP4 deployment needs our
+    own quantization.}
+- {id: modalities, severity: info, detail: Vision tower excluded.}
+derived: {params_total_b: 179.5, params_active_b: 6.8, params_expert_b: 123.3, params_table_b: 51.2, expected_weight_gb: 359.1,
+  published_weight_gb: 360.0, weight_check_ratio: 0.997, published_total_ratio: 0.997, published_active_ratio: 1.13}

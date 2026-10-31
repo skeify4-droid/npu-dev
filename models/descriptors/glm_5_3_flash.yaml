@@ -1,0 +1,79 @@
+schema_version: 1
+name: GLM-5.3-Flash
+slug: glm_5_3_flash
+hf_repo: zai-org/GLM-5.3-Flash
+config_sha256: bb8f01c42cb92a52
+arch:
+  model_type: glm5_next
+  architectures: [Glm5NextForConditionalGeneration]
+dims: {hidden: 4096, vocab: 154880, n_layers: 45, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 328326771576
+  dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8, hc: fp32}
+  notes: FP8 e4m3; hyper-connection and norm weights kept in higher precision.
+attn_types:
+  kda: {kind: linear, variant: kda, n_k_heads: 64, n_v_heads: 64, k_dim: 128, v_dim: 128, conv_kernel: 4,
+    f_gate: lowrank, out_gate: lowrank, gate_rank: 128}
+  mla_nr:
+    kind: mla
+    n_heads: 64
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_dim: 256
+    qk_rope_dim: 0
+    v_head_dim: 256
+    sparse: {kind: indexer, n_heads: 32, head_dim: 128, topk: 2048, index_role: own, q_in: 1536, key_pool: 4}
+ffn_types:
+  dense: {kind: dense, d_ff: 12288}
+  moe:
+    kind: moe
+    n_experts: 288
+    top_k: 8
+    d_expert: 2048
+    n_shared: 1
+    d_shared: 2048
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true, routed_scale: 2.5}
+layers:
+- {n: 3, attn: kda, ffn: dense}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla_nr, ffn: moe}
+- {n: 1, attn: kda, ffn: moe}
+mtp: {n_layers: 1, attn: mla_nr, ffn: moe}
+drafter: null
+extras:
+  hyper_connections: {variant: mhc_sinkhorn, mult: 4, sinkhorn_iters: 20}
+published: {total_b: 320, active_b: 18, source: README}
+sources: ['transformers modeling_glm5_next.py (HyperConnection, LinearAttention, Indexer)', zai-org/GLM-5.3-Flash
+    README]
+flags:
+- {id: hyper_connections, severity: required, detail: 'mHC, same form as DeepSeek V4.1: fp32 [24 x 4d]
+    projection per sublayer plus Sinkhorn (20 iters), and a final ''hyper head'' collapse. See docs/spec/hyper_connections.md.'}
+- {id: kda_linear_attention, severity: warn, detail: '34 Kimi-Delta-style linear-attention layers: q/k/v/o
+    full size, forget and output gates low-rank (rank 128), short conv, chunked delta-rule scan.'}
+- {id: indexer_key_pooling, severity: warn, detail: Indexer keys are pooled by 4 with a learned gate (index_kpool);
+    the tail block is always selected.}
+- {id: mla_without_rope, severity: info, detail: 'MLA layers use qk_rope_head_dim=0 (mla_use_nope): all
+    256 query/key dims are content dims.'}
+- {id: vision_tower, severity: info, detail: Vision tower excluded.}
+derived: {params_total_b: 320.8, params_active_b: 17.1, params_expert_b: 311.7, params_table_b: 0.0, expected_weight_gb: 322.1,
+  published_weight_gb: 328.3, weight_check_ratio: 0.981, published_total_ratio: 1.002, published_active_ratio: 0.95}

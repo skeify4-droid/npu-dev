@@ -1,0 +1,64 @@
+schema_version: 1
+name: Ling 3.1 Flash
+slug: ling_3_1_flash
+hf_repo: inclusionAI/Ling-3.1-flash
+config_sha256: 7b1732fd23b932c2
+arch:
+  model_type: bailing_hybrid
+  architectures: [BailingMoeV3ForCausalLM]
+dims: {hidden: 4096, vocab: 157184, n_layers: 72, max_ctx: 262144, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 573753281152
+  dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
+  notes: FP8 e4m3.
+attn_types:
+  mla: {kind: mla, n_heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 128, qk_rope_dim: 64,
+    v_head_dim: 128, out_gate: head}
+  kda: {kind: linear, variant: kda, n_k_heads: 64, n_v_heads: 64, k_dim: 128, v_dim: 128, conv_kernel: 4,
+    f_gate: full, out_gate: full}
+ffn_types:
+  dense: {kind: dense, d_ff: 10240}
+  moe:
+    kind: moe
+    n_experts: 512
+    top_k: 8
+    d_expert: 1280
+    n_shared: 1
+    d_shared: 1280
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true, routed_scale: 2.5, n_group: 8,
+      topk_group: 4}
+layers:
+- {n: 4, attn: kda, ffn: dense}
+- {n: 3, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+- {n: 7, attn: kda, ffn: moe}
+- {n: 1, attn: mla, ffn: moe}
+mtp: {n_layers: 1, attn: mla, ffn: moe}
+drafter: null
+extras: {}
+published: {total_b: 560, active_b: 25, source: README}
+sources: [inclusionAI/Ling-3.1-flash/modeling_bailing_moe_v3.py, README]
+flags:
+- {id: layer_pattern, severity: info, detail: 'Confirmed in modeling_bailing_moe_v3.py and the README
+    (63 KDA + 9 gated MLA, 7:1): layer i is MLA iff (i+1) % 8 == 0.'}
+- {id: kda_linear_attention, severity: warn, detail: 'Kimi-Delta linear attention: q/k/v/o plus full-size
+    forget (f_proj) and output (g_proj) gates, short conv, chunked scan.'}
+- {id: group_limited_routing, severity: info, detail: Router picks 4 of 8 expert groups first.}
+- {id: modalities, severity: info, detail: Text path only.}
+derived: {params_total_b: 572.1, params_active_b: 24.5, params_expert_b: 555.7, params_table_b: 0.0, expected_weight_gb: 573.4,
+  published_weight_gb: 573.8, weight_check_ratio: 0.999, published_total_ratio: 1.022, published_active_ratio: 0.979}

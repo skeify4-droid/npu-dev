@@ -1,0 +1,68 @@
+schema_version: 1
+name: MiMo-V2.6-Pro
+slug: mimo_v2_6_pro
+hf_repo: XiaomiMiMo/MiMo-V2.6-Pro-RL
+config_sha256: a9dc00e2a0c2c172
+arch:
+  model_type: mimo_v2
+  architectures: [MiMoV2ForCausalLM]
+dims: {hidden: 6144, vocab: 152576, n_layers: 70, max_ctx: 1048576, tie_embeddings: false, final_logit_softcap: null,
+  encoder_layers: null}
+weights:
+  total_bytes: 566027990784
+  dtypes: {expert: mxfp4, dense: fp8, embed: bf16, table: fp8}
+  notes: FP8 dense, 4-bit experts (see flag); o_proj kept in BF16 (ignored_layers).
+attn_types:
+  full: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 192, v_head_dim: 128, rope_dim: 64}
+  swa: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 192, v_head_dim: 128, rope_dim: 64, window: 128,
+    sink_bias: true}
+ffn_types:
+  dense: {kind: dense, d_ff: 16384}
+  moe:
+    kind: moe
+    n_experts: 384
+    top_k: 8
+    d_expert: 2048
+    n_shared: 0
+    d_shared: 2048
+    router: {scoring: sigmoid, correction_bias: true, norm_topk: true}
+layers:
+- {n: 1, attn: full, ffn: dense}
+- {n: 6, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 7, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 6, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+- {n: 6, attn: swa, ffn: moe}
+- {n: 1, attn: full, ffn: moe}
+mtp: null
+drafter: {kind: dflash, in_main_weights: false, n_layers: 5, hidden: 6144, d_ff: 16384, n_heads: 128,
+  n_kv_heads: 8, head_dim: 128, window: 1024, block: 8, source: dflash/config.json}
+extras: {}
+published: {total_b: 1020, active_b: 42, source: README}
+sources: ['README (params, layer split, drafter)', dflash/config.json, model.safetensors.index.json (mtp
+    tensors are dense)]
+flags:
+- {id: attention_sink_bias, severity: info, detail: SWA layers add a learned sink logit to the softmax.}
+- {id: hybrid_pattern, severity: info, detail: 'hybrid_layer_pattern: 1 = sliding window (60 layers),
+    0 = full (10). Layer 0 is full attention with a dense FFN.'}
+- {id: separate_drafter, severity: warn, detail: 'Speculative decoding uses a separate 5-layer DFlash
+    drafter (SWA window 1024, block 8, reads target hidden states) that is not in the main weights.'}
+- {id: experts_stored_fp4, severity: warn, detail: 'quantization_config says FP8, but the safetensors
+    expert tensors are packed 4-bit (U8). The HF tensor dtype counts and the total-size check both agree.
+    Modeled as MXFP4 experts.'}
+- {id: modalities, severity: info, detail: Vision and audio towers excluded.}
+derived: {params_total_b: 1021.2, params_active_b: 41.0, params_expert_b: 1000.2, params_table_b: 0.0,
+  expected_weight_gb: 554.3, published_weight_gb: 566.0, weight_check_ratio: 0.979, published_total_ratio: 1.001,
+  published_active_ratio: 0.975}
