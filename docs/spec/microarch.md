@@ -1,8 +1,9 @@
 # Micro-architecture (Phase 2)
 
-Status: **draft for review, 2026-11-01.** Refines the frozen numbers of [`arch.md`](arch.md) into blocks, datapaths and interfaces.
+Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../reports/spec_review.md)). Refines the frozen numbers of [`arch.md`](arch.md) into blocks, datapaths and interfaces.
 Companion specs: [`isa.md`](isa.md) (programming model, `isa/isa.yaml`), [`memmap.md`](memmap.md) (address map),
-[`noc.md`](noc.md) (network and deadlock freedom), [`numerics.md`](numerics.md) (formats, rounding, accumulation order). Still to come in Phase 2: `hbm.md`, `d2d_c2c.md`.
+[`noc.md`](noc.md) (network and deadlock freedom), [`numerics.md`](numerics.md) (formats, rounding, accumulation order),
+[`hbm.md`](hbm.md) (HBM controller, timing, DRAM model), [`d2d_c2c.md`](d2d_c2c.md) (link layer, collective schedules).
 Items marked *(P2)* are decisions made here; §8 lists what they changed in `arch.md`.
 
 ## 1. Die
@@ -30,15 +31,15 @@ Items marked *(P2)* are decisions made here; §8 lists what they changed in `arc
 |---|---|---|
 | Core tile | 32 (8 x 4) | core, 6-port router (2 planes), 1 MiB GSRAM slice |
 | HBM leaf | 16 | 2-port router: mesh port + HBM controller port (8 pseudo-channels) |
-| HBM controller | 4 (one per stack) | 32 pseudo-channel queues, 4 NoC ports (one per leaf); `hbm.md` |
-| D2D leaf + bridge | 4 sub-links | 2 x 128 B/cycle per direction each: 1.54 TB/s raw, 1.4 TB/s payload per direction per die *(P2)* |
-| C2C leaf + bridge | 4 leaves, 8 ports | 100 GB/s per port per direction; rail-aligned (noc.md §6) |
+| HBM controller | 4 (one per stack) | 32 pseudo-channel engines (read queue 32, write queue 16 granules), 4 NoC ports (one per leaf), own clock 1.2 GHz; [hbm.md](hbm.md) |
+| D2D leaf + bridge | 4 sub-links | 2 lanes (one per plane) of 156 B link flits per cycle per direction each: 1.87 TB/s raw link rate, 1.45 TB/s payload per direction per die, 2 UCIe-A x64 modules per sub-link *(P2)*; [d2d_c2c.md](d2d_c2c.md) |
+| C2C leaf + bridge | 4 leaves, 8 ports | 6 SerDes lanes per port: 150 GB/s raw, 116 GB/s payload per direction (frozen 100); rail-aligned (noc.md §6, [d2d_c2c.md](d2d_c2c.md)) |
 | Command processor (CP) | 1 | RV64-class control core, behavioral in RTL; boots and launches cores, runs the runtime's page-table and n-gram-hash work |
 | Host interface | 1 | PCIe-class, about 64 GB/s per direction, modeled |
 
 Physical intent (for Phase 6): HBM PHYs on the two 33 mm edges (2 stacks each, about 22 mm of each edge), D2D on the short edge that faces
 the sibling die, C2C SerDes on the outer short edge. The D2D link needs only about a quarter of its short edge at 1.4 TB/s
-(UCIe-advanced class), which leaves room for a fifth HBM site on that edge; the 5-6 stacks/die question stays a Phase 6 floorplan item.
+(8 UCIe-Advanced x64 modules, d2d_c2c.md L-2), which leaves room for a fifth HBM site on that edge; the 5-6 stacks/die question stays a Phase 6 floorplan item.
 
 ## 2. Core tile
 
@@ -150,7 +151,8 @@ isa.md §5) a cheap multiply at the ACC input.
 - The interface is an initiator for the DMA and a target for SPM, GSRAM and CORECTL (IMEM, DTAB, semaphores, CSRs).
 - Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
 - Plane choice is per packet: round-robin over planes with credits. No ordering is needed (noc.md §7).
-- Write acknowledgements are coalesced per 2 KiB burst.
+- Write acknowledgements carry a byte count and are coalesced per 2 KiB burst while the coalescing table has room. A full table acks
+  early with a partial count, so accepting a write never waits for ack state (review finding R-3, hbm.md H-2).
 - 64 semaphores (32-bit) per core, readable and writable over the network (memmap.md §5).
 
 ## 3. Die-level blocks
@@ -170,12 +172,14 @@ isa.md §5) a cheap multiply at the ACC input.
 
   Example: an intra-die all-reduce of a `[64 tokens x 25]` FP32 hyper-connection vector is a reduce-scatter by write-add to 32 owners,
   then 32 multicasts. That is about 0.1 µs, against about 0.6 µs through one central reduction point (HC-5 needs 80 per step).
-  Inter-die and inter-package steps use the same writes over D2D/C2C with credit semaphores (`d2d_c2c.md` will give the schedules).
-- **HBM controllers:** one per stack, 32 pseudo-channel queues behind 4 NoC ports (8 PCs per port). Scheduler, page policy, refresh and
-  timing go in `hbm.md`.
+  Inter-die and inter-package steps use the same writes over D2D/C2C with credit semaphores. The schedules (hierarchical direct
+  all-reduce, rail-staged all-to-all) are in [d2d_c2c.md](d2d_c2c.md) L-7.
+- **HBM controllers:** one per stack, 32 pseudo-channel engines behind 4 NoC ports (8 PCs per port), in their own 1.2 GHz clock domain.
+  The scheduler (FR-FCFS, adaptive page policy, per-bank refresh), timing table and DRAM model are in [hbm.md](hbm.md).
 - **D2D / C2C bridges:**
   - They convert NoC packets to link flits with per-virtual-network credits, and inject arriving packets into class X virtual channels.
   - They never forward a packet that arrived over a link (noc.md §6).
+  - One link layer for both: 156 B link flits, per-VN credits with a shared pool, CRC-32C and go-back-N replay ([d2d_c2c.md](d2d_c2c.md)).
 
 ## 4. Configurations for RTL and simulation
 
@@ -275,16 +279,22 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | noc[4] | in/out | flit_t | credit per VC | one per leaf (8 PCs each) |
-| dfi[32] | out/in | per PC: command, 32-bit DQ x BL8 (32 B/access) | DFI-like | to the behavioral PHY + DRAM model (`hbm.md`) |
-| csr | in/out | 64 | valid/ready | timing table, refresh, error counters |
+| dfi[32] | out/in | per PC: 1 row + 1 column command per `clk_mc` cycle, 256-bit write and read data | DFI-like, fixed read latency | to the behavioral PHY + DRAM model ([hbm.md](hbm.md) H-5) |
+| csr | in/out | 64 | valid/ready | timing table, policy, refresh rate, per-PC counters (hbm.md H-7) |
+| clk_mc | in | 1 | | controller clock, 1.2 GHz (`MC_SYNC = 1`: same as `clk`) |
+
+The PC engine, the DFI-like signals and the DRAM model have their own tables in hbm.md H-5 and H-7.
 
 **D2D / C2C bridge (`link/*`)**
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | noc | in/out | flit_t | credit per VC | the leaf router |
-| link_tx / link_rx | out/in | flit_t + VN | credit per VN (REQ, RSP) | behavioral PHY with latency and bandwidth parameters |
-| csr | in/out | 64 | valid/ready | routing table (C2C peer ports), counters |
+| link_tx / link_rx | out/in | 1248-bit link flit per lane | valid/ready; credits per VN (REQ, RSP) + shared pool inside the flit | behavioral PHY with latency, bandwidth and error-injection parameters |
+| csr | in/out | 64 | valid/ready | routing table (C2C peer ports), replay and CRC counters, link state |
+| irq | out | 1 | level | link down |
+
+The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md L-9.
 
 **GSRAM slice (`die/gsram`)**
 
@@ -292,6 +302,36 @@ Conventions:
 |---|---|---|---|---|
 | noc | in/out | flit_t | credit per VC | router port 6 |
 | sem_add | out | 6 + 32 | pulse | to the tile's semaphore file |
+
+**Accumulator (`core/acc`)**, 2048 rows x 64 FP32, shared by the MXU and the VPU
+
+| Port | Dir | Width | Protocol | Purpose |
+|---|---|---|---|---|
+| mxu_rmw | in/out | 64 x 32 read + 64 x 32 write per cycle, row index 11 | fixed latency (read 2 cycles) | K-tile accumulation, `rowscale` / `colscale` at the input |
+| vpu_rd / vpu_wr | in/out | 4 rows x 64 x 32 per cycle | fixed latency | epilogues; ACC as a VPU operand or destination (space `ACC`) |
+| conflict | out | 1 | level | same-row MXU write and VPU access in one cycle: the VPU stalls (semaphores make this rare) |
+
+**Leaf router (`noc/leaf`)**, 24 per die
+
+| Port | Dir | Width | Protocol | Purpose |
+|---|---|---|---|---|
+| mesh[2] | in/out | flit_t | credit per VC (5 VCs) | one per plane, to the boundary core router |
+| ep[k] | in/out | flit_t | credit per VC | endpoints: HBM controller port, D2D bridge, C2C bridge (2 ports), CP, host interface |
+
+A leaf never forwards between its mesh ports (noc.md §1). Arrivals from a link endpoint enter class X VCs.
+
+**Host interface (`die/host`)**, behavioral
+
+| Port | Dir | Width | Protocol | Purpose |
+|---|---|---|---|---|
+| noc | in/out | flit_t | credit per VC | via leaf W3; the host is an initiator (reads, writes) and a target (DMA to host memory) |
+| host | in/out | 64 B/cycle per direction | valid/ready | PCIe-class stream, modeled |
+
+**Async FIFO (`common/afifo`)**: the HBM controller's clock crossing (`clk` 1.5 GHz to `clk_mc` 1.2 GHz)
+
+| Port | Dir | Width | Protocol | Purpose |
+|---|---|---|---|---|
+| wr_* / rd_* | in/out | parameter (flit_t at the HBM ports) | valid/ready in each clock domain | Gray-coded pointers, 2-flop synchronizers, depth parameter (default 8) |
 
 **Command processor (`die/cp`)**
 
@@ -327,3 +367,5 @@ Conventions:
 | NoC | one 2D mesh, 128 B/cycle links | two identical mesh planes of 128 B/cycle links | A single plane cannot take 820 B/cycle per HBM stack in through 4 leaves (noc.md §5) |
 | SRAM | 128 MiB SPM + 32 MiB GSRAM | + 16 MiB MXU accumulators (ACC), + 2.3 MiB IMEM/DTAB | §2.2: a weight-stationary MXU accumulates outside the array |
 | Collective engine | a die block | distributed: write-add in SRAM targets, multicast, semaphores | §3 |
+| Buffer SRAM outside the cores (review R-9) | not counted | HBM controllers 1 MiB per die (hbm.md H-1), link replay + receive buffers 1.4 MiB per die (d2d_c2c.md L-4) | `make hbm`, `make links` |
+| C2C PHY | 100 GB/s per port, unspecified | 6 x 200 Gb/s lanes per port (48 per die) to carry 100 GB/s of payload after flit overhead | d2d_c2c.md L-2 |

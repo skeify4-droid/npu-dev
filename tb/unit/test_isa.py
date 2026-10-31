@@ -83,6 +83,7 @@ def test_validator_rejects(isa):
 def test_generated_files_current(isa):
     for path, text in [(os.path.join(ROOT, "isa", "gen", "isa_pkg.sv"), I.emit_sv(isa)),
                        (os.path.join(ROOT, "isa", "gen", "isa.h"), I.emit_h(isa)),
+                       (os.path.join(ROOT, "isa", "gen", "isa_defs.py"), I.emit_py(isa)),
                        (os.path.join(ROOT, "docs", "spec", "isa_ref.md"), I.emit_md(isa))]:
         assert open(path).read() == text, f"{path} is stale: run make isa"
 
@@ -123,3 +124,13 @@ def test_hbm_map(isa):
             assert len(leaves) == 1
     # a 64 KB stride (same pc bits) still spreads over pseudo-channels
     assert len({I.hbm_fields(isa, 65536 * i)["pc"] for i in range(32)}) >= 16
+
+
+def test_python_constants_match(isa):
+    """The generated Python module carries the same opcodes, enums and memory map as the YAML."""
+    ns = {}
+    exec(open(os.path.join(ROOT, "isa", "gen", "isa_defs.py")).read(), ns)
+    assert ns["OPCODES"] == {n: i["op"] for n, i in isa["instructions"].items()}
+    assert ns["ENUMS"] == isa["enums"]
+    assert ns["MEMMAP"]["hbm"]["fields"] == isa["memmap"]["hbm"]["fields"]
+    assert ns["ENUMS"]["fault_cause"]["HBM_ALIGN"] == isa["enums"]["fault_cause"]["HBM_ALIGN"]

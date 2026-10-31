@@ -1,8 +1,8 @@
 # ISA: programming model (Phase 2)
 
-Status: **draft v0.1 for review, 2026-11-01.**
-- Source of truth: `isa/isa.yaml`. `make isa` validates it and regenerates `isa/gen/isa_pkg.sv`, `isa/gen/isa.h` and the instruction
-  reference [isa_ref.md](isa_ref.md).
+Status: **v0.1, reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../reports/spec_review.md)).
+- Source of truth: `isa/isa.yaml`. `make isa` validates it and regenerates `isa/gen/isa_pkg.sv` (SV), `isa/gen/isa.h` (C++),
+  `isa/gen/isa_defs.py` (Python constants) and the instruction reference [isa_ref.md](isa_ref.md).
 - This document explains the model and the decisions. Bit layouts and the full instruction list are in the reference.
 - Micro-architecture: [microarch.md](microarch.md). Addresses and ordering: [memmap.md](memmap.md).
 
@@ -169,12 +169,14 @@ S4 as well and the wait is `S4 >= 2`. The compiler's scheduler does this countin
 
 ## 8. Faults
 
-A fault stops the core, records `FAULT_CAUSE` and `FAULT_ADDR`, and sends an interrupt to the CP. Causes:
+A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP. Causes:
 - illegal opcode or field value;
 - a descriptor whose space is not allowed for that operand;
 - address faults (memmap.md §8), including `RAIL`;
 - ACC or SPM range overflow;
-- write-add to HBM;
+- write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
+- an invalid page-table entry in paged DMA;
+- a D2D/C2C link going down with transfers outstanding (d2d_c2c.md L-4);
 - an `SSET` on a semaphore that queued instructions reference.
 
 Floating-point exceptions do not trap. NaN/Inf/saturation behavior is defined in numerics.md.

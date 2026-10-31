@@ -15,11 +15,11 @@ Phase 2 refines the micro-architecture under these numbers. Changing one of them
 | MXU per core | 64 x 64 PEs, each a 4-way FP8 dot product: 16,384 FP8 MAC/cycle, FP32 accumulate; BF16 at half rate | 1.57 PFLOPS FP8, 0.79 PFLOPS BF16 per die |
 | VPU per core | 512 FP32 FLOP/cycle (16 lanes x 16 x FMA) | 24.6 TFLOPS per die |
 | SFU per core | 128 exp / reciprocal / rsqrt per cycle | 6.1 T ops/s per die |
-| HBM per die | 4 x HBM3e 12-Hi (1024 bit, 9.6 Gb/s/pin, 36 GB) | 4.92 TB/s, 144 GB; sustained ops:byte about 301 at 0.8 MXU / 0.85 HBM efficiency |
+| HBM per die | 4 x HBM3e 12-Hi (1024 bit, 9.6 Gb/s/pin, 36 GB) | 4.92 TB/s, 144 GB; sustained ops:byte about 301 at 0.8 MXU / 0.85 HBM efficiency (the controller model alone reaches 0.95-0.99 on decode traffic, [hbm.md](hbm.md) H-6) |
 | SRAM per die | 32 x 4 MB scratchpad (32 banks, double-buffered DMA) + 32 MB global SRAM; + 32 x 512 KB MXU accumulators and 72 KB IMEM/DTAB per core *(P2)* | 160 MB + 18 MB |
 | Dies per package | 2 | 3.1 PFLOPS FP8, 288 GB, 9.8 TB/s per package |
-| D2D | **1.4 TB/s** per direction payload (4 sub-links, what the NoC can feed; was 5 TB/s, changed in Phase 2), about 0.5 µs per collective step | |
-| C2C | 16 ports x 100 GB/s per direction per package, about 2 µs per collective step | 1.6 TB/s per package |
+| D2D | **1.4 TB/s** per direction payload (4 sub-links, what the NoC can feed; was 5 TB/s, changed in Phase 2), about 0.5 µs per collective step (planning value; bottom-up 0.09 µs, [d2d_c2c.md](d2d_c2c.md) L-5) | |
+| C2C | 16 ports x 100 GB/s per direction per package (6 SerDes lanes each), about 2 µs per collective step (planning value; bottom-up 0.24 µs) | 1.6 TB/s per package |
 | NoC | 8 x 4 2D mesh, **2 planes** of 128 B/cycle/link/direction *(P2)*, HBM controllers on 16 edge leaf routers ([noc.md](noc.md)) | carries 3.3 KB/cycle of HBM ingress at <= 80% link load |
 | Weight formats | FP8 E4M3/E5M2, BF16, MXFP8 (E8M0 scale / 32), MXFP4 (E8M0 / 32), **NVFP4 (E4M3 scale / 16 + FP32 tensor scale)**; 4-bit and MXFP8 are dequantized to FP8 in the DMA path | |
 | KV / cache formats | FP8, BF16, **NVFP4** (DeepSeek global KV, MiniMax KV and index keys as served), MXFP4 index keys (DeepSeek) | |
@@ -128,6 +128,7 @@ Where Phase 2 covers each one: [isa.md](isa.md) §6 (instruction per feature), [
 |---|---|---|
 | 2026-11-01 | Frozen. SFU 128/cycle/core; NVFP4 weights and KV; VPU 512 FLOP/cycle/core; package counts fixed. | `docs/reports/phase1_sweeps.md` |
 | 2026-11-01 | Phase 2: D2D 5 -> 1.4 TB/s per direction; NoC 2 mesh planes; + 16 MB ACC and 2.3 MB IMEM/DTAB per die; no central collective engine (distributed write-add, multicast, semaphores). Package counts unchanged; decode within 0.2%. | [microarch.md](microarch.md) §8, [noc.md](noc.md) §5, `make sweep` rerun |
+| 2026-11-01 | Phase 2 HBM, links and spec review: no frozen number changes. The HBM controller model supports the 0.85 efficiency. C2C ports need 6 x 200 Gb/s lanes for 100 GB/s of payload. The roofline's collective formulas are conservative (ring latency) and under-count off-package all-to-all bytes (review R-1). With the d2d_c2c.md schedules decode changes by -1% to +16% and no package count changes; the roofline stays as frozen. | [hbm.md](hbm.md), [d2d_c2c.md](d2d_c2c.md), [spec_review.md](../reports/spec_review.md), `make hbm`, `make links` |
 | 2026-11-01 | Phase 2 numerics: no frozen number changes. BF16 at half rate confirmed as a 2-way BF16 dot product per PE (microarch.md had quarter rate); recurrent state stays FP32; NVFP4 takes the exact BF16 path when memory-bound. | [numerics.md](numerics.md) N-3, N-7; `make numerics` |
 
 ## 6. Model limits (what the roofline does not capture)

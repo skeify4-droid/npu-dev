@@ -1,6 +1,7 @@
 """ISA tooling: load and validate isa/isa.yaml, encode / decode instruction words, emit SV / C++ / Markdown.
 
-    python isa/isa.py            # validate and regenerate isa/gen/isa_pkg.sv, isa/gen/isa.h, docs/spec/isa_ref.md
+    python isa/isa.py            # validate and regenerate isa/gen/isa_pkg.sv, isa/gen/isa.h, isa/gen/isa_defs.py,
+                                 # docs/spec/isa_ref.md
     python isa/isa.py --check    # validate only
 """
 import os
@@ -352,6 +353,23 @@ def emit_h(isa):
     return "\n".join(L)
 
 
+def emit_py(isa):
+    """Plain-Python constants (no YAML needed): what the compiler, simulator and cocotb tests import."""
+    import pprint
+    pick = {"VERSION": isa["version"], "WORD_BITS": isa["word_bits"], "OPCODE": list(OPCODE),
+            "MACHINE": isa["machine"], "QUEUES": {n: q["id"] for n, q in isa["queues"].items()},
+            "OPCODES": {n: i["op"] for n, i in sorted(isa["instructions"].items(), key=lambda x: x[1]["op"])},
+            "SYNC": {k: list(v) for k, v in isa["sync"].items()},
+            "FORMATS": {fmt: {k: list(v) for k, v in fmt_fields(isa, fmt).items()} for fmt in isa["formats"]},
+            "TD_FIELDS": {k: list(v) for k, v in isa["td"]["fields"].items()},
+            "ENUMS": isa["enums"], "MEMMAP": isa.get("memmap", {})}
+    L = [f"# {HDR}", f'"""ISA v{isa['version']} constants generated from isa/isa.yaml (docs/spec/isa_ref.md)."""', ""]
+    for k, v in pick.items():
+        L.append(f"{k} = " + pprint.pformat(v, width=120, sort_dicts=False))
+        L.append("")
+    return "\n".join(L)
+
+
 def emit_md(isa):
     L = [f"# ISA reference (v{isa['version']})", "", f"<!-- {HDR} -->", "",
          "Generated from `isa/isa.yaml`; the programming model is in [isa.md](isa.md). "
@@ -390,6 +408,7 @@ def write_all(isa):
     gen = os.path.join(HERE, "gen")
     os.makedirs(gen, exist_ok=True)
     outs = {os.path.join(gen, "isa_pkg.sv"): emit_sv(isa), os.path.join(gen, "isa.h"): emit_h(isa),
+            os.path.join(gen, "isa_defs.py"): emit_py(isa),
             os.path.join(ROOT, "docs", "spec", "isa_ref.md"): emit_md(isa)}
     for p, s in outs.items():
         with open(p, "w") as f:

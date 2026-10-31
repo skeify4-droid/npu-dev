@@ -1,6 +1,6 @@
 # Network on chip and deadlock strategy (Phase 2)
 
-Status: **draft for review, 2026-11-01.**
+Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../reports/spec_review.md)).
 - Model and checks: `sim/analytic/noc.py` (`python -m analytic.noc`) and `tb/unit/test_noc.py`.
 - Floorplan and blocks: [microarch.md](microarch.md) §1. Addresses: [memmap.md](memmap.md).
 
@@ -31,7 +31,7 @@ Status: **draft for review, 2026-11-01.**
 | RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target) |
 | RD_RSP | RSP | 256 B | 2 | one per 256 B granule: tag + granule index; destination space reserved at request time |
 | WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id |
-| WR_ACK | RSP | none | 1 | one per write burst (≤ 2 KiB), coalesced at the target |
+| WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target, partial when the target's coalescing table is full (R-3) |
 | SEM | REQ | 8 B | 1 | `SIGNAL`: add or set at a semaphore address (a WR to the add window) |
 | MC_WR | REQ (MC VC) | ≤ 256 B | ≤ 2 | intra-die multicast to a mesh rectangle; posted, no ack; `rsem` applies at each destination |
 | ERR | RSP | none | 1 | address fault / unsupported operation |
@@ -86,6 +86,9 @@ Four mechanisms remove the four kinds of deadlock:
      - Write-add is done inside the target.
      - Command queues written remotely are flow-controlled by the sender, through credit semaphores.
      - Collectives receive into buffers announced beforehand by semaphores.
+     - A target never waits for write-ack coalescing state before accepting a write: when its table is full it acks early with a
+       partial byte count (hbm.md H-2). Otherwise partial bursts could hold every table entry while their remaining packets wait
+       behind new bursts in the same VC.
 3. **Deadlock across links:**
    - A die's mesh carries packets heading to a link and packets that arrived from one.
    - If those shared VCs, the cycle `D2D(0->1) -> die-1 column-8 channel -> D2D(1->0) -> die-0 column-8 channel -> D2D(0->1)` is
@@ -170,7 +173,8 @@ across both planes (`noc.scenarios()`).
   byte-counting semaphores, `SIGNAL`.
 - **QoS:** none beyond round-robin in v1. The perf simulator reports per-class latency, to decide whether HBM responses need priority.
 - **Errors:** a target that cannot serve an address returns `ERR`. The initiating DMA records it, stops the core and interrupts the CP.
-  Links have no CRC or replay in v1 (`d2d_c2c.md` can add it).
+  Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down faults the cores with transfers
+  outstanding (`LINK`).
 
 ## 8. Open items
 

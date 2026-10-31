@@ -350,6 +350,22 @@ enum class Csr : uint16_t {
   PERF_CNT1 = 18,
   SEM_BASE_GPA = 32,
 };
+enum class FaultCause : uint16_t {
+  NONE = 0,
+  ILLEGAL_OP = 1,
+  ILLEGAL_FIELD = 2,
+  TD_SPACE = 3,
+  ADDR_UNMAPPED = 4,
+  ADDR_FORBIDDEN = 5,
+  RAIL = 6,
+  RANGE = 7,
+  HBM_WADD = 8,
+  HBM_ALIGN = 9,
+  SEM_BUSY = 10,
+  PTE_INVALID = 11,
+  LINK = 12,
+  ERR_RSP = 13,
+};
 constexpr uint8_t kNodeSelf = 0x7F;
 constexpr Field kNode{48, 42};
 constexpr uint64_t kMmHbmBase = 0x0ull;

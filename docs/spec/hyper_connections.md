@@ -67,8 +67,8 @@ compositions of existing MXU/VPU/SFU capability; no new datapath is required, on
 the stream layout is in `docs/spec/memmap.md` §7, and `DMA_GATHER_ROWS` is `DMA_GATHER` with `SCALE_INLINE`.
 
 **HC-5: tensor parallelism.** With the stream sharded along `d`, each mixer needs one all-reduce of `[tokens, 25]` fp32 (24 outputs plus the RMS statistic):
-80 extra latency-critical collectives per step for DeepSeek. This is small in bytes and large in count; the collective engine must support sub-microsecond
-intra-die all-reduce, and the perf simulator must model these. Qwen's gated mixer needs the `[tokens, 320]` low-rank activations reduced instead.
+80 extra latency-critical collectives per step for DeepSeek. This is small in bytes and large in count. The distributed schedule (reduce-scatter by write-add,
+then multicast; d2d_c2c.md L-7) does it in about 0.1 µs intra-die, and about 0.2 µs across D2D. The perf simulator must model these. Qwen's gated mixer needs the `[tokens, 320]` low-rank activations reduced instead.
 
 **HC-6: speculative layers.** DeepSeek's DSpark draft layers and the MTP layers also carry the 4 streams (the descriptor counts them in `mtp`).
 

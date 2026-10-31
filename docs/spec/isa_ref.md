@@ -140,3 +140,4 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 - `quant_fmt`: E4M3_ROW = 0, MXFP8 = 1, MXFP4 = 2, NVFP4 = 3, E4M3_TENSOR = 4
 - `hc_post_func`: MHC = 0, GATED = 1
 - `csr`: CORE_ID = 0, NODE_ID = 1, CYCLE = 2, PC = 3, STATUS = 4, FAULT_CAUSE = 5, FAULT_ADDR = 6, FP_STATUS = 7, PERF_SEL = 16, PERF_CNT0 = 17, PERF_CNT1 = 18, SEM_BASE_GPA = 32
+- `fault_cause`: NONE = 0, ILLEGAL_OP = 1, ILLEGAL_FIELD = 2, TD_SPACE = 3, ADDR_UNMAPPED = 4, ADDR_FORBIDDEN = 5, RAIL = 6, RANGE = 7, HBM_WADD = 8, HBM_ALIGN = 9, SEM_BUSY = 10, PTE_INVALID = 11, LINK = 12, ERR_RSP = 13

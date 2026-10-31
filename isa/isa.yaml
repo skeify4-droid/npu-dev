@@ -180,6 +180,21 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
+  fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
+    NONE: 0
+    ILLEGAL_OP: 1      # unknown opcode
+    ILLEGAL_FIELD: 2   # enum value or field combination not allowed
+    TD_SPACE: 3        # a descriptor's space is not allowed for that operand
+    ADDR_UNMAPPED: 4   # memmap.md section 8: unmapped, reserved, or hole
+    ADDR_FORBIDDEN: 5  # access type not allowed for that initiator and region (memmap.md section 8 table)
+    RAIL: 6            # destination node is on the other rail of another package (noc.md section 4)
+    RANGE: 7           # ACC rows or SPM offset beyond the end
+    HBM_WADD: 8        # write-add / max to HBM
+    HBM_ALIGN: 9       # HBM write not 32 B aligned in address and size (hbm.md H-2)
+    SEM_BUSY: 10       # SSET on a semaphore that queued instructions reference
+    PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
+    LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4)
+    ERR_RSP: 13        # a target returned ERR for another reason
 
 # Tile descriptor (TD): 256 bits in DTAB. Shapes are up to 4-D, innermost dim contiguous.
 # Element (i0, i1, i2, i3) is at base + i0*esize + i1*s1 + i2*s2 + i3*s3. A stride of 0 broadcasts.

@@ -241,3 +241,55 @@
 ### Next
 - `hbm.md`, `d2d_c2c.md`, then the Phase 2 spec review.
 - Open: confirm D2 on the real DeepSeek `hc_fn` weights (range requests, 2 MB per sublayer).
+
+## Phase 2 step 3: HBM, links, spec review (2026-11-01)
+
+### Changes
+- `docs/spec/hbm.md`:
+  - controller per stack, `clk_mc` = 1.2 GHz with async FIFOs, 32 PC engines;
+  - read queue 32 / write queue 16 / read return 16 granules;
+  - FR-FCFS scheduler with an age cap, write drain by watermarks, adaptive page policy, per-bank refresh;
+  - timing table (Ramulator 2 HBM3 preset plus marked assumptions) and the checker rule table;
+  - DFI-like boundary, the behavioral DRAM model contract, interfaces and CSRs.
+- `sim/analytic/hbm.py`: `Dram` (bank state + timing checker, the reference for the Phase 4 RTL checker) and a cycle-level PC
+  scheduler. `make hbm` (60 s, 20 MB) writes `docs/reports/hbm_experiments.md` (H1-H5).
+- `docs/spec/d2d_c2c.md`:
+  - one link layer for D2D and C2C: 156 B flits, per-VN credits with a shared pool, CRC-32C and go-back-N replay;
+  - PHY sizing: 2 UCIe-A x64 modules per D2D sub-link, 6 x 200 Gb/s lanes per C2C port;
+  - buffers, bottom-up latency, and collective schedules (hierarchical direct all-reduce, rail-staged all-to-all).
+- `sim/analytic/links.py`: `make links` (1 s) writes `docs/reports/links_experiments.md` (L1-L6).
+- Spec review: `docs/reports/spec_review.md`, findings R-1 to R-15, all resolved or recorded. Follow-on edits:
+  - `isa.yaml`: new `fault_cause` enum.
+  - `isa.py`: now also emits `isa/gen/isa_defs.py` (Python).
+  - noc.md: partial write acks, link CRC.
+  - memmap.md: HBM write alignment, reduced-config PC fold.
+  - microarch.md: interface tables for ACC, leaf router, host interface and async FIFO; buffer SRAM accounting.
+  - arch.md change log, PLAN Phase 2 and risk table, hyper_connections.md HC-5.
+
+### Results
+- **HBM controller (one PC, saturation):** 0.99 on streams, 0.95 with 5% KV writes, 0.97 on random 256 B granules, 0.90 on a 3:1
+  read/write mix. The frozen 0.85 keeps 0.10-0.14 of margin for what the model leaves out.
+  - All-bank refresh would cost 12% (25% hot), so refresh is per bank.
+  - Read queues of 16 lose 9-11%.
+  - The p99 granule latency at 85% load is 370 ns, which keeps 2x margin in the DMA's 512 granules in flight.
+- **Device requirement:** tCCD_L ≤ 2.5 ns. At 4.1 ns streaming falls to 0.79 whatever the queue depth (4 bank groups / 5 cycles).
+  Added to the PLAN risks.
+- **Links:**
+  - At 1e-15 BER an 8-package system would see an undetected error every 2.5 s, so both links have CRC and replay.
+  - C2C needs 6 SerDes lanes per port for the frozen 100 GB/s of payload.
+  - Link buffers are 1.4 MiB per die (C2C round trip 470 cycles); HBM controller buffers are 1 MiB per die.
+- **Collectives:**
+  - The bottom-up step latency is 0.09 µs (D2D) and 0.24 µs (C2C), against the frozen 0.5 / 2 µs.
+  - The hierarchical direct all-reduce needs 4 latency steps for any group size; the roofline's ring needs 2(g-1).
+  - The roofline under-counts off-package all-to-all bytes (R-1).
+  - Net effect on decode at the serving point: -1% to +10% with frozen latencies, up to +16% with bottom-up latencies. No package
+    count changes; arch.md stays frozen.
+
+### Tests
+- `make pytest`: 137 passed (89 before, + 40 HBM, + 7 links, + 1 ISA Python constants).
+- `make isa`, `make lint unit` clean. `make hbm` and `make links` reports are byte-identical across runs.
+
+### Next
+- Independent Opus/xhigh review of ISA + HBM (PLAN §5) before Phase 3 RTL on `core/dma`, `core/seq`, `hbm`.
+- Phase 3: `common` blocks (FIFOs, async FIFO, credit interfaces, arbiters, SRAM wrapper) and `arith`.
+- Open: vendor HBM3e timing (tCCD_L), PHY latencies, the DeepSeek `hc_fn` check for numerics D2.

@@ -1,5 +1,7 @@
 # Numerics
 
+Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../reports/spec_review.md)).
+
 This document defines the bits of every data format, every conversion and the arithmetic of each unit:
 - formats and conversions (N-1, N-2);
 - MXU arithmetic and accumulation order (N-3);

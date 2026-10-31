@@ -1,6 +1,6 @@
 # Memory map (Phase 2)
 
-Status: **draft for review, 2026-11-01.**
+Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../reports/spec_review.md)).
 - Source of truth for the numbers: the `memmap` section of `isa/isa.yaml`.
 - `isa/isa.py` generates the SV and C++ constants from it, and `decode_addr` / `hbm_fields` are the reference decoders.
 - `tb/unit/test_isa.py` checks the properties claimed here.
@@ -88,7 +88,9 @@ Properties (all tested):
 - The map is one-to-one on 32 B bursts.
 
 Per stack: 32 PCs x 16 banks (4 bank groups x 4) x 3 SIDs x 24,576 rows x 1 KiB = 36 GiB.
-These are representative JESD238-style values; `hbm.md` fixes the timing.
+The timing table, scheduler and refresh are in [hbm.md](hbm.md) (H-3, H-4). Reduced configurations (`TINY` 4 PCs, `MID` 8) fold the
+PC index into the PCs present and move the unused PC bits into the row, so the map stays one-to-one and 2 KiB blocks stay on one
+leaf (hbm.md H-1).
 
 ## 4. On-chip SRAM
 
@@ -146,7 +148,10 @@ These are representative JESD238-style values; `hbm.md` fixes the timing.
 
 - An access to an unmapped, reserved or forbidden address returns an error response.
 - The initiating core stops with `FAULT_CAUSE`/`FAULT_ADDR` set and sends an interrupt to the CP.
-- Write-add on an HBM address is a fault: HBM has no read-modify-write path.
+- Write-add on an HBM address is a fault (`HBM_WADD`): HBM has no read-modify-write path.
+- HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The compiler pads layouts
+  where a per-token item is smaller (for example, NVFP4 KV scales are stored for all KV heads of a token together).
+- Fault codes: isa.yaml `fault_cause`.
 
 ## 9. Ordering
 

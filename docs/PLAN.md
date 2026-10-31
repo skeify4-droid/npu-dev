@@ -194,7 +194,9 @@ start until they are met.
 blocks, TINY/MID/FULL configs, interface tables), ISA v0.1 (`docs/spec/isa.md`, `isa/isa.yaml` with validator, encoder/decoder and
 SV/C++/Markdown generators: `make isa`), memory map (`docs/spec/memmap.md`), NoC and deadlock strategy (`docs/spec/noc.md`, checked by
 `sim/analytic/noc.py`). **Step 2 done (2026-11-01):** numerics (`docs/spec/numerics.md`, golden model `sw/npumodel/numerics.py`,
-experiments `make numerics`). Remaining: `hbm.md`, `d2d_c2c.md`, spec review.
+experiments `make numerics`). **Step 3 done (2026-11-01):** HBM controller (`docs/spec/hbm.md`, model and timing checker
+`sim/analytic/hbm.py`, `make hbm`), links and collectives (`docs/spec/d2d_c2c.md`, `sim/analytic/links.py`, `make links`), spec review
+(`docs/reports/spec_review.md`, findings R-1 to R-15).
 - **Done (v0.1).** `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
   MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE; hyper-connection ops HC_MIX / HC_SINKHORN / HC_PRE / HC_POST /
   HC_GATED_MIX; DMA_GATHER_ROWS with unaligned rows and MXFP8 dequantization). Decoupled access/execute queues per core.
@@ -204,15 +206,19 @@ experiments `make numerics`). Remaining: `hbm.md`, `d2d_c2c.md`, spec review.
   As built: also the NVFP4 fold residual (exact BF16 path when memory-bound, fold when compute-bound), BF16 recurrent state (rejected), RTL test tolerances.
 - **Done.** `memmap.md`: global address map (HBM address interleaving across stacks/PCs/banks, scratchpad, global SRAM, remote die/package windows).
 - **Done.** `noc.md`: topology, routing (XY), virtual channels for deadlock freedom (request/response separation), credit flow control.
-- `hbm.md`: controller architecture (per-PC queues, FR-FCFS scheduler, open/close page policy, refresh,
+- **Done.** `hbm.md`: controller architecture (per-PC queues, FR-FCFS scheduler, open/close page policy, refresh,
   timing table) and the DFI-like boundary to the behavioral PHY + DRAM model.
-- `d2d_c2c.md`: link layer (flits, credits, CRC/replay optional), collective engine (ring/tree all-reduce, all-to-all).
+  As built: adaptive page policy, per-bank refresh, 32/16-entry queues, `clk_mc` = 1.2 GHz; a cycle model shows 0.95-0.99 on decode traffic.
+- **Done.** `d2d_c2c.md`: link layer (flits, credits, CRC/replay optional), collective engine (ring/tree all-reduce, all-to-all).
+  As built: CRC-32C + go-back-N on both links (required, not optional); no engine: hierarchical direct all-reduce and rail-staged
+  all-to-all as DMA programs.
 - Exit: spec reviewed. `isa.yaml` generator emits SV/C++/Python. Every block has an interface table.
+  **Met (2026-11-01)** as a self-review; the independent Opus/xhigh pass on ISA + HBM (§5) is still recommended before Phase 3.
 
 ### Phase 3: RTL, leaf and core blocks (L)
 | Block | Contents | Verification hook |
 |---|---|---|
-| `common` | FIFOs, credit interfaces, arbiters (RR, priority), SRAM wrapper (behavioral ↔ fakeram macro switch) | formal |
+| `common` | FIFOs (incl. async FIFO for the HBM `clk_mc` domain), credit interfaces, arbiters (RR, priority), SRAM wrapper (behavioral ↔ fakeram macro switch) | formal |
 | `arith` | FP8/BF16 multipliers, 4-way dot-product PE, FP32 adder/accumulator, converters, MXFP4 decoder | **exhaustive** FP8×FP8 (65,536 pairs per format) vs `ml_dtypes`; BF16 random + corners |
 | `core/mxu` | output-stationary or weight-stationary array (Phase 2 decides), skew/de-skew, accumulator SRAM | cocotb GEMM vs NumPy |
 | `core/vpu`, `sfu` | lanes, reductions, exp/recip/rsqrt (LUT + polynomial), top-k unit | ULP-error bounds vs NumPy |
@@ -225,7 +231,8 @@ experiments `make numerics`). Remaining: `hbm.md`, `d2d_c2c.md`, spec review.
 - `noc`: router (VCs, credits) and a parameterized mesh generator.
 - `hbm`: controller RTL. PHY = behavioral DFI responder. DRAM = behavioral bank-state model with a **timing-violation
   checker** (tRCD, tRP, tRAS, tRRD, tFAW, tCCD, refresh).
-- `link`: D2D and C2C link-layer RTL, behavioral PHY with configurable latency and bandwidth. Collective engine.
+- `link`: D2D and C2C link-layer RTL (CRC-32C, go-back-N replay, shared-pool credits), behavioral PHY with configurable latency,
+  bandwidth and error injection. Collectives are DMA programs (d2d_c2c.md L-7), not an engine.
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.
@@ -357,6 +364,7 @@ Session hygiene:
 | Verilator or Yosys runs out of memory | Phase 0 calibration caps, the `TINY`/`MID` configs, hierarchical synthesis, `memrun` logging |
 | Yosys SV front end gaps | sv2v in the flow. RTL stays in a conservative SV subset (no classes or interfaces in synthesizable code; packages and structs allowed). |
 | VM RAM for P&R | 12 GB VM cap. Block sizes come from Phase 0 calibration. Nothing heavy runs natively during P&R; lower the cap to 10 GB if macOS swaps. |
+| HBM3e tCCD_L above 2.5 ns (the scheduler cannot hide it; 0.79 of peak at 4.1 ns) | Check the vendor datasheet before tape-out (hbm.md H-6); fallback: SID-alternating address map. Re-run `make hbm` with real timing. |
 | OpenROAD pin becomes stale | Keep the pin. Bumping needs the Bazel build (see the env_setup README). |
 | HBM3e timing not public at vendor level | JESD238 timing scaled to 9.6 Gb/s, documented as representative. The sweep shows sensitivity. |
 | RTL and simulator drift apart | Single ISA source, shared timing table file (`hbm_timing.yaml` → SV params + C++), calibration in CI-style `make calib` |

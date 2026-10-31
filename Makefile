@@ -16,9 +16,9 @@ endif
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit pytest models fetch-models sweep numerics isa formal e2e syn clean
+.PHONY: help lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn clean
 help:
-	@echo "targets: lint unit pytest models fetch-models sweep numerics isa formal e2e syn clean"
+	@echo "targets: lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn clean"
 
 # Lint every RTL file, -Wall, as its own top (block lint).
 lint:
@@ -41,7 +41,8 @@ unit: $(BUILD)
 
 # Python tests (descriptor schema and ingestion). Needs the venv from env_setup.
 pytest:
-	$(PY) -m pytest -q tb/unit/test_descriptors.py tb/unit/test_analytic.py tb/unit/test_isa.py tb/unit/test_noc.py tb/unit/test_numerics.py
+	$(PY) -m pytest -q tb/unit/test_descriptors.py tb/unit/test_analytic.py tb/unit/test_isa.py tb/unit/test_noc.py tb/unit/test_numerics.py \
+	  tb/unit/test_hbm.py tb/unit/test_links.py
 
 # Re-ingest config snapshots into models/descriptors and regenerate docs/reports/model_survey.md.
 models:
@@ -56,7 +57,15 @@ sweep:
 numerics:
 	PYTHONPATH=sw:sim scripts/memrun numerics $(PY) -m analytic.numerics_exp
 
-# ISA: validate isa/isa.yaml, regenerate isa/gen/{isa_pkg.sv,isa.h} and docs/spec/isa_ref.md, lint the SV package.
+# Phase 2 HBM controller model -> docs/reports/hbm_experiments.md (about 60 s, <50 MB).
+hbm:
+	PYTHONPATH=sw:sim scripts/memrun hbm $(PY) -m analytic.hbm --report
+
+# Phase 2 link layer and collective schedules -> docs/reports/links_experiments.md (about 1 s).
+links:
+	PYTHONPATH=sw:sim scripts/memrun links $(PY) -m analytic.links
+
+# ISA: validate isa/isa.yaml, regenerate isa/gen/{isa_pkg.sv,isa.h,isa_defs.py} and docs/spec/isa_ref.md, lint the SV package.
 isa:
 	$(PY) isa/isa.py
 	verilator --lint-only -Wall isa/gen/isa_pkg.sv
