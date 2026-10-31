@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 440" width="940" height="440" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12">
+<style>
+:root{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e4e3df;--axis:#a9a8a3;--s0:#2a78d6;--s1:#eb6834;--s2:#1baf7a;--s3:#eda100;--s4:#e87ba4;--s5:#008300;}
+@media (prefers-color-scheme: dark){:root{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#33332f;--axis:#6b6a64;--s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;--s4:#d55181;--s5:#008300;}}
+.t1{fill:var(--t1)}.t2{fill:var(--t2)}.g{stroke:var(--grid);stroke-width:1}.ax{stroke:var(--axis);stroke-width:1}
+</style>
+<rect width="940" height="440" fill="var(--bg)"/>
+<text x="70" y="24" class="t1" font-size="15" font-weight="600">Decode at 128K context on the serving package count (over 800 B)</text>
+<line class="g" x1="197.9" x2="197.9" y1="48" y2="384"/>
+<text class="t2" x="197.9" y="402" text-anchor="middle">50</text>
+<line class="g" x1="340.3" x2="340.3" y1="48" y2="384"/>
+<text class="t2" x="340.3" y="402" text-anchor="middle">100</text>
+<line class="g" x1="482.8" x2="482.8" y1="48" y2="384"/>
+<text class="t2" x="482.8" y="402" text-anchor="middle">200</text>
+<line class="g" x1="70" x2="640" y1="349.4" y2="349.4"/>
+<text class="t2" x="62" y="353.4" text-anchor="end">50</text>
+<line class="g" x1="70" x2="640" y1="290.5" y2="290.5"/>
+<text class="t2" x="62" y="294.5" text-anchor="end">100</text>
+<line class="g" x1="70" x2="640" y1="231.5" y2="231.5"/>
+<text class="t2" x="62" y="235.5" text-anchor="end">200</text>
+<line class="g" x1="70" x2="640" y1="153.6" y2="153.6"/>
+<text class="t2" x="62" y="157.6" text-anchor="end">500</text>
+<line class="g" x1="70" x2="640" y1="94.7" y2="94.7"/>
+<text class="t2" x="62" y="98.7" text-anchor="end">1k</text>
+<line class="ax" x1="70" x2="640" y1="384" y2="384"/>
+<text class="t2" x="355.0" y="426" text-anchor="middle">tokens/s per user</text>
+<text class="t2" transform="translate(18 216.0) rotate(-90)" text-anchor="middle">tokens/s per package</text>
+<line x1="197.9" x2="197.9" y1="48" y2="384" stroke="var(--axis)" stroke-dasharray="4 4"/>
+<text class="t2" x="201.9" y="378">50 tok/s/user</text>
+<path d="M605.2,357.7 L527.6,271.9 L381.0,214.7 L228.5,159.9 L98.7,95.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="605.2" cy="357.7" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Muse Spark Open: 362.997, 45.37</title></circle>
+<circle cx="527.6" cy="271.9" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Muse Spark Open: 248.793, 124.4</title></circle>
+<circle cx="381.0" cy="214.7" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Muse Spark Open: 121.876, 243.8</title></circle>
+<circle cx="228.5" cy="159.9" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Muse Spark Open: 58.0262, 464.2</title></circle>
+<circle cx="98.7" cy="95.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Muse Spark Open: 30.8512, 987.2</title></circle>
+<path d="M611.3,355.2 L567.4,255.4 L460.1,182.0 L307.2,127.4 L160.3,70.3" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="611.3" cy="355.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 373.816, 46.73</title></circle>
+<circle cx="567.4" cy="255.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 301.981, 151</title></circle>
+<circle cx="460.1" cy="182.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 179.127, 358.3</title></circle>
+<circle cx="307.2" cy="127.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 85.0938, 680.8</title></circle>
+<circle cx="160.3" cy="70.3" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 41.6327, 1332</title></circle>
+<path d="M595.5,361.7 L514.0,277.5 L366.7,220.6 L230.5,159.1" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="595.5" cy="361.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 346.184, 43.27</title></circle>
+<circle cx="514.0" cy="277.5" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 232.836, 116.4</title></circle>
+<circle cx="366.7" cy="220.6" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 113.693, 227.4</title></circle>
+<circle cx="230.5" cy="159.1" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 58.578, 468.6</title></circle>
+<line x1="656" x2="674" y1="54" y2="54" stroke="var(--s0)" stroke-width="2"/>
+<circle cx="665" cy="54" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="58">Muse Spark Open</text>
+<line x1="656" x2="674" y1="74" y2="74" stroke="var(--s1)" stroke-width="2"/>
+<circle cx="665" cy="74" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="78">MiMo-V2.6-Pro</text>
+<line x1="656" x2="674" y1="94" y2="94" stroke="var(--s2)" stroke-width="2"/>
+<circle cx="665" cy="94" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="98">Mistral Large 4</text>
+</svg>

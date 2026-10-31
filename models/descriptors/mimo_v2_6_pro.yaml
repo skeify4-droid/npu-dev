@@ -10,12 +10,14 @@ dims: {hidden: 6144, vocab: 152576, n_layers: 70, max_ctx: 1048576, tie_embeddin
   encoder_layers: null}
 weights:
   total_bytes: 566027990784
+  non_text_bytes: 2067523584
+  duplicate_bytes: 0
   dtypes: {expert: mxfp4, dense: fp8, embed: bf16, table: fp8}
   notes: FP8 dense, 4-bit experts (see flag); o_proj kept in BF16 (ignored_layers).
 attn_types:
-  full: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 192, v_head_dim: 128, rope_dim: 64}
+  full: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 192, v_head_dim: 128, rope_dim: 64, o_dtype: bf16}
   swa: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 192, v_head_dim: 128, rope_dim: 64, window: 128,
-    sink_bias: true}
+    sink_bias: true, o_dtype: bf16}
 ffn_types:
   dense: {kind: dense, d_ff: 16384}
   moe:
@@ -47,12 +49,28 @@ layers:
 - {n: 6, attn: swa, ffn: moe}
 - {n: 1, attn: full, ffn: moe}
 mtp: null
-drafter: {kind: dflash, in_main_weights: false, n_layers: 5, hidden: 6144, d_ff: 16384, n_heads: 128,
-  n_kv_heads: 8, head_dim: 128, window: 1024, block: 8, source: dflash/config.json}
+drafter:
+  kind: dflash
+  in_main_weights: false
+  n_layers: 5
+  hidden: 6144
+  d_ff: 16384
+  attn: {kind: gqa, n_heads: 128, n_kv_heads: 8, head_dim: 128}
+  window: 1024
+  block: 8
+  target_layer_ids: [0, 15, 31, 47, 69]
+  fc_in: 30720
+  dtype: bf16
+  aux_dtype: bf16
+  shares_target_embed_and_lm_head: true
+  source: dflash/config.json, dflash/dflash.py, dflash safetensors header
+spec_decode: {method: dflash, draft_tokens: 7, in_weights: drafter, source: 'tech report 2.4: 7 tokens
+    per forward pass (block 8); RL rollouts use block 6'}
 extras: {}
 published: {total_b: 1020, active_b: 42, source: README}
-sources: ['README (params, layer split, drafter)', dflash/config.json, model.safetensors.index.json (mtp
-    tensors are dense)]
+sources: ['README (params, layer split, drafter)', dflash/config.json, dflash/dflash.py (spec_generate),
+  'MiMo_V2_6_technical_report.pdf (Table 1, 2.4, RL infra)', model.safetensors.index.json (mtp tensors
+    are dense)]
 flags:
 - {id: attention_sink_bias, severity: info, detail: SWA layers add a learned sink logit to the softmax.}
 - {id: hybrid_pattern, severity: info, detail: 'hybrid_layer_pattern: 1 = sliding window (60 layers),
@@ -64,5 +82,5 @@ flags:
     Modeled as MXFP4 experts.'}
 - {id: modalities, severity: info, detail: Vision and audio towers excluded.}
 derived: {params_total_b: 1021.2, params_active_b: 41.0, params_expert_b: 1000.2, params_table_b: 0.0,
-  expected_weight_gb: 554.3, published_weight_gb: 566.0, weight_check_ratio: 0.979, published_total_ratio: 1.001,
-  published_active_ratio: 0.975}
+  params_mtp_layer_b: 0.0, params_drafter_b: 2.77, expected_weight_gb: 561.3, published_weight_gb: 566.0,
+  weight_check_ratio: 0.995, published_total_ratio: 1.001, published_active_ratio: 0.975}

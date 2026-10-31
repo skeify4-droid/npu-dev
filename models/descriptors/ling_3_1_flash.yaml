@@ -10,6 +10,8 @@ dims: {hidden: 4096, vocab: 157184, n_layers: 72, max_ctx: 262144, tie_embedding
   encoder_layers: null}
 weights:
   total_bytes: 573753281152
+  non_text_bytes: 0
+  duplicate_bytes: 0
   dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
   notes: FP8 e4m3.
 attn_types:
@@ -50,6 +52,7 @@ layers:
 - {n: 1, attn: mla, ffn: moe}
 mtp: {n_layers: 1, attn: mla, ffn: moe}
 drafter: null
+spec_decode: {method: mtp, draft_tokens: 1, in_weights: mtp, source: config num_nextn_predict_layers}
 extras: {}
 published: {total_b: 560, active_b: 25, source: README}
 sources: [inclusionAI/Ling-3.1-flash/modeling_bailing_moe_v3.py, README]
@@ -60,5 +63,6 @@ flags:
     forget (f_proj) and output (g_proj) gates, short conv, chunked scan.'}
 - {id: group_limited_routing, severity: info, detail: Router picks 4 of 8 expert groups first.}
 - {id: modalities, severity: info, detail: Text path only.}
-derived: {params_total_b: 572.1, params_active_b: 24.5, params_expert_b: 555.7, params_table_b: 0.0, expected_weight_gb: 573.4,
-  published_weight_gb: 573.8, weight_check_ratio: 0.999, published_total_ratio: 1.022, published_active_ratio: 0.979}
+derived: {params_total_b: 572.1, params_active_b: 24.3, params_expert_b: 555.7, params_table_b: 0.0, params_mtp_layer_b: 0.25,
+  params_drafter_b: 0.0, expected_weight_gb: 573.4, published_weight_gb: 573.8, weight_check_ratio: 0.999,
+  published_total_ratio: 1.022, published_active_ratio: 0.97}

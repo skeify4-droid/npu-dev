@@ -1,0 +1,12 @@
+slug	non_text_bytes	duplicate_bytes	source
+deepseek_v4_1_flash	970536960	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+glm_5_3	0	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+glm_5_3_flash	1127254016	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+mimo_v2_6_pro	2067523584	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+mimo_v2_6_flash	1979443200	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+ling_3_1_flash	0	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+minimax_m3_1_flash	1734145024	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+step_5_preview	3962029568	2733196800	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+mistral_large_4	3408437248	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+muse_spark_open	4091955200	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)
+qwen3_8_flash_next	897862112	0	safetensors headers of all shards: vision/audio tensors; tensors stored twice (2026-11-01)

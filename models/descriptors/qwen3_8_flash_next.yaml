@@ -10,6 +10,8 @@ dims: {hidden: 2560, vocab: 248320, n_layers: 48, max_ctx: 262144, tie_embedding
   encoder_layers: null}
 weights:
   total_bytes: 359999963128
+  non_text_bytes: 897862112
+  duplicate_bytes: 0
   dtypes: {expert: bf16, dense: bf16, embed: bf16, table: bf16, hc: bf16}
   notes: BF16 as published.
 attn_types:
@@ -59,6 +61,7 @@ layers:
 - {n: 1, attn: full, ffn: moe}
 mtp: {n_layers: 1, attn: full, ffn: moe}
 drafter: null
+spec_decode: {method: mtp, draft_tokens: 1, in_weights: mtp, source: config mtp_num_hidden_layers}
 extras:
   hyper_connections: {variant: gated_lowrank, mult: 4, lowrank: 320}
   tables:
@@ -70,7 +73,8 @@ extras:
     lookup: hashed_ngram_gather
     ngram_sizes: [2, 3]
     proj_params: 32768000
-published: {total_b: 180, active_b: 6, source: 'README: 125B (6B active) + 51B n-gram embedding + 4B MTP'}
+published: {total_b: 180, active_b: 6, active_convention: main, source: 'README: 125B (6B active) + 51B
+    n-gram embedding + 4B MTP; active convention inferred (fits without the LM head)'}
 sources: ['transformers modeling_qwen4_exp.py (GatedResidual, NGramEmbedding, QSAIndexer, TopKRouter)',
   README]
 flags:
@@ -89,5 +93,6 @@ flags:
 - {id: published_bf16, severity: warn, detail: Only BF16 weights published; FP8/FP4 deployment needs our
     own quantization.}
 - {id: modalities, severity: info, detail: Vision tower excluded.}
-derived: {params_total_b: 179.5, params_active_b: 6.8, params_expert_b: 123.3, params_table_b: 51.2, expected_weight_gb: 359.1,
-  published_weight_gb: 360.0, weight_check_ratio: 0.997, published_total_ratio: 0.997, published_active_ratio: 1.13}
+derived: {params_total_b: 179.5, params_active_b: 6.7, params_expert_b: 123.3, params_table_b: 51.2, params_mtp_layer_b: 0.12,
+  params_drafter_b: 0.0, expected_weight_gb: 359.1, published_weight_gb: 360.0, weight_check_ratio: 1.0,
+  published_total_ratio: 0.997, published_active_ratio: 1.004}

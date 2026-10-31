@@ -7,19 +7,19 @@ Configs are snapshots of the Hugging Face `config.json` files in `models/configs
 
 | Model | Layers | Hidden | Params (B) | Published (B) | Active (B) | Experts (top-k) | Attention mix | Weights GB | Check |
 |---|---|---|---|---|---|---|---|---|---|
-| DeepSeek V4.1 Flash | 40 | 5120 | 763 | 748 / 16 active | 16.9 (7.6 prefill) | 384 (top-6) | gqa+window x2, gqa+window+sparse x38 | 510 | 0.998 |
-| GLM-5.3 | 78 | 6144 | 753 | - / - active | 40.8 | 256 (top-8) | mla+sparse x78 | 756 | 0.999 |
-| GLM-5.3-Flash | 45 | 4096 | 321 | 320 / 18 active | 17.1 | 288 (top-8) | linear/kda x34, mla+sparse x11 | 328 | 0.981 |
-| Ling 3.1 Flash | 72 | 4096 | 572 | 560 / 25 active | 24.5 | 512 (top-8) | linear/kda x63, mla x9 | 574 | 0.999 |
-| MiMo-V2.6-Flash | 48 | 4096 | 310 | 309 / 15 active | 15.7 | 256 (top-8) | gqa x9, gqa+window x39 | 173 | 0.978 |
-| MiMo-V2.6-Pro | 70 | 6144 | 1021 | 1020 / 42 active | 41.0 | 384 (top-8) | gqa x10, gqa+window x60 | 566 | 0.979 |
-| MiniMax-M3.1-Flash | 60 | 6144 | 426 | 428 / 23 active | 24.7 | 128 (top-4) | gqa+sparse x60 | 250 | 0.941 |
-| Mistral Large 4 | 72 | 6144 | 1049 | 1000 / 52 active | 51.1 | 128 (top-4) | mla+sparse x72 | 1061 | 0.992 |
-| Muse Spark Open | 62 | 8192 | 820 | 816 / 42 active | 44.4 | 256 (top-8) | gqa+window x46, gqa x16 | 1644 | 0.997 |
-| Qwen3.8-Flash-Next | 48 | 2560 | 180 | 180 / 6 active | 6.8 | 512 (top-10) | linear/gdn x36, gqa+sparse x12 | 360 | 0.997 |
-| Step 5 Preview | 92 | 4096 | 619 | 600 / 27 active | 27.4 | 352 (top-8) | gqa+window x69, gqa+sparse x23 | 644 | 0.962 |
+| DeepSeek V4.1 Flash | 40 | 5120 | 763 | 748 / 16 active | 16.1 (7.6 prefill) | 384 (top-6) | gqa+window x2, gqa+window+sparse x38 | 510 | 1.000 |
+| GLM-5.3 | 78 | 6144 | 753 | 753.3 / None active | 40.3 | 256 (top-8) | mla+sparse x78 | 756 | 0.999 |
+| GLM-5.3-Flash | 45 | 4096 | 321 | 320 / 18 active | 16.7 | 288 (top-8) | linear/kda x34, mla+sparse x11 | 328 | 0.999 |
+| Ling 3.1 Flash | 72 | 4096 | 572 | 560 / 25 active | 24.3 | 512 (top-8) | linear/kda x63, mla x9 | 574 | 0.999 |
+| MiMo-V2.6-Flash | 48 | 4096 | 310 | 309 / 15 active | 14.8 | 256 (top-8) | gqa x9, gqa+window x39 | 173 | 0.999 |
+| MiMo-V2.6-Pro | 70 | 6144 | 1021 | 1020 / 42 active | 41.0 | 384 (top-8) | gqa x10, gqa+window x60 | 566 | 0.995 |
+| MiniMax-M3.1-Flash | 60 | 6144 | 426 | 428 / 23 active | 24.7 | 128 (top-4) | gqa+sparse x60 | 250 | 0.999 |
+| Mistral Large 4 | 72 | 6144 | 1052 | 1000 / 49 active | 51.1 | 128 (top-4) | mla+sparse x72 | 1061 | 0.999 |
+| Muse Spark Open | 62 | 8192 | 820 | 816 / 42 active | 44.4 | 256 (top-8) | gqa+window x46, gqa x16 | 1644 | 1.000 |
+| Qwen3.8-Flash-Next | 48 | 2560 | 180 | 180 / 6 active | 6.7 | 512 (top-10) | linear/gdn x36, gqa+sparse x12 | 360 | 1.000 |
+| Step 5 Preview | 92 | 4096 | 601 | 600 / 27 active | 26.6 | 352 (top-8) | gqa+window x69, gqa+sparse x23 | 644 | 1.000 |
 
-Two independent checks on the layer plans. `Check` = weight bytes estimated from the layer plan and dtypes divided by the published safetensors size (worst case 6% off). `Published` = total / active parameter counts quoted by the model authors (totals within 5%; the authors round, and 'active' conventions for embeddings differ).
+Two independent checks on the layer plans. `Check` = weight bytes estimated from the layer plan and dtypes divided by the published safetensors size (worst case 1% off). `Published` = total / active parameter counts quoted by the model authors (totals within 5%; the authors round, and 'active' conventions for embeddings differ).
 
 ## Weight dtypes as published
 
@@ -31,11 +31,11 @@ Two independent checks on the layer plans. `Check` = weight bytes estimated from
 | Ling 3.1 Flash | fp8 | fp8 | FP8 e4m3. |
 | MiMo-V2.6-Flash | mxfp4 | fp8 | FP8 dense, 4-bit experts (see flag); o_proj kept in BF16 (ignored_layers). |
 | MiMo-V2.6-Pro | mxfp4 | fp8 | FP8 dense, 4-bit experts (see flag); o_proj kept in BF16 (ignored_layers). |
-| MiniMax-M3.1-Flash | mxfp4 | mxfp8 | MXFP8 dense per quantization_config; expert tensors are packed 4-bit (see flag). |
+| MiniMax-M3.1-Flash | nvfp4 | mxfp8 | MXFP8 dense per quantization_config; routed experts NVFP4 (see flag). KV and index-key caches NVFP4 as served by vLLM on Blackwell. |
 | Mistral Large 4 | fp8 | fp8 | FP8 128x128 block scales. Weights shipped as consolidated-*.safetensors (no index). |
 | Muse Spark Open | bf16 | bf16 | BF16 as published; weights fetched from the unsloth mirror (original repo is gated). |
 | Qwen3.8-Flash-Next | bf16 | bf16 | BF16 as published. |
-| Step 5 Preview | fp8 | fp8 | FP8 e4m3 128x128 block scales. |
+| Step 5 Preview | fp8 | bf16 | Routed experts FP8 e4m3 (128x128 F32 scales); attention, shared experts, dense MLPs and MTP layers BF16 (safetensors headers). Each MTP layer has its own output head. KV cache BF16 (reference DSALayerCache), region summaries FP8. |
 
 ## KV cache and recurrent state per sequence
 
@@ -49,11 +49,11 @@ FP8 unless a layer type says otherwise (DeepSeek: NVFP4 global KV, MXFP4 index k
 | Ling 3.1 Flash | 5,184 | 0.63 GB | 5.1 GB | 258 MB |
 | MiMo-V2.6-Flash | 11,520 | 1.41 GB | 11.2 GB | 12 MB |
 | MiMo-V2.6-Pro | 25,600 | 3.12 GB | 25.0 GB | 19 MB |
-| MiniMax-M3.1-Flash | 69,120 | 8.44 GB | 67.5 GB | 0 MB |
+| MiniMax-M3.1-Flash | 38,880 | 4.75 GB | 38.0 GB | 0 MB |
 | Mistral Large 4 | 40,768 | 4.98 GB | 39.8 GB | 0 MB |
 | Muse Spark Open | 32,768 | 4.00 GB | 32.0 GB | 184 MB |
 | Qwen3.8-Flash-Next | 12,672 | 1.55 GB | 12.4 GB | 109 MB |
-| Step 5 Preview | 41,216 | 5.03 GB | 40.2 GB | 52 MB |
+| Step 5 Preview | 71,392 | 8.71 GB | 69.7 GB | 104 MB |
 
 ## Hyper-connections and hashed-gather tables (hardware requirements)
 
@@ -63,7 +63,7 @@ Per token and per sublayer (two sublayers per layer). `Mixer MACs` = the mixing 
 |---|---|---|---|---|---|---|---|---|
 | DeepSeek V4.1 Flash | mhc_sinkhorn | 4 | 0.49 | 0.49 M | 120 KB | 0.3% | 48 | 264 B x 24, 264 B x 24 |
 | GLM-5.3-Flash | mhc_sinkhorn | 4 | 0.39 | 0.39 M | 96 KB | 0.3% | - | - |
-| Qwen3.8-Flash-Next | gated_lowrank | 4 | 6.59 | 6.59 M | 60 KB | 9.5% | 16 | 320 B x 16 |
+| Qwen3.8-Flash-Next | gated_lowrank | 4 | 6.59 | 6.59 M | 60 KB | 9.7% | 16 | 320 B x 16 |
 
 ## Speculative decoding
 
@@ -76,10 +76,10 @@ Per token and per sublayer (two sublayers per layer). `Mixer MACs` = the mixing 
 | MiMo-V2.6-Flash | 3 x (swa, dense) | dflash: 5 layers, block 8, window 1024 |
 | MiMo-V2.6-Pro | - | dflash: 5 layers, block 8, window 1024 |
 | MiniMax-M3.1-Flash | - | dspark: 5 layers, block 7, window 4096 |
-| Mistral Large 4 | - | dspark: 3 layers, block 3 |
+| Mistral Large 4 | - | dspark: 3 layers, block 3, window 2048 |
 | Muse Spark Open | - | - |
 | Qwen3.8-Flash-Next | 1 x (full, moe) | - |
-| Step 5 Preview | 3 x (swa, moe) | - |
+| Step 5 Preview | 3 x (swa, dense) | - |
 
 ## Features outside the base schema
 
@@ -95,6 +95,7 @@ Per token and per sublayer (two sublayers per layer). `Mixer MACs` = the mixing 
 | DeepSeek V4.1 Flash | `csa2_modes` | Every attention layer attends over a 128-token raw window plus top-512 entries of the global cache. Full layers (ids [2, 8, 14, 20]) build the cache and the indexer; Reindex layers (ids [24, 28, 32, 36]) rescore the shared index keys with their own query; Reuse layers read the previous top-k. Reindex layers only search a 16384-position candidate pool (Hierarchical Sparse Indexer). |
 | DeepSeek V4.1 Flash | `fp4_kv_cache` | Global KV is FP4 E2M1 with an E4M3 scale per 16 channels (0.5625 B/element); indexer K/Q are FP4 with an E8M0 scale per 32; the 128-token window stays FP8. 890 B of global KV per token, reproduced by this descriptor. |
 | GLM-5.3-Flash | `hyper_connections` | mHC, same form as DeepSeek V4.1: fp32 [24 x 4d] projection per sublayer plus Sinkhorn (20 iters), and a final 'hyper head' collapse. See docs/spec/hyper_connections.md. |
+| MiniMax-M3.1-Flash | `experts_stored_nvfp4` | quantization_config says MXFP8, but the routed experts are NVFP4: packed E2M1 (U8, two per byte), an FP8 E4M3 scale per 16 elements and an FP32 global weight scale and input scale per expert matrix (checked on the safetensors headers: w1 (3072, 3072) U8 with scale (3072, 384)). Attention, dense and shared-expert projections are FP8 E4M3 with an E8M0 (U8) scale per 32 (MXFP8). Router gate is FP32. |
 | Qwen3.8-Flash-Next | `hyper_connections` | Gated low-rank hyper-connection (no Sinkhorn): 4 streams, per sublayer a grouped RMSNorm, a [4d -> 320 -> 4d] SiLU/sigmoid mixer that collapses the streams by a mean, and a [4d -> 4] sigmoid injection gate. A different design from mHC. See docs/spec/hyper_connections.md. |
 | Qwen3.8-Flash-Next | `ngram_embedding` | Per-layer embedding on layer 1: 16 hashed 2/3-gram heads of 160 (BF16) from a 320 M-row table = 51 B elements (README: '51B n-gram embedding'), then key/value projections into the 4 streams. Needs a hashed-gather DMA. |
 
@@ -104,25 +105,23 @@ Per token and per sublayer (two sublayers per layer). `Mixer MACs` = the mixing 
 |---|---|---|
 | DeepSeek V4.1 Flash | `dspark_in_weights` | 3 DSpark draft layers are in the main weights (128 experts, top-3, FP4), block size 5, with a Markov head and a confidence head. Modeled as MTP layers; the draft/verify schedule is not. |
 | GLM-5.3 | `dsa_indexer` | DeepSeek-Sparse-Attention lightning indexer, top-2048 tokens. 21 layers compute it, the rest reuse the previous result (per indexer_types). |
-| GLM-5.3-Flash | `kda_linear_attention` | 34 Kimi-Delta-style linear-attention layers: q/k/v/o full size, forget and output gates low-rank (rank 128), short conv, chunked delta-rule scan. |
+| GLM-5.3-Flash | `kda_linear_attention` | 34 Kimi-Delta-style linear-attention layers: q/k/v/o full size, forget and output gates low-rank (rank 128), short conv, chunked delta-rule scan. All their projections are BF16 (quantization_config.modules_to_not_convert); the MLA and MoE weights are FP8. |
 | GLM-5.3-Flash | `indexer_key_pooling` | Indexer keys are pooled by 4 with a learned gate (index_kpool); the tail block is always selected. |
 | Ling 3.1 Flash | `kda_linear_attention` | Kimi-Delta linear attention: q/k/v/o plus full-size forget (f_proj) and output (g_proj) gates, short conv, chunked scan. |
 | MiMo-V2.6-Flash | `separate_drafter` | Speculative decoding uses a separate 5-layer DFlash drafter (SWA window 1024, block 8, reads target hidden states) that is not in the main weights. |
 | MiMo-V2.6-Flash | `experts_stored_fp4` | quantization_config says FP8, but the safetensors expert tensors are packed 4-bit (U8). The HF tensor dtype counts and the total-size check both agree. Modeled as MXFP4 experts. |
 | MiMo-V2.6-Pro | `separate_drafter` | Speculative decoding uses a separate 5-layer DFlash drafter (SWA window 1024, block 8, reads target hidden states) that is not in the main weights. |
 | MiMo-V2.6-Pro | `experts_stored_fp4` | quantization_config says FP8, but the safetensors expert tensors are packed 4-bit (U8). The HF tensor dtype counts and the total-size check both agree. Modeled as MXFP4 experts. |
-| MiniMax-M3.1-Flash | `block_sparse_attention` | MiniMax Sparse Attention: 16 blocks of 128 chosen by a 4-head indexer (score=max), plus init and local blocks; in every layer. Paper arXiv 2606.13392 not yet read. |
+| MiniMax-M3.1-Flash | `block_sparse_attention` | MiniMax Sparse Attention: 16 blocks of 128 chosen by a 4 index query heads (one per GQA group) and ONE index key head shared by all groups (arXiv 2606.13392 eq. 5). Every cached token is scored (dot product / sqrt(d_idx)), the score of a block is the max over its tokens, then top-k blocks per group; the query's own (local) block is forced and counts as one of the 16 slots (init_block=0, so no sink block). Decode therefore reads all N index keys plus only k*block KV tokens, in every layer. vLLM serves both the KV cache and the index-key cache in NVFP4 (--kv-cache-dtype nvfp4, indexer_kv_dtype nvfp4); indexer_decode_cp splits the decode index scan across TP ranks by context. |
 | MiniMax-M3.1-Flash | `separate_drafter` | DSpark draft head (5 layers, dense FFN 12288, block 7, Markov head, confidence head) ships in dspark/ and is not in the main weights. |
-| MiniMax-M3.1-Flash | `experts_stored_fp4` | quantization_config says MXFP8, but expert tensors are packed 4-bit (U8). The README confirms quantization-aware training of the routed experts and attention paths. Modeled as MXFP4 experts; the total-size check lands 6% under, so some tensors are larger than modeled. |
 | Mistral Large 4 | `dsa_indexer` | Indexed sparse attention, top-2048, FP8 indexer and FP8 KV; 44 layers own an indexer (params.json dsa.sharing equals indexer_types). |
 | Mistral Large 4 | `kv_sharing` | params.json kv_sharing: layers [39, 43, 47, 51, 55, 59, 63, 67, 71] read layer 35's latent KV (their own q/attention still run). Modeled with kv_role=reuse. |
-| Mistral Large 4 | `separate_drafter` | DSpark draft head: 3 dense BF16 MLA layers, block 3, Markov rank 512; ships next to the target weights. |
 | Muse Spark Open | `narrow_expert_width` | Experts run at moe_hidden_size=4096 (model dim 8192) behind pre/post projections with a centered RMSNorm. |
 | Muse Spark Open | `published_bf16` | Only BF16 weights are published (1.64 TB); FP8/FP4 deployment needs our own quantization. |
 | Qwen3.8-Flash-Next | `gated_deltanet` | 36 Gated-DeltaNet linear-attention layers (README: 3 x (GDN -> MoE) then 1 x (sparse attention -> MoE)). |
 | Qwen3.8-Flash-Next | `qsa_indexer` | Qwen Sparse Attention on the 12 full-attention layers: MQA indexer (4 query heads, 1 key head, dim 128) over keys compressed by 4; budget 2048 tokens = 512 blocks. |
 | Qwen3.8-Flash-Next | `published_bf16` | Only BF16 weights published; FP8/FP4 deployment needs our own quantization. |
-| Step 5 Preview | `sparse_full_attention` | Full-attention layers use a 16-head indexer (proxy dim 256) with block compression 'csa_block_compress' (top-512, region 8). The reference code uses weighted-ReLU scores; the compression details are approximated as a plain indexer. |
+| Step 5 Preview | `csa_region_compression` | Full-attention layers (CSA): one shared index key (dim 256) and a gate z per token; every 8 tokens are pooled into one FP8 region summary by a per-dimension softmax over z (s_d = sum_t softmax_t(z_td) k_td). 16 index query heads in 4 groups (one per KV group) score summaries as sum_h w_h relu(q_h . s); each group takes the top-512 regions (4096 tokens) and attends to their raw BF16 K/V plus the unfinished region. Decode scores N/8 summaries. |
 
 ### info
 
@@ -133,7 +132,7 @@ Per token and per sublayer (two sublayers per layer). `Mixer MACs` = the mixing 
 - **MiMo-V2.6-Flash**: `attention_sink_bias`, `hybrid_pattern`, `modalities`
 - **MiMo-V2.6-Pro**: `attention_sink_bias`, `hybrid_pattern`, `modalities`
 - **MiniMax-M3.1-Flash**: `swiglu_oai`, `gemma_norm`, `modalities`
-- **Mistral Large 4**: `router_softmax`, `nope_layers`, `softmax_scaling`, `modalities`
+- **Mistral Large 4**: `drafter_in_weights`, `router_softmax`, `nope_layers`, `softmax_scaling`, `modalities`
 - **Muse Spark Open**: `router_sigmoid_bias`, `residual_gate`, `custom_scaling`, `modalities`
 - **Qwen3.8-Flash-Next**: `router_softmax`, `modalities`
-- **Step 5 Preview**: `head_wise_attn_gate`, `fp32_residual`, `mtp_layers_in_layer_types`, `router_sigmoid_bias`, `modalities`
+- **Step 5 Preview**: `bf16_expert_layers`, `head_wise_attn_gate`, `fp32_residual`, `mtp_layers_in_layer_types`, `router_sigmoid_bias`, `modalities`

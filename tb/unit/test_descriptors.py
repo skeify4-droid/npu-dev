@@ -25,13 +25,14 @@ def test_eleven_models():
 @pytest.mark.parametrize("slug", SLUGS)
 def test_validates_and_weight_check(slug):
     d = S.validate(desc(slug))
-    # layer plan + dtypes must reproduce the published weight size
-    assert abs(d["derived"]["weight_check_ratio"] - 1) < 0.07
+    # layer plan + dtypes must reproduce the published weight size (vision/audio and duplicated tensors removed)
+    assert abs(d["derived"]["weight_check_ratio"] - 1) < 0.02
     assert d["derived"]["params_active_b"] < d["derived"]["params_total_b"]
     # second, independent check: parameter counts quoted by the authors (they round; 'active' conventions differ)
     if d.get("published"):
         assert abs(d["derived"]["published_total_ratio"] - 1) < 0.06
-        assert abs(d["derived"]["published_active_ratio"] - 1) < 0.15
+        if d["published"].get("active_b"):  # counted the way the author counts (main layers, +/- LM head, +/- embedding)
+            assert abs(d["derived"]["published_active_ratio"] - 1) < 0.08
 
 
 @pytest.mark.parametrize("slug", SLUGS)
@@ -142,3 +143,75 @@ def test_validator_rejects_bad_descriptors():
     bad["weights"]["dtypes"]["expert"] = "fp3"
     with pytest.raises(S.SchemaError):
         S.validate(bad)
+
+
+def test_minimax_msa_and_nvfp4_experts():
+    """Facts checked on the MSA paper (arXiv 2606.13392) and on the safetensors headers of the HF repo."""
+    d = desc("minimax_m3_1_flash")
+    assert d["weights"]["dtypes"]["expert"] == "nvfp4"
+    assert abs(d["derived"]["weight_check_ratio"] - 1) < 0.005          # language-model tensors: 248.37 GB on disk
+    sp = d["attn_types"]["gqa_sparse"]["sparse"]
+    assert (sp["n_heads"], sp["k_heads"], sp["head_dim"], sp["block_size"], sp["topk"]) == (4, 1, 128, 128, 2048)
+    assert (sp["score"], sp["local_blocks"], sp["init_blocks"]) == ("max", 1, 0)
+    # index projections per layer: q 6144 x (4 x 128) and one shared k 6144 x 128, no per-head weight vector
+    h = d["dims"]["hidden"]
+    a = d["attn_types"]["gqa_sparse"]
+    base = h * 64 * 128 + 2 * h * 4 * 128 + 64 * 128 * h
+    assert S._attn_params(a, h) - base == h * 4 * 128 + h * 128
+    # decode reads every index key: 60 layers x 128 dims per token, NVFP4 as served by vLLM (0.5625 B/element)
+    kb = S.kv_breakdown(d, 1 << 20)
+    assert kb["index"] == 60 * 128 * 0.5625 * (1 << 20)
+    assert sp["key_dtype"] == "nvfp4" and d["attn_types"]["gqa_sparse"]["kv_dtype"] == "nvfp4"
+    # 'approximately 23B activated' counts the main layers without the 1.23 B LM head
+    assert d["published"]["active_convention"] == "main"
+    assert S.active_by_convention(d, "main") / 1e9 == pytest.approx(23.5, abs=0.1)
+    # the DSpark head taps 5 target layers
+    dr = d["drafter"]
+    assert dr["target_layer_ids"] == [3, 17, 31, 45, 59] and dr["fc_in"] == 5 * h
+    ids = {f["id"]: f for f in d["flags"]}
+    assert ids["experts_stored_nvfp4"]["severity"] == "required"
+
+
+def test_drafters_match_their_safetensors():
+    """Drafter parameter/byte models reproduce the headers of the published drafter files."""
+    mm = desc("minimax_m3_1_flash")["drafter"]
+    assert S.drafter_bytes(mm) == pytest.approx(2_301_852_674, rel=0.005)        # dspark/model-dspark-00001 (MXFP8 + BF16)
+    mi = desc("mimo_v2_6_flash")["drafter"]
+    assert S.drafter_params(mi)["total"] == pytest.approx(1_468_057_152, rel=0.001)  # dflash_draft_model.safetensors
+    ml = desc("mistral_large_4")
+    assert ml["drafter"]["in_main_weights"] is True                              # mtp_dspark.* in consolidated-00054
+    assert S.drafter_bytes(ml["drafter"]) == pytest.approx(4_199_938_048, rel=0.002)
+    assert ml["drafter"]["target_layer_ids"] == [1, 18, 36, 54, 71]
+
+
+def test_step5_from_code_and_headers():
+    d = desc("step_5_preview")
+    assert abs(d["derived"]["weight_check_ratio"] - 1) < 0.005
+    assert d["weights"]["dtypes"]["dense"] == "bf16" and d["weights"]["duplicate_bytes"] == 2_733_196_800
+    i, bf16 = 0, []
+    for r in d["layers"]:
+        for _ in range(r["n"]):
+            if d["ffn_types"][r["ffn"]].get("expert_dtype") == "bf16":
+                bf16.append(i)
+            i += 1
+    assert bf16 == [88, 89, 90]                                                   # quantization_config.modules_to_not_convert
+    sp = d["attn_types"]["full"]["sparse"]
+    assert (sp["key_pool"], sp["topk"], sp["groups"], sp["score"], sp["key_gate"]) == (8, 4096, 4, "weighted_relu", True)
+    assert d["mtp"]["ffn"] == "dense" and d["mtp"]["own_lm_head"] is True
+
+
+def test_spec_decode_recorded():
+    expect = {"deepseek_v4_1_flash": "dspark", "minimax_m3_1_flash": "dspark", "mistral_large_4": "dspark",
+              "mimo_v2_6_flash": "dflash", "mimo_v2_6_pro": "dflash", "muse_spark_open": None}
+    for slug in SLUGS:
+        sd = desc(slug).get("spec_decode")
+        if slug in expect and expect[slug] is None:
+            assert sd is None
+            continue
+        assert sd["method"] == expect.get(slug, "mtp") and sd["draft_tokens"] >= 1
+    assert desc("minimax_m3_1_flash")["spec_decode"]["draft_tokens"] == 7
+
+
+def test_non_text_bytes_measured():
+    assert desc("minimax_m3_1_flash")["weights"]["non_text_bytes"] == 1_734_145_024
+    assert desc("glm_5_3")["weights"]["non_text_bytes"] == 0

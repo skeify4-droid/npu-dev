@@ -10,6 +10,8 @@ dims: {hidden: 6144, vocab: 204800, n_layers: 72, max_ctx: 1048576, tie_embeddin
   encoder_layers: null}
 weights:
   total_bytes: 1060554587912
+  non_text_bytes: 3408437248
+  duplicate_bytes: 0
   dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
   notes: FP8 128x128 block scales. Weights shipped as consolidated-*.safetensors (no index).
 attn_types:
@@ -107,24 +109,44 @@ layers:
 - {n: 2, attn: mla_reuse_own, ffn: moe}
 - {n: 1, attn: mla_own_reuse, ffn: moe}
 mtp: null
-drafter: {kind: dspark, in_main_weights: unknown, n_layers: 3, hidden: 6144, d_ff: 24576, attn: mla, dtype: bf16,
-  block: 3, markov_rank: 512, source: params.json + README}
+drafter:
+  kind: dspark
+  in_main_weights: true
+  n_layers: 3
+  hidden: 6144
+  d_ff: 24576
+  attn: {kind: mla, n_heads: 64, kv_lora_rank: 512, qk_nope_dim: 64, qk_rope_dim: 64, v_head_dim: 128}
+  window: 2048
+  block: 3
+  target_layer_ids: [1, 18, 36, 54, 71]
+  fc_in: 30720
+  markov_rank: 512
+  markov_head: rnn
+  vocab: 204800
+  aux_params: 11011584
+  dtype: bf16
+  aux_dtype: bf16
+  source: params.json mtp; mtp_dspark.* tensors in consolidated-00054 (shapes from the safetensors header)
+spec_decode: {method: dspark, draft_tokens: 3, in_weights: drafter, source: params.json mtp.depth}
 extras: {}
-published: {total_b: 1000, active_b: 52, source: 'README: ~1T total, 49B active (52B incl. embeddings)'}
-sources: [params.json, transformers modeling_mistral_large4.py, README]
+published: {total_b: 1000, active_b: 49, active_convention: main, source: 'README: ~1T total, 49B active
+    (52B incl. embeddings)'}
+sources: [params.json, transformers modeling_mistral_large4.py, README, consolidated.safetensors.index.json
+    + last-shard header]
 flags:
 - {id: dsa_indexer, severity: warn, detail: 'Indexed sparse attention, top-2048, FP8 indexer and FP8 KV;
     44 layers own an indexer (params.json dsa.sharing equals indexer_types).'}
 - {id: kv_sharing, severity: warn, detail: 'params.json kv_sharing: layers [39, 43, 47, 51, 55, 59, 63,
     67, 71] read layer 35''s latent KV (their own q/attention still run). Modeled with kv_role=reuse.'}
-- {id: separate_drafter, severity: warn, detail: 'DSpark draft head: 3 dense BF16 MLA layers, block 3,
-    Markov rank 512; ships next to the target weights.'}
+- {id: drafter_in_weights, severity: info, detail: 'DSpark draft head: 3 dense BF16 MLA layers (64 heads,
+    no q-LoRA, d_ff 24576), rnn Markov head of rank 512, target taps at layers [1, 18, 36, 54, 71]; stored
+    as mtp_dspark.* in the last shard (4.20 GB, inside the published total).'}
 - {id: router_softmax, severity: info, detail: Router is softmax over fp32 logits with normalized top-k
     weights and no selection bias (confirmed in transformers modeling_mistral_large4.py).}
 - {id: nope_layers, severity: info, detail: '18 layers use no positional rotation (pattern ''rope,rope,rope,nope'').'}
 - {id: softmax_scaling, severity: info, detail: Query scaling by position (ssmax) and tanh logit soft-capping
     at 30.}
 - {id: modalities, severity: info, detail: Vision tower excluded.}
-derived: {params_total_b: 1049.4, params_active_b: 51.1, params_expert_b: 1029.2, params_table_b: 0.0,
-  expected_weight_gb: 1051.9, published_weight_gb: 1060.6, weight_check_ratio: 0.992, published_total_ratio: 1.049,
-  published_active_ratio: 0.982}
+derived: {params_total_b: 1051.5, params_active_b: 51.1, params_expert_b: 1029.2, params_table_b: 0.0,
+  params_mtp_layer_b: 0.0, params_drafter_b: 2.1, expected_weight_gb: 1056.1, published_weight_gb: 1060.6,
+  weight_check_ratio: 0.999, published_total_ratio: 1.051, published_active_ratio: 1.017}

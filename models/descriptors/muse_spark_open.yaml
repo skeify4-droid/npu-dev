@@ -10,6 +10,8 @@ dims: {hidden: 8192, vocab: 202048, n_layers: 62, max_ctx: 1048576, tie_embeddin
   encoder_layers: null}
 weights:
   total_bytes: 1644333137920
+  non_text_bytes: 4091955200
+  duplicate_bytes: 0
   dtypes: {expert: bf16, dense: bf16, embed: bf16, table: bf16}
   notes: BF16 as published; weights fetched from the unsloth mirror (original repo is gated).
 attn_types:
@@ -61,8 +63,10 @@ layers:
 - {n: 1, attn: full, ffn: moe}
 mtp: null
 drafter: null
+spec_decode: null
 extras: {}
-published: {total_b: 816, active_b: 42, source: README}
+published: {total_b: 816, active_b: 42, active_convention: main, source: README; active convention inferred
+    (fits without the LM head)}
 sources: [transformers modeling_muse_spark.py, README]
 flags:
 - {id: narrow_expert_width, severity: warn, detail: Experts run at moe_hidden_size=4096 (model dim 8192)
@@ -76,5 +80,6 @@ flags:
 - {id: custom_scaling, severity: info, detail: 'Unit-scale QK norm x 5.473, elementwise sigmoid output
     gate with output norm, logit soft-cap 20.0.'}
 - {id: modalities, severity: info, detail: Vision/audio towers excluded.}
-derived: {params_total_b: 820.0, params_active_b: 44.4, params_expert_b: 798.9, params_table_b: 0.0, expected_weight_gb: 1640.0,
-  published_weight_gb: 1644.3, weight_check_ratio: 0.997, published_total_ratio: 1.005, published_active_ratio: 1.058}
+derived: {params_total_b: 820.0, params_active_b: 44.4, params_expert_b: 798.9, params_table_b: 0.0, params_mtp_layer_b: 0.0,
+  params_drafter_b: 0.0, expected_weight_gb: 1640.0, published_weight_gb: 1644.3, weight_check_ratio: 1.0,
+  published_total_ratio: 1.005, published_active_ratio: 1.019}

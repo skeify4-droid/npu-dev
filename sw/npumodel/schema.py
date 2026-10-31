@@ -9,10 +9,13 @@ A descriptor is a plain dict (stored as YAML in models/descriptors/<slug>.yaml):
   attn_types{key: attention spec}     see ATTN_KINDS
   ffn_types {key: ffn spec}           see FFN_KINDS
   layers    [{n, attn, ffn}]          run-length encoded, in execution order
-  mtp       {n_layers, attn, ffn} | null    multi-token-prediction layers stored in the main weights
-  drafter   {kind, n_layers, block, ...} | null  separate speculative-decoding draft model (not in main weights)
+  mtp       {n_layers, attn, ffn, own_lm_head} | null    multi-token-prediction layers stored in the main weights
+  drafter   {kind, n_layers, hidden, d_ff, attn, fc_in, markov_rank, dtype, aux_dtype, in_main_weights, ...} | null
+            speculative-decoding draft model; see drafter_params() / drafter_bytes()
+  spec_decode {method, draft_tokens, profile}  how the authors' serving stack drafts (see npumodel.specdec)
   extras    {hyper_connections, tables}
-  published {total_b, active_b, source}  parameter counts quoted by the model authors (cross-check)
+  published {total_b, active_b, active_convention, source}  parameter counts quoted by the model authors (cross-check)
+            active_convention: main (main layers only) | main+lm_head (default) | main+embed+lm_head
   sources   [str]                   what each uncertain fact was verified against
   flags     [{id, severity, detail}]  features outside the base schema or unverified assumptions
 
@@ -152,10 +155,39 @@ def _attn_params(a, h):
     sp = a.get("sparse")
     role = index_role(sp)
     if role in ("own", "reindex"):
-        p += sp.get("q_in", h) * sp["n_heads"] * sp["head_dim"] + h * sp["n_heads"]
+        p += sp.get("q_in", h) * sp["n_heads"] * sp["head_dim"]
+        if sp.get("kind") != "block_topk":
+            p += h * sp["n_heads"]  # per-head weight of the DSA-style lightning indexer; MSA has none
     if role == "own":
-        p += sp.get("k_in", h) * sp["head_dim"]
+        p += sp.get("k_in", h) * sp["head_dim"] * sp.get("k_heads", 1)
+        if sp.get("key_gate"):  # Step 5 CSA: per-dimension softmax logits that pool keys into region summaries
+            p += h * sp["head_dim"]
     return p
+
+
+def index_keys_scanned(a, ctx):
+    """Index keys one decode query scores in a layer (0 when the layer reuses another layer's selection)."""
+    sp = a.get("sparse")
+    role = index_role(sp)
+    if role not in ("own", "reindex"):
+        return 0
+    n = ctx / ((a.get("kv_compress_ratio") or 1) * max(1, sp.get("key_pool", 1)))
+    if role == "reindex" and sp.get("candidate_pool"):
+        n = min(n, sp["candidate_pool"])
+    return n
+
+
+def attn_dtype_split(a, h):
+    """{dtype: params} for the parts of an attention spec stored in a dtype other than the descriptor's dense dtype:
+    `w_dtype` (the whole block, e.g. GLM-5.3-Flash KDA in BF16) or `o_dtype` (output projection only, e.g. MiMo)."""
+    if a.get("w_dtype"):
+        return {a["w_dtype"]: _attn_params(a, h)}
+    if a.get("o_dtype"):
+        H = a["n_heads"]
+        dv = a.get("v_head_dim", a.get("head_dim", 0)) if a["kind"] != "linear" else a["v_dim"]
+        n = (a["n_v_heads"] if a["kind"] == "linear" else H) * dv
+        return {a["o_dtype"]: n * h}
+    return {}
 
 
 def _ffn_params(f, h):
@@ -200,6 +232,29 @@ def hc_ops(hc, h):
             "stream_bytes": 2 * (n * h * 2) + n * h * 2}
 
 
+def _drafter_attn_params(a, h):
+    if a["kind"] == "mla":
+        H = a["n_heads"]
+        qk = a["qk_nope_dim"] + a["qk_rope_dim"]
+        return (h * H * qk + h * (a["kv_lora_rank"] + a["qk_rope_dim"]) + a["kv_lora_rank"] * H * (a["qk_nope_dim"] + a["v_head_dim"])
+                + H * a["v_head_dim"] * h)
+    H, G, d = a["n_heads"], a["n_kv_heads"], a["head_dim"]
+    return h * H * d + 2 * h * G * d + H * d * h
+
+
+def drafter_params(dr):
+    """{layers, aux, total}: transformer layers vs fc / Markov head / confidence head. Embedding and LM head are the target's."""
+    h = dr["hidden"]
+    layers = dr["n_layers"] * (_drafter_attn_params(dr["attn"], h) + 3 * h * dr["d_ff"])
+    aux = dr.get("fc_in", 0) * h + 2 * dr.get("vocab", 0) * dr.get("markov_rank", 0) + dr.get("aux_params", 0)
+    return {"layers": layers, "aux": aux, "total": layers + aux}
+
+
+def drafter_bytes(dr):
+    p = drafter_params(dr)
+    return p["layers"] * DTYPE_BYTES[dr["dtype"]] + p["aux"] * DTYPE_BYTES[dr.get("aux_dtype", dr["dtype"])]
+
+
 def active_params(desc, n_layers=None):
     """Per-token active parameters of the first `n_layers` main layers (all if None). Excludes lm_head when
     n_layers is given (prefill needs no logits for most tokens)."""
@@ -216,20 +271,26 @@ def active_params(desc, n_layers=None):
 def count_params(desc):
     """Parameter counts by weight class (from the layer plan, not from the file size)."""
     h = desc["dims"]["hidden"]
-    c = {"dense": 0, "expert": 0, "embed": 0, "table": 0, "hc": 0, "active": 0}
-    plan = expand_layers(desc)
+    c = {"dense": 0, "expert": 0, "embed": 0, "table": 0, "hc": 0, "active": 0, "active_mtp_layer": 0}
+    main = expand_layers(desc)
+    plan = list(main)
     mt = desc.get("mtp")
+    emb = desc["dims"]["vocab"] * h
     if mt:
         plan = plan + [(desc["attn_types"][mt["attn"]], desc["ffn_types"][mt["ffn"]])] * mt["n_layers"]
         c["dense"] += mt["n_layers"] * 2 * h * h  # eh_proj
-    for a, f in plan:
+        if mt.get("own_lm_head"):  # Step 5: every MTP layer ships its own output head
+            c["embed"] += mt["n_layers"] * emb
+        a, f = desc["attn_types"][mt["attn"]], desc["ffn_types"][mt["ffn"]]
+        c["active_mtp_layer"] = _attn_params(a, h) + _ffn_params(f, h)[2] + 2 * h * h
+    for i, (a, f) in enumerate(plan):
         c["dense"] += _attn_params(a, h)
         d, e, act = _ffn_params(f, h)
         c["dense"] += d
         c["expert"] += e
-        c["active"] += _attn_params(a, h) + act
-    emb = desc["dims"]["vocab"] * h
-    c["embed"] = emb if desc["dims"].get("tie_embeddings") else 2 * emb
+        if i < len(main):  # active = one token through the main layers (MTP layers are reported separately)
+            c["active"] += _attn_params(a, h) + act
+    c["embed"] += emb if desc["dims"].get("tie_embeddings") else 2 * emb
     c["active"] += emb  # lm_head matmul reads the output embedding once per token
     ex = desc.get("extras", {})
     for t in ex.get("tables", []):
@@ -238,19 +299,43 @@ def count_params(desc):
         c["active"] += t.get("proj_params", 0)
     hc = ex.get("hyper_connections")
     if hc:
-        per = 2 * hc_params_per_sublayer(hc, h) * len(plan)
-        c["hc"] = per
-        c["active"] += per
+        c["hc"] = 2 * hc_params_per_sublayer(hc, h) * len(plan)
+        c["active"] += 2 * hc_params_per_sublayer(hc, h) * len(main)
     c["total"] = c["dense"] + c["expert"] + c["embed"] + c["table"] + c["hc"]
+    c["expert_override"] = {}  # expert params whose ffn spec sets its own expert_dtype
+    c["dense_override"] = {}   # attention params stored in another dtype (attn_dtype_split)
+    for a, f in plan:
+        for k, n in attn_dtype_split(a, h).items():
+            c["dense_override"][k] = c["dense_override"].get(k, 0) + n
+        if f.get("expert_dtype"):
+            c["expert_override"][f["expert_dtype"]] = c["expert_override"].get(f["expert_dtype"], 0) + _ffn_params(f, h)[1]
+    dr = desc.get("drafter")
+    c["drafter"] = drafter_params(dr)["total"] if dr and dr.get("attn") else 0
+    if dr and dr.get("in_main_weights") is True:
+        c["total"] += c["drafter"]
     return c
+
+
+def active_by_convention(desc, convention="main+lm_head"):
+    """Active parameters counted the way an author's figure counts them (see `published.active_convention`)."""
+    c = count_params(desc)
+    emb = desc["dims"]["vocab"] * desc["dims"]["hidden"]
+    return {"main": c["active"] - emb, "main+lm_head": c["active"], "main+embed+lm_head": c["active"] + emb}[convention]
 
 
 def expected_weight_bytes(desc):
     c = count_params(desc)
     dt = desc["weights"]["dtypes"]
     b = lambda k: DTYPE_BYTES[dt[k]]
-    return (c["dense"] * b("dense") + c["expert"] * b("expert") + c["embed"] * b("embed")
-            + c["table"] * b("table") + c["hc"] * DTYPE_BYTES[dt.get("hc", "fp32")])
+    ov, dv = c["expert_override"], c["dense_override"]
+    out = ((c["dense"] - sum(dv.values())) * b("dense") + sum(n * DTYPE_BYTES[k] for k, n in dv.items())
+           + (c["expert"] - sum(ov.values())) * b("expert") + c["embed"] * b("embed")
+           + sum(n * DTYPE_BYTES[k] for k, n in ov.items())
+           + c["table"] * b("table") + c["hc"] * DTYPE_BYTES[dt.get("hc", "fp32")])
+    dr = desc.get("drafter")
+    if dr and dr.get("in_main_weights") is True:
+        out += drafter_bytes(dr)
+    return out
 
 
 def kv_bytes(desc, ctx, kv_dtype="fp8", state_dtype="fp32", window_dtype="fp8"):

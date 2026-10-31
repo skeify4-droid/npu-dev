@@ -16,9 +16,9 @@ endif
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit pytest models fetch-models formal e2e syn clean
+.PHONY: help lint unit pytest models fetch-models sweep formal e2e syn clean
 help:
-	@echo "targets: lint unit pytest models fetch-models formal e2e syn clean"
+	@echo "targets: lint unit pytest models fetch-models sweep formal e2e syn clean"
 
 # Lint every RTL file, -Wall, as its own top (block lint).
 lint:
@@ -41,12 +41,16 @@ unit: $(BUILD)
 
 # Python tests (descriptor schema and ingestion). Needs the venv from env_setup.
 pytest:
-	$(PY) -m pytest -q tb/unit/test_descriptors.py
+	$(PY) -m pytest -q tb/unit/test_descriptors.py tb/unit/test_analytic.py
 
 # Re-ingest config snapshots into models/descriptors and regenerate docs/reports/model_survey.md.
 models:
 	PYTHONPATH=sw $(PY) -m npumodel.ingest
 	PYTHONPATH=sw $(PY) -m npumodel.report
+
+# Phase 1 analytical sweeps -> docs/reports/phase1_sweeps.md, docs/spec/plots/*.svg, build/phase1/*.csv (seconds, <50 MB).
+sweep:
+	PYTHONPATH=sw:sim scripts/memrun sweep $(PY) -m analytic.sweep
 
 # Re-download config.json snapshots from Hugging Face (network). Review the diff before committing.
 fetch-models:

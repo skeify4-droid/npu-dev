@@ -10,6 +10,8 @@ dims: {hidden: 5120, vocab: 129280, n_layers: 40, max_ctx: 1048576, tie_embeddin
   encoder_layers: 20}
 weights:
   total_bytes: 510286023000
+  non_text_bytes: 970536960
+  duplicate_bytes: 0
   dtypes: {expert: mxfp4, dense: fp8, embed: bf16, table: mxfp8, hc: fp32}
   notes: Dense FP8 (32x32 UE8M0 scales), experts FP4 (scale per 32), Engram FP8 (scale per 32); mHC weights
     FP32.
@@ -138,6 +140,13 @@ layers:
 - {n: 3, attn: csa_r1_reuse, ffn: moe}
 mtp: {n_layers: 3, attn: swa, ffn: moe_dspark}
 drafter: null
+spec_decode:
+  method: dspark
+  draft_tokens: 5
+  in_weights: mtp
+  target_layer_ids: [37, 38, 39]
+  markov_rank: 256
+  source: config dspark_*; DSpark paper (arXiv 2607.05147) production DSpark-5
 extras:
   hyper_connections: {variant: mhc_sinkhorn, mult: 4, sinkhorn_iters: 20}
   tables:
@@ -189,6 +198,6 @@ flags:
 - {id: mqa_kv_equals_v, severity: info, detail: 'MQA with one 512-wide KV head; K and V are the same vector.
     Grouped low-rank output projection (o_lora 1024, 8 groups).'}
 - {id: vision_tower, severity: info, detail: Vision tower excluded (text decode only).}
-derived: {params_total_b: 762.7, params_active_b: 16.9, params_expert_b: 557.2, params_table_b: 196.6,
-  expected_weight_gb: 509.1, published_weight_gb: 510.3, weight_check_ratio: 0.998, params_active_prefill_b: 7.6,
-  published_total_ratio: 1.02, published_active_ratio: 1.058}
+derived: {params_total_b: 762.7, params_active_b: 16.1, params_expert_b: 557.2, params_table_b: 196.6,
+  params_mtp_layer_b: 0.32, params_drafter_b: 0.0, expected_weight_gb: 509.1, published_weight_gb: 510.3,
+  weight_check_ratio: 1.0, params_active_prefill_b: 7.6, published_total_ratio: 1.02, published_active_ratio: 1.007}

@@ -10,8 +10,11 @@ dims: {hidden: 6144, vocab: 200064, n_layers: 60, max_ctx: 1048576, tie_embeddin
   encoder_layers: null}
 weights:
   total_bytes: 250103411200
-  dtypes: {expert: mxfp4, dense: mxfp8, embed: bf16, table: fp8}
-  notes: MXFP8 dense per quantization_config; expert tensors are packed 4-bit (see flag).
+  non_text_bytes: 1734145024
+  duplicate_bytes: 0
+  dtypes: {expert: nvfp4, dense: mxfp8, embed: bf16, table: fp8}
+  notes: MXFP8 dense per quantization_config; routed experts NVFP4 (see flag). KV and index-key caches
+    NVFP4 as served by vLLM on Blackwell.
 attn_types:
   gqa_sparse:
     kind: gqa
@@ -20,7 +23,9 @@ attn_types:
     head_dim: 128
     rope_dim: 64
     qk_norm: true
-    sparse: {kind: block_topk, n_heads: 4, head_dim: 128, topk: 2048, block_size: 128, index_role: own}
+    sparse: {kind: block_topk, n_heads: 4, head_dim: 128, topk: 2048, block_size: 128, index_role: own,
+      k_heads: 1, score: max, local_blocks: 1, init_blocks: 0, key_dtype: nvfp4, q_dtype: fp8}
+    kv_dtype: nvfp4
 ffn_types:
   dense: {kind: dense, d_ff: 12288}
   moe:
@@ -35,24 +40,53 @@ layers:
 - {n: 3, attn: gqa_sparse, ffn: dense}
 - {n: 57, attn: gqa_sparse, ffn: moe}
 mtp: null
-drafter: {kind: dspark, in_main_weights: false, n_layers: 5, hidden: 6144, d_ff: 12288, n_heads: 64, n_kv_heads: 4,
-  head_dim: 128, window: 4096, block: 7, markov_rank: 256, confidence_head: true, source: dspark/config.json}
+drafter:
+  kind: dspark
+  in_main_weights: false
+  n_layers: 5
+  hidden: 6144
+  d_ff: 12288
+  attn: {kind: gqa, n_heads: 64, n_kv_heads: 4, head_dim: 128}
+  window: 4096
+  block: 7
+  markov_rank: 256
+  vocab: 200064
+  confidence_head: true
+  aux_params: 6401
+  dtype: mxfp8
+  aux_dtype: bf16
+  source: dspark/config.json, dspark safetensors header
+  target_layer_ids: [3, 17, 31, 45, 59]
+  fc_in: 30720
+  shares_target_embed_and_lm_head: true
+  aux_gemm_precision: bf16
+  paper: arXiv 2607.05147
+spec_decode: {method: dspark, draft_tokens: 7, in_weights: drafter, source: 'vLLM recipe: num_speculative_tokens
+    7 (Blackwell), 3 (MI355X); draft KV fp8'}
 extras: {}
-published: {total_b: 428, active_b: 23, source: README}
-sources: [README, dspark/config.json]
+published: {total_b: 428, active_b: 23, active_convention: main, source: 'README (''approximately 23B
+    activated''); convention inferred: 23.5 B without the 1.23 B LM head, 24.7 B with it'}
+sources: [README, dspark/config.json, 'vLLM recipe (KV and indexer caches NVFP4 on Blackwell, FP8 on Hopper)']
 flags:
 - {id: block_sparse_attention, severity: warn, detail: 'MiniMax Sparse Attention: 16 blocks of 128 chosen
-    by a 4-head indexer (score=max), plus init and local blocks; in every layer. Paper arXiv 2606.13392
-    not yet read.'}
+    by a 4 index query heads (one per GQA group) and ONE index key head shared by all groups (arXiv 2606.13392
+    eq. 5). Every cached token is scored (dot product / sqrt(d_idx)), the score of a block is the max
+    over its tokens, then top-k blocks per group; the query''s own (local) block is forced and counts
+    as one of the 16 slots (init_block=0, so no sink block). Decode therefore reads all N index keys plus
+    only k*block KV tokens, in every layer. vLLM serves both the KV cache and the index-key cache in NVFP4
+    (--kv-cache-dtype nvfp4, indexer_kv_dtype nvfp4); indexer_decode_cp splits the decode index scan across
+    TP ranks by context.'}
 - {id: separate_drafter, severity: warn, detail: 'DSpark draft head (5 layers, dense FFN 12288, block
     7, Markov head, confidence head) ships in dspark/ and is not in the main weights.'}
-- {id: experts_stored_fp4, severity: warn, detail: 'quantization_config says MXFP8, but expert tensors
-    are packed 4-bit (U8). The README confirms quantization-aware training of the routed experts and attention
-    paths. Modeled as MXFP4 experts; the total-size check lands 6% under, so some tensors are larger than
-    modeled.'}
+- {id: experts_stored_nvfp4, severity: required, detail: 'quantization_config says MXFP8, but the routed
+    experts are NVFP4: packed E2M1 (U8, two per byte), an FP8 E4M3 scale per 16 elements and an FP32 global
+    weight scale and input scale per expert matrix (checked on the safetensors headers: w1 (3072, 3072)
+    U8 with scale (3072, 384)). Attention, dense and shared-expert projections are FP8 E4M3 with an E8M0
+    (U8) scale per 32 (MXFP8). Router gate is FP32.'}
 - {id: swiglu_oai, severity: info, detail: 'hidden_act=swigluoai (alpha 1.702, limit 7.0): clamped SwiGLU
     variant.'}
 - {id: gemma_norm, severity: info, detail: Gemma-style RMSNorm (1+w) and per-head QK norm.}
 - {id: modalities, severity: info, detail: Vision tower excluded.}
-derived: {params_total_b: 426.2, params_active_b: 24.7, params_expert_b: 413.1, params_table_b: 0.0, expected_weight_gb: 235.3,
-  published_weight_gb: 250.1, weight_check_ratio: 0.941, published_total_ratio: 0.996, published_active_ratio: 1.076}
+derived: {params_total_b: 426.2, params_active_b: 24.7, params_expert_b: 413.1, params_table_b: 0.0, params_mtp_layer_b: 0.0,
+  params_drafter_b: 1.96, expected_weight_gb: 248.2, published_weight_gb: 250.1, weight_check_ratio: 0.999,
+  published_total_ratio: 0.996, published_active_ratio: 1.022}

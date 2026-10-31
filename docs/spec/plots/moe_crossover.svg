@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 440" width="940" height="440" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="12">
+<style>
+:root{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e4e3df;--axis:#a9a8a3;--s0:#2a78d6;--s1:#eb6834;--s2:#1baf7a;--s3:#eda100;--s4:#e87ba4;--s5:#008300;}
+@media (prefers-color-scheme: dark){:root{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#33332f;--axis:#6b6a64;--s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;--s4:#d55181;--s5:#008300;}}
+.t1{fill:var(--t1)}.t2{fill:var(--t2)}.g{stroke:var(--grid);stroke-width:1}.ax{stroke:var(--axis);stroke-width:1}
+</style>
+<rect width="940" height="440" fill="var(--bg)"/>
+<text x="70" y="24" class="t1" font-size="15" font-weight="600">Routed-expert GEMM: MXU utilization vs tokens per expert</text>
+<line class="g" x1="80.1" x2="80.1" y1="48" y2="384"/>
+<text class="t2" x="80.1" y="402" text-anchor="middle">1</text>
+<line class="g" x1="130.1" x2="130.1" y1="48" y2="384"/>
+<text class="t2" x="130.1" y="402" text-anchor="middle">2</text>
+<line class="g" x1="196.1" x2="196.1" y1="48" y2="384"/>
+<text class="t2" x="196.1" y="402" text-anchor="middle">5</text>
+<line class="g" x1="246.1" x2="246.1" y1="48" y2="384"/>
+<text class="t2" x="246.1" y="402" text-anchor="middle">10</text>
+<line class="g" x1="296.1" x2="296.1" y1="48" y2="384"/>
+<text class="t2" x="296.1" y="402" text-anchor="middle">20</text>
+<line class="g" x1="362.2" x2="362.2" y1="48" y2="384"/>
+<text class="t2" x="362.2" y="402" text-anchor="middle">50</text>
+<line class="g" x1="412.2" x2="412.2" y1="48" y2="384"/>
+<text class="t2" x="412.2" y="402" text-anchor="middle">100</text>
+<line class="g" x1="462.2" x2="462.2" y1="48" y2="384"/>
+<text class="t2" x="462.2" y="402" text-anchor="middle">200</text>
+<line class="g" x1="528.2" x2="528.2" y1="48" y2="384"/>
+<text class="t2" x="528.2" y="402" text-anchor="middle">500</text>
+<line class="g" x1="578.2" x2="578.2" y1="48" y2="384"/>
+<text class="t2" x="578.2" y="402" text-anchor="middle">1k</text>
+<line class="g" x1="628.2" x2="628.2" y1="48" y2="384"/>
+<text class="t2" x="628.2" y="402" text-anchor="middle">2k</text>
+<line class="g" x1="70" x2="640" y1="384.0" y2="384.0"/>
+<text class="t2" x="62" y="388.0" text-anchor="end">0</text>
+<line class="g" x1="70" x2="640" y1="320.0" y2="320.0"/>
+<text class="t2" x="62" y="324.0" text-anchor="end">0.2</text>
+<line class="g" x1="70" x2="640" y1="256.0" y2="256.0"/>
+<text class="t2" x="62" y="260.0" text-anchor="end">0.4</text>
+<line class="g" x1="70" x2="640" y1="192.0" y2="192.0"/>
+<text class="t2" x="62" y="196.0" text-anchor="end">0.6</text>
+<line class="g" x1="70" x2="640" y1="128.0" y2="128.0"/>
+<text class="t2" x="62" y="132.0" text-anchor="end">0.8</text>
+<line class="g" x1="70" x2="640" y1="64.0" y2="64.0"/>
+<text class="t2" x="62" y="68.0" text-anchor="end">1</text>
+<line class="ax" x1="70" x2="640" y1="384" y2="384"/>
+<text class="t2" x="355.0" y="426" text-anchor="middle">tokens per expert per step</text>
+<text class="t2" transform="translate(18 216.0) rotate(-90)" text-anchor="middle">fraction of sustained MXU rate</text>
+<path d="M80.1,381.9 L130.1,379.8 L180.1,375.5 L230.0,367.0 L280.0,350.0 L330.0,316.0 L380.0,248.0 L430.0,112.0 L480.0,64.0 L529.9,64.0 L579.9,64.0 L629.9,64.0" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="80.1" cy="381.9" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 1, 0.006641</title></circle>
+<circle cx="130.1" cy="379.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 2, 0.01328</title></circle>
+<circle cx="180.1" cy="375.5" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 4, 0.02656</title></circle>
+<circle cx="230.0" cy="367.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 8, 0.05312</title></circle>
+<circle cx="280.0" cy="350.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 16, 0.1062</title></circle>
+<circle cx="330.0" cy="316.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 32, 0.2125</title></circle>
+<circle cx="380.0" cy="248.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 64, 0.425</title></circle>
+<circle cx="430.0" cy="112.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 128, 0.85</title></circle>
+<circle cx="480.0" cy="64.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 256, 1</title></circle>
+<circle cx="529.9" cy="64.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 512, 1</title></circle>
+<circle cx="579.9" cy="64.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 1024, 1</title></circle>
+<circle cx="629.9" cy="64.0" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>fp8 (same as bf16): 2048, 1</title></circle>
+<path d="M80.1,380.2 L130.1,376.4 L180.1,368.9 L230.0,353.8 L280.0,323.6 L330.0,263.1 L380.0,142.2 L430.0,64.0 L480.0,64.0 L529.9,64.0 L579.9,64.0 L629.9,64.0" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="80.1" cy="380.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 1, 0.01181</title></circle>
+<circle cx="130.1" cy="376.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 2, 0.02361</title></circle>
+<circle cx="180.1" cy="368.9" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 4, 0.04722</title></circle>
+<circle cx="230.0" cy="353.8" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 8, 0.09444</title></circle>
+<circle cx="280.0" cy="323.6" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 16, 0.1889</title></circle>
+<circle cx="330.0" cy="263.1" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 32, 0.3778</title></circle>
+<circle cx="380.0" cy="142.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 64, 0.7556</title></circle>
+<circle cx="430.0" cy="64.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 128, 1</title></circle>
+<circle cx="480.0" cy="64.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 256, 1</title></circle>
+<circle cx="529.9" cy="64.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 512, 1</title></circle>
+<circle cx="579.9" cy="64.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 1024, 1</title></circle>
+<circle cx="629.9" cy="64.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>nvfp4: 2048, 1</title></circle>
+<path d="M80.1,380.0 L130.1,376.0 L180.1,368.0 L230.0,352.0 L280.0,320.0 L330.0,256.0 L380.0,128.0 L430.0,64.0 L480.0,64.0 L529.9,64.0 L579.9,64.0 L629.9,64.0" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="80.1" cy="380.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 1, 0.0125</title></circle>
+<circle cx="130.1" cy="376.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 2, 0.025</title></circle>
+<circle cx="180.1" cy="368.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 4, 0.05</title></circle>
+<circle cx="230.0" cy="352.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 8, 0.1</title></circle>
+<circle cx="280.0" cy="320.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 16, 0.2</title></circle>
+<circle cx="330.0" cy="256.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 32, 0.4</title></circle>
+<circle cx="380.0" cy="128.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 64, 0.8</title></circle>
+<circle cx="430.0" cy="64.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 128, 1</title></circle>
+<circle cx="480.0" cy="64.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 256, 1</title></circle>
+<circle cx="529.9" cy="64.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 512, 1</title></circle>
+<circle cx="579.9" cy="64.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 1024, 1</title></circle>
+<circle cx="629.9" cy="64.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>mxfp4: 2048, 1</title></circle>
+<line x1="656" x2="674" y1="54" y2="54" stroke="var(--s0)" stroke-width="2"/>
+<circle cx="665" cy="54" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="58">fp8 (same as bf16)</text>
+<line x1="656" x2="674" y1="74" y2="74" stroke="var(--s1)" stroke-width="2"/>
+<circle cx="665" cy="74" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="78">nvfp4</text>
+<line x1="656" x2="674" y1="94" y2="94" stroke="var(--s2)" stroke-width="2"/>
+<circle cx="665" cy="94" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"/>
+<text class="t1" x="680" y="98">mxfp4</text>
+</svg>

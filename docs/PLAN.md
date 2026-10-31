@@ -83,6 +83,8 @@ Die:      ≤ 858 mm², 4 HBM3e stacks (4 controllers × 32 PCs), 2D-mesh NoC,
 Core:     MXU (matrix unit) + VPU (vector unit) + SFU + DMA + scratchpad + sequencer
 ```
 
+Frozen on 2026-11-01 with the Phase 1 justification in **`docs/spec/arch.md`** (it wins where the two differ).
+
 | Item | Baseline *(P1)* | Derived |
 |---|---|---|
 | Clock | 1.5 GHz (Phase 6 synthesis checks it on ASAP7) | |
@@ -95,27 +97,30 @@ Core:     MXU (matrix unit) + VPU (vector unit) + SFU + DMA + scratchpad + seque
 | NoC | 2D mesh, 128 B/cycle/link/direction, HBM controllers on edge routers | must sustain ≥ 3.3 KB/cycle HBM ingress |
 | D2D | UCIe-like, 5 TB/s/direction (modeled PHY) | |
 | C2C | 16 ports × 100 GB/s/direction (modeled SerDes) | 1.6 TB/s/package |
-| Data types | FP8 E4M3/E5M2, BF16, MXFP4 weights (decompressed in the DMA path), FP32 accumulate, INT8 optional | |
+| VPU / SFU per core | 512 FP32 FLOP/cycle; 128 exp/rcp/rsqrt per cycle | 24.6 TFLOPS / 6.1 T ops/s per die |
+| Data types | FP8 E4M3/E5M2, BF16, MXFP8, MXFP4 and NVFP4 weights (dequantized to FP8 in the DMA path), NVFP4/FP8/BF16 KV, FP32 accumulate, INT8 optional | |
 
-Capacity check (Phase 1 refines it): a ~1T-parameter model at FP8 needs ≥ 4 packages for weights, and in practice
-8 or more to leave room for KV cache. "Flash" class models should fit 1 package. Multi-package support is a
+Capacity check (Phase 1 result, `docs/spec/arch.md` §3): ~1T-parameter models need 8 packages (Mistral Large 4 for its weights,
+MiMo-Pro for speed, Muse for KV). "Flash" class models hold their weights on 1-2 packages but need 2-4 to serve 64 x 128K sequences at
+>= 50 tokens/s per user. Multi-package support is a
 hard requirement, not an extra.
 
 ### 2.3 LLM features the hardware and compiler must support
 
 Phase 1 step 1 read each model's `config.json`, then its published code, README and technical report where they exist
 (`docs/reports/model_features.md`, `docs/reports/model_survey.md`). The list below is what the 11 real models need,
-not what their predecessors needed. Descriptors are checked against the published weight sizes (within 6%) and
-parameter counts (within 5%).
+not what their predecessors needed. Descriptors are checked against the published weight sizes (all 11 within 0.5% after removing
+measured vision/audio and duplicated tensors) and parameter counts (within 5%).
 
 - MoE: top-k routing, shared experts, fine-grained experts (DeepSeek, GLM, Ling, Qwen3-Next, Mistral Large lines).
   The design needs fast top-k in the VPU, a gather/scatter DMA, and expert-parallel all-to-all.
 - Attention variants (as found in the real configs): GQA/MQA; MLA with weight absorption (GLM, Ling, Mistral); sparse attention with an
-  indexer (DeepSeek CSA2, GLM DSA, Mistral, Step, Qwen QSA) or block top-k (MiniMax MSA); linear attention (KDA in Ling and GLM-Flash,
+  indexer (DeepSeek CSA2, GLM DSA, Mistral, Qwen QSA, Step CSA: 8-token region summaries pooled by a softmax gate, weighted-ReLU scores,
+  top-512 regions per KV group) or block top-k (MiniMax MSA: per-token index scoring of the whole cache, block max, top-16 of 128-token blocks per GQA group; decode reads 64x more index-key bytes than selected KV at 1 M context, NVFP4 as served); linear attention (KDA in Ling and GLM-Flash,
   Gated DeltaNet in Qwen); sliding-window hybrids (MiMo, Step, Muse, DeepSeek's 128-token window).
 - Multi-token prediction / speculative decode: MTP layers inside the weights (DeepSeek DSpark layers, GLM, Step, Ling, Qwen,
-  MiMo's dense MTP) and separate draft models (MiMo DFlash, MiniMax DSpark, Mistral DSpark). Draft/verify schedules are
-  Phase 1 sweep parameters.
+  MiMo's dense MTP) and draft models (MiMo DFlash, MiniMax DSpark, Mistral DSpark inside its weights). Schedules and acceptance are modeled
+  (`sw/npumodel/specdec.py`, `opgraph.draft_ops`): x1.4-2.7 per user at batch 16 with each model's own drafter.
 - **Hyper-connections (decided: supported).** DeepSeek V4.1 Flash and GLM-5.3-Flash run mHC (4 residual streams, an fp32
   `[24 x 4d]` mixer and a 20-iteration Sinkhorn per sublayer); Qwen3.8-Flash-Next runs a different gated low-rank mixer that
   costs 9.5% of its decode compute. Requirements: residual stream resident on-chip, fused `HC_*` tile ops, Sinkhorn on the VPU/SFU,
@@ -174,12 +179,15 @@ start until they are met.
    Normalize them into a descriptor schema: layer pattern, attention type per layer, MoE (E, k, shared, d_ff),
    vocab size, MTP, and dtype of the published weights. Flag any model whose features fall outside the schema.
    Result: `sw/npumodel`, `models/descriptors/`, `docs/reports/model_survey.md`, `docs/reports/model_features.md`.
-2. Build an op-graph generator for prefill and decode (batch, context length, KV dtype as parameters).
-3. Build a roofline / analytical model: FLOPs, bytes, KV footprint, capacity per die, all-to-all volume per parallelism scheme (TP/EP/PP/DP).
-4. Sweep: stacks/die, dies/package, packages, dtype (FP8 vs MXFP4 weights), batch, context.
-   Answer: the batch per expert at which MoE layers become compute-bound (≈ ops:byte / 2 tokens per expert at FP8);
-   the decode bandwidth floor per model; the minimum package count per model.
-- Exit: §2 numbers frozen in `docs/spec/arch.md` with justification plots. The per-model package count is fixed.
+2. **Done (2026-11-01).** Op-graph generator for prefill and decode (batch, context, q tokens, KV and weight dtype as parameters),
+   plus one drafting round per spec-decode method. Result: `sw/npumodel/opgraph.py`, `sw/npumodel/specdec.py`.
+3. **Done (2026-11-01).** Roofline / analytical model: FLOPs, bytes, KV footprint, capacity per die, TP all-reduce and EP all-to-all
+   over D2D / C2C, PP hand-off, mapping search. Result: `sim/analytic/{hw,roofline}.py`.
+4. **Done (2026-11-01).** Sweeps (`make sweep`): stacks/die, dies/package, packages, dtype (FP8 vs MXFP4 experts), batch, context, draft length.
+   Answers (`docs/reports/phase1_sweeps.md`): MoE layers turn compute-bound at ~151 tokens per expert with FP8 weights (~80 with 4-bit),
+   i.e. 2.6k-9.6k tokens in flight per EP group, so decode is HBM-bound for all 11 models; decode floors at batch 1 are 1.4-3.1 ms per token;
+   package counts are 2 (Qwen, MiMo-Flash, GLM-Flash), 4 (MiniMax, DeepSeek, Ling) and 8 (GLM-5.3, Step 5, MiMo-Pro, Mistral, Muse).
+- Exit: **met (2026-11-01).** §2 numbers frozen in `docs/spec/arch.md` with justification plots. The per-model package count is fixed.
 
 ### Phase 2: Architecture and micro-architecture spec (M)
 - `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;

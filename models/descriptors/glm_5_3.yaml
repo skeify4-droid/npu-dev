@@ -10,6 +10,8 @@ dims: {hidden: 6144, vocab: 154880, n_layers: 78, max_ctx: 1048576, tie_embeddin
   encoder_layers: null}
 weights:
   total_bytes: 755617140416
+  non_text_bytes: 0
+  duplicate_bytes: 0
   dtypes: {expert: fp8, dense: fp8, embed: bf16, table: fp8}
   notes: FP8 e4m3 128x128 block scales.
 attn_types:
@@ -82,11 +84,14 @@ layers:
 - {n: 3, attn: mla_shr, ffn: moe}
 mtp: {n_layers: 1, attn: mla_own, ffn: moe}
 drafter: null
+spec_decode: {method: mtp, draft_tokens: 1, in_weights: mtp, source: config num_nextn_predict_layers}
 extras: {}
-published: null
+published: {total_b: 753.3, active_b: null, source: Hugging Face safetensors parameter count (no figure
+    in the README)}
 sources: [config.json + weight-size check]
 flags:
 - {id: dsa_indexer, severity: warn, detail: 'DeepSeek-Sparse-Attention lightning indexer, top-2048 tokens.
     21 layers compute it, the rest reuse the previous result (per indexer_types).'}
-derived: {params_total_b: 753.3, params_active_b: 40.8, params_expert_b: 734.4, params_table_b: 0.0, expected_weight_gb: 755.2,
-  published_weight_gb: 755.6, weight_check_ratio: 0.999}
+derived: {params_total_b: 753.3, params_active_b: 40.3, params_expert_b: 734.4, params_table_b: 0.0, params_mtp_layer_b: 0.59,
+  params_drafter_b: 0.0, expected_weight_gb: 755.2, published_weight_gb: 755.6, weight_check_ratio: 0.999,
+  published_total_ratio: 1.0}
