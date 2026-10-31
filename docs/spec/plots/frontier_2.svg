@@ -39,11 +39,11 @@
 <circle cx="460.1" cy="182.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 179.127, 358.3</title></circle>
 <circle cx="307.2" cy="127.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 85.0938, 680.8</title></circle>
 <circle cx="160.3" cy="70.3" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Pro: 41.6327, 1332</title></circle>
-<path d="M595.5,361.7 L514.0,277.5 L366.7,220.6 L230.5,159.1" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+<path d="M595.5,361.7 L514.0,277.5 L366.7,220.6 L230.4,159.2" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="595.5" cy="361.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 346.184, 43.27</title></circle>
 <circle cx="514.0" cy="277.5" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 232.836, 116.4</title></circle>
 <circle cx="366.7" cy="220.6" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 113.693, 227.4</title></circle>
-<circle cx="230.5" cy="159.1" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 58.578, 468.6</title></circle>
+<circle cx="230.4" cy="159.2" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4: 58.5653, 468.5</title></circle>
 <line x1="656" x2="674" y1="54" y2="54" stroke="var(--s0)" stroke-width="2"/>
 <circle cx="665" cy="54" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"/>
 <text class="t1" x="680" y="58">Muse Spark Open</text>

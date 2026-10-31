@@ -62,6 +62,8 @@ Add one fused microcoded instruction `HC_SINKHORN` *(P1)* so the sequence does n
 **HC-4: new tile ops** *(P1, names for isa.yaml)*: `HC_MIX` (project + rsqrt scale + split; or a GEMM plus VPU ops), `HC_SINKHORN`, `HC_PRE` (weighted 4->1 collapse),
 `HC_POST` (1->4 expand + comb mix), and for the gated variant `HC_GATED_MIX` (grouped RMSNorm, SiLU, sigmoid on the low-rank path). All are elementwise or small-GEMM
 compositions of existing MXU/VPU/SFU capability; no new datapath is required, only fused instructions and scratchpad layouts for `[tokens, 4, d]`.
+*Phase 2:* defined in `isa/isa.yaml` as `HC_MIX`, `HC_SINKHORN`, `HC_PRE` (with `mean=1` for the gated variant) and `HC_POST` (`MHC` or `GATED`);
+the stream layout is in `docs/spec/memmap.md` §7, and `DMA_GATHER_ROWS` is `DMA_GATHER` with `SCALE_INLINE`.
 
 **HC-5: tensor parallelism.** With the stream sharded along `d`, each mixer needs one all-reduce of `[tokens, 25]` fp32 (24 outputs plus the RMS statistic):
 80 extra latency-critical collectives per step for DeepSeek. This is small in bytes and large in count; the collective engine must support sub-microsecond

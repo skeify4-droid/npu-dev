@@ -16,9 +16,9 @@ endif
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit pytest models fetch-models sweep formal e2e syn clean
+.PHONY: help lint unit pytest models fetch-models sweep isa formal e2e syn clean
 help:
-	@echo "targets: lint unit pytest models fetch-models sweep formal e2e syn clean"
+	@echo "targets: lint unit pytest models fetch-models sweep isa formal e2e syn clean"
 
 # Lint every RTL file, -Wall, as its own top (block lint).
 lint:
@@ -41,7 +41,7 @@ unit: $(BUILD)
 
 # Python tests (descriptor schema and ingestion). Needs the venv from env_setup.
 pytest:
-	$(PY) -m pytest -q tb/unit/test_descriptors.py tb/unit/test_analytic.py
+	$(PY) -m pytest -q tb/unit/test_descriptors.py tb/unit/test_analytic.py tb/unit/test_isa.py tb/unit/test_noc.py
 
 # Re-ingest config snapshots into models/descriptors and regenerate docs/reports/model_survey.md.
 models:
@@ -51,6 +51,11 @@ models:
 # Phase 1 analytical sweeps -> docs/reports/phase1_sweeps.md, docs/spec/plots/*.svg, build/phase1/*.csv (seconds, <50 MB).
 sweep:
 	PYTHONPATH=sw:sim scripts/memrun sweep $(PY) -m analytic.sweep
+
+# ISA: validate isa/isa.yaml, regenerate isa/gen/{isa_pkg.sv,isa.h} and docs/spec/isa_ref.md, lint the SV package.
+isa:
+	$(PY) isa/isa.py
+	verilator --lint-only -Wall isa/gen/isa_pkg.sv
 
 # Re-download config.json snapshots from Hugging Face (network). Review the diff before committing.
 fetch-models:

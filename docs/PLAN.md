@@ -79,7 +79,7 @@ Measured from `/Volumes/EVO970PLUS/claude/env_setup`:
 System:   1–32 packages, scale-up fabric (C2C links; ring / 2D torus / switch modeled)
 Package:  2 compute dies + 8 HBM3e stacks on a 2.5D interposer, die-to-die (D2D) link
 Die:      ≤ 858 mm², 4 HBM3e stacks (4 controllers × 32 PCs), 2D-mesh NoC,
-          32 tensor cores, global SRAM, command processor, D2D port, C2C ports, collective engine
+          32 tensor cores, global SRAM, command processor, D2D port, C2C ports, collectives (distributed, Phase 2)
 Core:     MXU (matrix unit) + VPU (vector unit) + SFU + DMA + scratchpad + sequencer
 ```
 
@@ -94,8 +94,8 @@ Frozen on 2026-11-01 with the Phase 1 justification in **`docs/spec/arch.md`** (
 | Per package | 2 dies | 3.1 PFLOPS FP8, 288 GB, 9.8 TB/s |
 | Scratchpad per core | 4 MB, 32 banks, double-buffered DMA | 128 MB/die |
 | Global SRAM per die | 32 MB, software-managed (KV staging, expert prefetch, collectives) | |
-| NoC | 2D mesh, 128 B/cycle/link/direction, HBM controllers on edge routers | must sustain ≥ 3.3 KB/cycle HBM ingress |
-| D2D | UCIe-like, 5 TB/s/direction (modeled PHY) | |
+| NoC | 8 x 4 2D mesh, 2 planes of 128 B/cycle/link/direction, HBM controllers on 16 edge leaf routers (Phase 2) | sustains 3.3 KB/cycle HBM ingress at ≤ 80% link load |
+| D2D | UCIe-like, 1.4 TB/s/direction payload, 4 sub-links (modeled PHY; 5 TB/s until Phase 2, noc.md §5) | |
 | C2C | 16 ports × 100 GB/s/direction (modeled SerDes) | 1.6 TB/s/package |
 | VPU / SFU per core | 512 FP32 FLOP/cycle; 128 exp/rcp/rsqrt per cycle | 24.6 TFLOPS / 6.1 T ops/s per die |
 | Data types | FP8 E4M3/E5M2, BF16, MXFP8, MXFP4 and NVFP4 weights (dequantized to FP8 in the DMA path), NVFP4/FP8/BF16 KV, FP32 accumulate, INT8 optional | |
@@ -190,12 +190,18 @@ start until they are met.
 - Exit: **met (2026-11-01).** §2 numbers frozen in `docs/spec/arch.md` with justification plots. The per-model package count is fixed.
 
 ### Phase 2: Architecture and micro-architecture spec (M)
-- `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
+**Step 1 done (2026-11-01):** micro-architecture (`docs/spec/microarch.md`: weight-stationary MXU, ACC, SPM banking, DMA, core and die
+blocks, TINY/MID/FULL configs, interface tables), ISA v0.1 (`docs/spec/isa.md`, `isa/isa.yaml` with validator, encoder/decoder and
+SV/C++/Markdown generators: `make isa`), memory map (`docs/spec/memmap.md`), NoC and deadlock strategy (`docs/spec/noc.md`, checked by
+`sim/analytic/noc.py`). Remaining: `numerics.md`, `hbm.md`, `d2d_c2c.md`, spec review.
+- **Done (v0.1).** `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
   MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE; hyper-connection ops HC_MIX / HC_SINKHORN / HC_PRE / HC_POST /
   HC_GATED_MIX; DMA_GATHER_ROWS with unaligned rows and MXFP8 dequantization). Decoupled access/execute queues per core.
+  As built: COLLECTIVE became `DMA_LIST` + write-add + `DMA_MCAST` + semaphores (isa.md §10); HC_GATED_MIX folded into
+  `HC_PRE mean=1` and `HC_POST GATED`; DMA_GATHER_ROWS is `DMA_GATHER`.
 - `numerics.md`: FP8/BF16/MXFP4/NVFP4 formats, rounding (RNE), saturation, accumulation order, NaN/Inf policy; the hyper-connection mixer-precision experiment.
-- `memmap.md`: global address map (HBM address interleaving across stacks/PCs/banks, scratchpad, global SRAM, remote die/package windows).
-- `noc.md`: topology, routing (XY), virtual channels for deadlock freedom (request/response separation), credit flow control.
+- **Done.** `memmap.md`: global address map (HBM address interleaving across stacks/PCs/banks, scratchpad, global SRAM, remote die/package windows).
+- **Done.** `noc.md`: topology, routing (XY), virtual channels for deadlock freedom (request/response separation), credit flow control.
 - `hbm.md`: controller architecture (per-PC queues, FR-FCFS scheduler, open/close page policy, refresh,
   timing table) and the DFI-like boundary to the behavioral PHY + DRAM model.
 - `d2d_c2c.md`: link layer (flits, credits, CRC/replay optional), collective engine (ring/tree all-reduce, all-to-all).

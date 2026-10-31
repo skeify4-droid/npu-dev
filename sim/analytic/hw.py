@@ -21,7 +21,7 @@ BASE = {
     "workspace_bytes": 4e9,                  # activations, MoE dispatch buffers, collective staging per die
     "sram_bytes": 32 * 4e6 + 32e6,           # scratchpads + global SRAM
     "dies_per_pkg": 2,
-    "d2d_bw": 5e12, "d2d_lat": 0.5e-6,       # per direction, die to die in a package
+    "d2d_bw": 1.4e12, "d2d_lat": 0.5e-6,     # per direction, die to die; what the NoC can feed (noc.md 5; was 5e12 until 2026-11-01)
     "c2c_bw_pkg": 16 * 100e9, "c2c_lat": 2.0e-6,   # 16 ports x 100 GB/s per direction per package; per collective step
     "overlap": 0.0,                          # fraction of communication hidden under compute (0 = none, conservative)
 }

@@ -37,28 +37,28 @@
 <text class="t2" transform="translate(18 216.0) rotate(-90)" text-anchor="middle">tokens/s per package</text>
 <line x1="176.0" x2="176.0" y1="48" y2="384" stroke="var(--axis)" stroke-dasharray="4 4"/>
 <text class="t2" x="180.0" y="378">50 tok/s/user</text>
-<path d="M510.6,331.8 L456.4,278.5 L348.7,241.7 L207.2,215.4 L92.8,180.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
+<path d="M510.6,331.8 L456.4,278.5 L348.7,241.7 L207.2,215.5 L92.8,180.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="510.6" cy="331.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 387.928, 96.98</title></circle>
-<circle cx="456.4" cy="278.5" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 278.505, 278.5</title></circle>
-<circle cx="348.7" cy="241.7" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 143.993, 576</title></circle>
-<circle cx="207.2" cy="215.4" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 60.5326, 968.5</title></circle>
+<circle cx="456.4" cy="278.5" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 278.48, 278.5</title></circle>
+<circle cx="348.7" cy="241.7" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 143.967, 575.9</title></circle>
+<circle cx="207.2" cy="215.5" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 60.5138, 968.2</title></circle>
 <circle cx="92.8" cy="180.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Ling 3.1 Flash: 30.0402, 1923</title></circle>
-<path d="M524.9,362.4 L487.2,304.0 L400.4,260.8 L295.3,223.2" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="524.9" cy="362.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 423.466, 52.93</title></circle>
-<circle cx="487.2" cy="304.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 336.159, 168.1</title></circle>
-<circle cx="400.4" cy="260.8" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 197.597, 395.2</title></circle>
-<circle cx="295.3" cy="223.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 103.808, 830.5</title></circle>
+<path d="M524.9,362.4 L487.2,304.0 L400.4,260.8 L295.2,223.2" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="524.9" cy="362.4" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 423.457, 52.93</title></circle>
+<circle cx="487.2" cy="304.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 336.136, 168.1</title></circle>
+<circle cx="400.4" cy="260.8" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 197.566, 395.1</title></circle>
+<circle cx="295.2" cy="223.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>Step 5 Preview: 103.773, 830.2</title></circle>
 <path d="M497.9,370.7 L448.2,316.0 L348.7,276.8 L250.9,237.0" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="497.9" cy="370.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3: 359.019, 44.88</title></circle>
 <circle cx="448.2" cy="316.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3: 264.829, 132.4</title></circle>
 <circle cx="348.7" cy="276.8" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3: 143.949, 287.9</title></circle>
-<circle cx="250.9" cy="237.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3: 79.1111, 632.9</title></circle>
-<path d="M617.2,298.8 L574.4,241.9 L476.4,202.2 L350.6,171.0 L285.3,121.2 L252.5,61.3" fill="none" stroke="var(--s3)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="250.9" cy="237.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3: 79.0855, 632.7</title></circle>
+<path d="M617.2,298.8 L574.4,241.9 L476.4,202.2 L350.6,171.1 L285.1,121.3 L252.5,61.3" fill="none" stroke="var(--s3)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="617.2" cy="298.8" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 745.298, 186.3</title></circle>
 <circle cx="574.4" cy="241.9" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 573.611, 573.6</title></circle>
 <circle cx="476.4" cy="202.2" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 314.784, 1259</title></circle>
-<circle cx="350.6" cy="171.0" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 145.691, 2331</title></circle>
-<circle cx="285.3" cy="121.2" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 97.6605, 6250</title></circle>
+<circle cx="350.6" cy="171.1" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 145.62, 2330</title></circle>
+<circle cx="285.1" cy="121.3" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 97.532, 6242</title></circle>
 <circle cx="252.5" cy="61.3" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash: 79.8836, 2.045e+04</title></circle>
 <line x1="656" x2="674" y1="54" y2="54" stroke="var(--s0)" stroke-width="2"/>
 <circle cx="665" cy="54" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"/>

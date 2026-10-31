@@ -31,21 +31,21 @@
 <text class="t2" transform="translate(18 216.0) rotate(-90)" text-anchor="middle">tokens/s per package</text>
 <line x1="96.9" x2="96.9" y1="48" y2="384" stroke="var(--axis)" stroke-dasharray="4 4"/>
 <text class="t2" x="100.9" y="378">50 tok/s/user</text>
-<path d="M589.6,281.3 L539.1,187.8 L424.6,122.1 L278.8,69.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="589.6" cy="281.3" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 647.709, 323.9</title></circle>
-<circle cx="539.1" cy="187.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 498.167, 996.3</title></circle>
-<circle cx="424.6" cy="122.1" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 274.705, 2198</title></circle>
-<circle cx="278.8" cy="69.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 128.753, 4120</title></circle>
-<path d="M613.1,271.1 L497.0,206.0 L318.4,168.0 L147.1,126.8" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="613.1" cy="271.1" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 731.86, 365.9</title></circle>
-<circle cx="497.0" cy="206.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 400.31, 800.6</title></circle>
-<circle cx="318.4" cy="168.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 158.179, 1265</title></circle>
-<circle cx="147.1" cy="126.8" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 64.9168, 2077</title></circle>
-<path d="M553.9,296.7 L440.0,230.7 L266.2,190.6 L117.5,139.5" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="553.9" cy="296.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 537.88, 268.9</title></circle>
-<circle cx="440.0" cy="230.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 297.537, 595.1</title></circle>
-<circle cx="266.2" cy="190.6" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 120.547, 964.4</title></circle>
-<circle cx="117.5" cy="139.5" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 55.6627, 1781</title></circle>
+<path d="M589.6,281.3 L539.1,187.8 L424.6,122.1 L278.7,69.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="589.6" cy="281.3" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 647.682, 323.8</title></circle>
+<circle cx="539.1" cy="187.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 498.105, 996.2</title></circle>
+<circle cx="424.6" cy="122.1" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 274.629, 2197</title></circle>
+<circle cx="278.7" cy="69.8" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>Qwen3.8-Flash-Next: 128.686, 4118</title></circle>
+<path d="M613.1,271.1 L497.0,206.0 L318.4,168.0 L147.0,126.8" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="613.1" cy="271.1" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 731.805, 365.9</title></circle>
+<circle cx="497.0" cy="206.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 400.243, 800.5</title></circle>
+<circle cx="318.4" cy="168.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 158.138, 1265</title></circle>
+<circle cx="147.0" cy="126.8" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash: 64.889, 2076</title></circle>
+<path d="M553.9,296.7 L440.0,230.7 L266.1,190.6 L117.5,139.5" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="553.9" cy="296.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 537.85, 268.9</title></circle>
+<circle cx="440.0" cy="230.7" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 297.501, 595</title></circle>
+<circle cx="266.1" cy="190.6" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 120.524, 964.2</title></circle>
+<circle cx="117.5" cy="139.5" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash: 55.6426, 1781</title></circle>
 <path d="M535.8,362.2 L480.9,270.6 L367.2,204.5 L246.8,141.3" fill="none" stroke="var(--s3)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="535.8" cy="362.2" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>MiniMax-M3.1-Flash: 489.65, 122.4</title></circle>
 <circle cx="480.9" cy="270.6" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>MiniMax-M3.1-Flash: 368.114, 368.1</title></circle>

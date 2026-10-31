@@ -152,3 +152,49 @@
 - Phase 2: ISA (`isa.yaml`) and the micro-architecture specs (numerics, memmap, NoC, HBM, D2D/C2C).
   Include the index-scan path, NVFP4 DMA and KV store, CSA region-summary writes, and verification batches.
 - Phase 2 numerics experiments: mHC mixer in BF16, and BF16 recurrent state.
+
+## Phase 2 step 1: micro-architecture, ISA, memory map, NoC deadlock strategy (2026-11-01)
+
+### Changes
+- `docs/spec/microarch.md`:
+  - die floorplan (8 x 4 core tiles, 24 leaf routers);
+  - core tile: front end, 6 queues, weight-stationary MXU with a 512 B/cycle stationary-load port and a 512 KB FP32 accumulator,
+    1R1W banked SPM, VPU/SFU/top-k, DMA with 512 reads in flight;
+  - die blocks; TINY/MID/FULL configs; interface tables for 11 blocks.
+- `isa/isa.yaml` (v0.1):
+  - 55 instructions, 16 formats, 18 enums, tile-descriptor layout, memory map constants.
+  - `isa/isa.py` validates it, encodes and decodes, and generates `isa/gen/isa_pkg.sv`, `isa/gen/isa.h` and `docs/spec/isa_ref.md`.
+  - The package is lint-clean in Verilator and loads in Icarus and in Yosys (sv2v or `isa_pkg::` names).
+  - `docs/spec/isa.md` explains the programming model (semaphores, tile descriptors, block-scale contract) and maps every model
+    feature to instructions.
+- `docs/spec/memmap.md`:
+  - 49-bit global addresses (node + 42-bit die offset, self alias);
+  - stack-contiguous HBM with quadrant affinity, plus an XOR-hashed PC/bank map;
+  - SPM/GSRAM/CORECTL/DIECTL windows; KV page tables; ordering model.
+- `docs/spec/noc.md`:
+  - 2 mesh planes, 5 VCs (REQ L/X/MC, RSP L/X), XY requests and YX responses;
+  - 2 KB read bursts with coalesced acks;
+  - rail-aligned C2C with at most one link per packet.
+- `sim/analytic/noc.py`: link-load scenarios plus a whole-system channel-dependency-graph cycle check.
+  - The baseline is acyclic at 2 and 4 packages.
+  - Each of the 4 rejected alternatives produces a cycle and is kept as a test.
+- `docs/spec/arch.md`, `docs/PLAN.md`, `sim/analytic/hw.py`: D2D 5 -> 1.4 TB/s, NoC 2 planes, ACC/IMEM SRAM, distributed collectives.
+  `make sweep` was rerun.
+
+### Results
+- **HBM traffic:**
+  - The mesh carries a full stack's 820 B/cycle at 80% peak link load with stack-affine placement, and 85% with every core reading every stack.
+  - With a request per 256 B, the request overhead alone overloaded the mesh (1.20); 2 KB read requests fixed that.
+- **D2D:** the mesh edge feeds at most 1.45 TB/s per direction, so a 5 TB/s D2D link was unusable.
+  - At 1.4 TB/s, decode at the serving point changes by at most 0.2% and no package count changes.
+  - Prefill with TP = 2 forced across D2D slows by up to 7%.
+- **MXU:** weight-stationary consumes 512 B/cycle of weights at any M, which is 2.9x a core's HBM share with 4-bit weights expanded to
+  FP8. The MXU is never the decode bottleneck.
+
+### Tests
+- `make pytest`: 68 passed (53 before, + 7 ISA, + 8 NoC).
+- `make isa` regenerates and lints the outputs. `make lint unit` is green.
+
+### Next
+- `numerics.md`: conversion rounding, the NVFP4 -> E4M3 residual error, HC mixer precision, BF16 linear-attention state.
+- `hbm.md`, `d2d_c2c.md`, then the Phase 2 spec review.

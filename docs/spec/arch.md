@@ -16,11 +16,11 @@ Phase 2 refines the micro-architecture under these numbers. Changing one of them
 | VPU per core | 512 FP32 FLOP/cycle (16 lanes x 16 x FMA) | 24.6 TFLOPS per die |
 | SFU per core | 128 exp / reciprocal / rsqrt per cycle | 6.1 T ops/s per die |
 | HBM per die | 4 x HBM3e 12-Hi (1024 bit, 9.6 Gb/s/pin, 36 GB) | 4.92 TB/s, 144 GB; sustained ops:byte about 301 at 0.8 MXU / 0.85 HBM efficiency |
-| SRAM per die | 32 x 4 MB scratchpad (32 banks, double-buffered DMA) + 32 MB global SRAM | 160 MB |
+| SRAM per die | 32 x 4 MB scratchpad (32 banks, double-buffered DMA) + 32 MB global SRAM; + 32 x 512 KB MXU accumulators and 72 KB IMEM/DTAB per core *(P2)* | 160 MB + 18 MB |
 | Dies per package | 2 | 3.1 PFLOPS FP8, 288 GB, 9.8 TB/s per package |
-| D2D | 5 TB/s per direction, about 0.5 µs per collective step | |
+| D2D | **1.4 TB/s** per direction payload (4 sub-links, what the NoC can feed; was 5 TB/s, changed in Phase 2), about 0.5 µs per collective step | |
 | C2C | 16 ports x 100 GB/s per direction per package, about 2 µs per collective step | 1.6 TB/s per package |
-| NoC | 2D mesh, 128 B/cycle/link/direction, HBM controllers on edge routers | must carry >= 3.3 KB/cycle of HBM ingress |
+| NoC | 8 x 4 2D mesh, **2 planes** of 128 B/cycle/link/direction *(P2)*, HBM controllers on 16 edge leaf routers ([noc.md](noc.md)) | carries 3.3 KB/cycle of HBM ingress at <= 80% link load |
 | Weight formats | FP8 E4M3/E5M2, BF16, MXFP8 (E8M0 scale / 32), MXFP4 (E8M0 / 32), **NVFP4 (E4M3 scale / 16 + FP32 tensor scale)**; 4-bit and MXFP8 are dequantized to FP8 in the DMA path | |
 | KV / cache formats | FP8, BF16, **NVFP4** (DeepSeek global KV, MiniMax KV and index keys as served), MXFP4 index keys (DeepSeek) | |
 | Recurrent state | FP32 (as published), BF16 option to evaluate in Phase 2 numerics | |
@@ -55,7 +55,9 @@ the step streams nearly all expert weights. Bandwidth per die is therefore the l
 **2 dies per package; the links are not the bottleneck.**
 - Running the same models on 1 or 4 dies per package changes throughput per die by -2% to +7% (report §4).
 - Communication is 1–12% of the decode step. The highest share is MiniMax at TP=4, from its per-layer MoE all-to-all.
-- D2D and C2C stay as planned. Overlap of communication with compute is assumed to be zero, so these numbers are conservative.
+- C2C stays as planned. D2D drops to 1.4 TB/s in Phase 2, because the mesh edge cannot feed more (noc.md §5). That changes decode
+  throughput at the serving point by at most 0.2%, because the decode all-reduces are latency-bound.
+- Overlap of communication with compute is assumed to be zero, so these numbers are conservative.
 
 **4-bit weights pay off where the model was trained for them.**
 - For FP8-published experts, MXFP4 experts give x1.39–1.75 tokens/s per package, and halve the package count for 3 models (GLM-5.3, Qwen, Step 5; report §4).
@@ -78,17 +80,17 @@ Mappings are pipeline x tensor parallel (expert parallel spans the stage); the s
 
 | Model | Packages | Dies | Weights only | Decode tok/s/user | tok/s per package | 8 x 1M context fits on | Main limiter |
 |---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | **2** | 4 | 1 | 129 | 4,119 | 2 | KV (1.8 GB/seq) on top of 180 GB of FP8 weights |
-| MiMo-V2.6-Flash | **2** | 4 | 1 | 64 | 2,051 | 2 | full-attention KV (9 layers, 1.5 GB/seq) |
+| Qwen3.8-Flash-Next | **2** | 4 | 1 | 129 | 4,118 | 2 | KV (1.8 GB/seq) on top of 180 GB of FP8 weights |
+| MiMo-V2.6-Flash | **2** | 4 | 1 | 65 | 2,076 | 2 | full-attention KV (9 layers, 1.5 GB/seq) |
 | GLM-5.3-Flash | **2** | 4 | 2 | 56 | 1,781 | 2 | expert streaming; KDA state 143 MB/seq |
-| MiniMax-M3.1-Flash | **4** | 8 | 1 | 109 | 1,742 | 4 | KV + index keys (5.1 GB/seq) |
+| MiniMax-M3.1-Flash | **4** | 8 | 1 | 109 | 1,744 | 4 | KV + index keys (5.1 GB/seq) |
 | DeepSeek V4.1 Flash | **4** | 8 | 2 | 146 | 2,330 | 4 | weights 510 GB incl. 197 G-element Engram tables leave no KV room on 2 |
-| Ling 3.1 Flash | **4** | 8 | 4 | 60 | 963 | 4 | weights (572 B) |
+| Ling 3.1 Flash | **4** | 8 | 4 | 60 | 968 | 4 | weights (572 B) |
 | GLM-5.3 | **8** | 16 | 4 | 79 | 633 | 8 | MLA KV (6.2 GB/seq) |
 | Step 5 Preview | **8** | 16 | 4 | 104 | 830 | 8 | BF16 KV (9.5 GB/seq) |
-| MiMo-V2.6-Pro | **8** | 16 | 4 | 84 | 674 | 4 | speed: 4 packages hold it but give < 50 tok/s/user |
-| Mistral Large 4 | **8** | 16 | 8 | 59 | 468 | 8 | weights (1.05 T) |
-| Muse Spark Open | **8** | 16 | 4 | 57 | 459 | 8 | KV (4.5 GB/seq) |
+| MiMo-V2.6-Pro | **8** | 16 | 4 | 85 | 681 | 4 | speed: 4 packages hold it but give < 50 tok/s/user |
+| Mistral Large 4 | **8** | 16 | 8 | 59 | 469 | 8 | weights (1.05 T) |
+| Muse Spark Open | **8** | 16 | 4 | 58 | 464 | 8 | KV (4.5 GB/seq) |
 
 The largest system needed is **8 packages (16 dies, 2.3 TB HBM)**, so the scale-up fabric must support at least 8 packages.
 The perf simulator keeps 32 as its upper bound for sensitivity studies.
@@ -99,6 +101,8 @@ Speculative decoding with each model's own drafter gives a further x1.4–2.7 pe
 - None of the package counts above relies on speculative decoding.
 
 ## 4. Requirements this adds for Phase 2
+
+Where Phase 2 covers each one: [isa.md](isa.md) §6 (instruction per feature), [microarch.md](microarch.md) §2.
 
 - **DMA:** NVFP4 dequantization (FP8 scale per 16, FP32 tensor scale), alongside MXFP4 and MXFP8.
   Also an NVFP4 KV write path (quantize on store).
@@ -123,11 +127,12 @@ Speculative decoding with each model's own drafter gives a further x1.4–2.7 pe
 | Date | Change | Evidence |
 |---|---|---|
 | 2026-11-01 | Frozen. SFU 128/cycle/core; NVFP4 weights and KV; VPU 512 FLOP/cycle/core; package counts fixed. | `docs/reports/phase1_sweeps.md` |
+| 2026-11-01 | Phase 2: D2D 5 -> 1.4 TB/s per direction; NoC 2 mesh planes; + 16 MB ACC and 2.3 MB IMEM/DTAB per die; no central collective engine (distributed write-add, multicast, semaphores). Package counts unchanged; decode within 0.2%. | [microarch.md](microarch.md) §8, [noc.md](noc.md) §5, `make sweep` rerun |
 
 ## 6. Model limits (what the roofline does not capture)
 
 - No overlap of communication with compute, and no MXU efficiency loss at small GEMM M beyond the fixed 0.8.
-  The real MXU tile shape is a Phase 2 / Phase 7 question.
+  Phase 2 chose a weight-stationary MXU (microarch.md §2.2); its small-M efficiency is measured in Phase 3/7.
 - MoE routing is uniform. Real routing is skewed, which touches fewer experts but loads the hot ones unevenly.
 - Prefill of one prompt is spread over the data-parallel ranks of a stage, which assumes context-parallel prefill.
 - Sparse attention reads `topk` entries per sequence per step, even when the gamma + 1 verify tokens select different blocks

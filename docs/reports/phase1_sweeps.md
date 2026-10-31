@@ -41,12 +41,12 @@ Bytes read per decoded token and the resulting single-user speed. At batch 1 eve
 | GLM-5.3 | 4 | 41.37 | 114.1 | 3.13 | 319.9 | 1 | 4 |
 | GLM-5.3-Flash | 2 | 17.53 | 299.6 | 1.86 | 538.6 | 1 | 2 |
 | Ling 3.1 Flash | 4 | 25.04 | 571.0 | 2.5 | 400.0 | 1 | 4 |
-| MiMo-V2.6-Flash | 1 | 11.06 | 107.3 | 1.44 | 692.0 | 1 | 2 |
+| MiMo-V2.6-Flash | 1 | 11.06 | 107.3 | 1.45 | 691.7 | 1 | 2 |
 | MiMo-V2.6-Pro | 4 | 32.29 | 229.6 | 2.8 | 357.6 | 1 | 4 |
-| MiniMax-M3.1-Flash | 1 | 20.7 | 106.2 | 2.62 | 381.4 | 1 | 2 |
+| MiniMax-M3.1-Flash | 1 | 20.7 | 106.2 | 2.62 | 381.2 | 1 | 2 |
 | Mistral Large 4 | 8 | 52.39 | 131.1 | 2.88 | 347.4 | 1 | 4 |
 | Muse Spark Open | 4 | 46.22 | 461.5 | 3.07 | 325.4 | 1 | 4 |
-| Qwen3.8-Flash-Next | 1 | 9.26 | 254.8 | 1.55 | 643.7 | 1 | 2 |
+| Qwen3.8-Flash-Next | 1 | 9.26 | 254.8 | 1.55 | 643.5 | 1 | 2 |
 | Step 5 Preview | 4 | 27.69 | 404.2 | 2.57 | 388.8 | 1 | 2 |
 
 ## 3. Package count per model
@@ -55,16 +55,16 @@ Bytes read per decoded token and the resulting single-user speed. At batch 1 eve
 
 | model | weights only | KV fits | serving | tokens/s/user | tokens/s per package | mapping | KV GB / seq @128K | 8 x 1M |
 |---|---|---|---|---|---|---|---|---|
-| DeepSeek V4.1 Flash | 2 | 4 | 4 | 145.7 | 2331 | PP1 TP2 | 0.12 | 4 |
+| DeepSeek V4.1 Flash | 2 | 4 | 4 | 145.6 | 2330 | PP1 TP2 | 0.12 | 4 |
 | GLM-5.3 | 4 | 8 | 8 | 79.1 | 633 | PP1 TP2 | 6.24 | 8 |
-| GLM-5.3-Flash | 2 | 2 | 2 | 55.7 | 1781 | PP1 TP2 | 0.93 | 2 |
-| Ling 3.1 Flash | 4 | 4 | 4 | 60.5 | 969 | PP1 TP2 | 0.95 | 4 |
-| MiMo-V2.6-Flash | 1 | 2 | 2 | 64.9 | 2077 | PP1 TP2 | 1.52 | 2 |
+| GLM-5.3-Flash | 2 | 2 | 2 | 55.6 | 1781 | PP1 TP2 | 0.93 | 2 |
+| Ling 3.1 Flash | 4 | 4 | 4 | 60.5 | 968 | PP1 TP2 | 0.95 | 4 |
+| MiMo-V2.6-Flash | 1 | 2 | 2 | 64.9 | 2076 | PP1 TP2 | 1.52 | 2 |
 | MiMo-V2.6-Pro | 4 | 4 | 8 | 85.1 | 681 | PP1 TP4 | 3.38 | 4 |
 | MiniMax-M3.1-Flash | 1 | 4 | 4 | 109.0 | 1744 | PP1 TP4 | 5.1 | 4 |
 | Mistral Large 4 | 8 | 8 | 8 | 58.6 | 469 | PP1 TP2 | 5.34 | 8 |
 | Muse Spark Open | 4 | 8 | 8 | 58.0 | 464 | PP1 TP4 | 4.49 | 8 |
-| Qwen3.8-Flash-Next | 1 | 2 | 2 | 128.8 | 4120 | PP1 TP2 | 1.78 | 2 |
+| Qwen3.8-Flash-Next | 1 | 2 | 2 | 128.7 | 4118 | PP1 TP2 | 1.78 | 2 |
 | Step 5 Preview | 4 | 8 | 8 | 103.8 | 830 | PP1 TP2 | 9.47 | 8 |
 
 ![frontier up to 450 B](../spec/plots/frontier_0.svg)
@@ -81,35 +81,35 @@ Each cell: package (or die) count that meets the serving point, and throughput p
 
 | model | pkgs | tokens/s/pkg | 5 stacks/die | 6 stacks/die | 1 die/pkg | 4 dies/pkg | MXFP4 experts |
 |---|---|---|---|---|---|---|---|
-| DeepSeek V4.1 Flash | 4 | 2331 | 2 pkg, x1.37 | 2 pkg, x1.64 | 8 dies, x1.00/die | 8 dies, x1.05/die | 4 pkg, x1.00 |
+| DeepSeek V4.1 Flash | 4 | 2330 | 2 pkg, x1.37 | 2 pkg, x1.64 | 8 dies, x1.00/die | 8 dies, x1.05/die | 4 pkg, x1.00 |
 | GLM-5.3 | 8 | 633 | 8 pkg, x1.24 | 4 pkg, x1.52 | 16 dies, x0.98/die | 16 dies, x1.00/die | 4 pkg, x1.60 |
 | GLM-5.3-Flash | 2 | 1781 | 2 pkg, x1.24 | 2 pkg, x1.49 | 4 dies, x0.99/die | 4 dies, x1.01/die | 2 pkg, x1.66 |
-| Ling 3.1 Flash | 4 | 969 | 4 pkg, x1.24 | 4 pkg, x1.43 | 8 dies, x0.99/die | 8 dies, x1.00/die | 4 pkg, x1.42 |
-| MiMo-V2.6-Flash | 2 | 2077 | 2 pkg, x1.24 | 1 pkg, x1.55 | 4 dies, x0.99/die | 4 dies, x1.03/die | 2 pkg, x1.00 |
+| Ling 3.1 Flash | 4 | 968 | 4 pkg, x1.24 | 4 pkg, x1.43 | 8 dies, x0.99/die | 8 dies, x1.00/die | 4 pkg, x1.42 |
+| MiMo-V2.6-Flash | 2 | 2076 | 2 pkg, x1.24 | 1 pkg, x1.54 | 4 dies, x0.99/die | 4 dies, x1.02/die | 2 pkg, x1.00 |
 | MiMo-V2.6-Pro | 8 | 681 | 4 pkg, x1.37 | 4 pkg, x1.62 | 16 dies, x1.00/die | 16 dies, x1.06/die | 8 pkg, x1.00 |
-| MiniMax-M3.1-Flash | 4 | 1744 | 2 pkg, x1.38 | 2 pkg, x1.65 | 8 dies, x1.00/die | 8 dies, x1.07/die | 4 pkg, x1.00 |
+| MiniMax-M3.1-Flash | 4 | 1744 | 2 pkg, x1.38 | 2 pkg, x1.64 | 8 dies, x1.00/die | 8 dies, x1.07/die | 4 pkg, x1.00 |
 | Mistral Large 4 | 8 | 469 | 8 pkg, x1.24 | 8 pkg, x1.48 | 16 dies, x0.99/die | 16 dies, x1.00/die | 8 pkg, x1.61 |
 | Muse Spark Open | 8 | 464 | 8 pkg, x1.23 | 8 pkg, x1.45 | 16 dies, x1.00/die | 16 dies, x1.03/die | 8 pkg, x1.39 |
-| Qwen3.8-Flash-Next | 2 | 4120 | 1 pkg, x1.39 | 1 pkg, x1.66 | 4 dies, x0.98/die | 4 dies, x1.03/die | 1 pkg, x1.71 |
+| Qwen3.8-Flash-Next | 2 | 4118 | 1 pkg, x1.38 | 1 pkg, x1.65 | 4 dies, x0.98/die | 4 dies, x1.02/die | 1 pkg, x1.70 |
 | Step 5 Preview | 8 | 830 | 4 pkg, x1.40 | 4 pkg, x1.66 | 16 dies, x0.98/die | 16 dies, x1.07/die | 4 pkg, x1.75 |
 
 ![context](../spec/plots/context.svg)
 
 | model | packages | context | tokens/s/user |
 |---|---|---|---|
-| Qwen3.8-Flash-Next | 2 | 8192 | 278.2 |
-| Qwen3.8-Flash-Next | 2 | 32768 | 277.5 |
-| Qwen3.8-Flash-Next | 2 | 131072 | 274.7 |
-| Qwen3.8-Flash-Next | 2 | 262144 | 271.1 |
-| Qwen3.8-Flash-Next | 2 | 524288 | 264.2 |
-| Qwen3.8-Flash-Next | 2 | 1048576 | 251.4 |
+| Qwen3.8-Flash-Next | 2 | 8192 | 278.1 |
+| Qwen3.8-Flash-Next | 2 | 32768 | 277.4 |
+| Qwen3.8-Flash-Next | 2 | 131072 | 274.6 |
+| Qwen3.8-Flash-Next | 2 | 262144 | 271.0 |
+| Qwen3.8-Flash-Next | 2 | 524288 | 264.1 |
+| Qwen3.8-Flash-Next | 2 | 1048576 | 251.3 |
 | MiMo-V2.6-Flash | 2 | 8192 | 203.2 |
-| MiMo-V2.6-Flash | 2 | 32768 | 192.3 |
-| MiMo-V2.6-Flash | 2 | 131072 | 158.2 |
+| MiMo-V2.6-Flash | 2 | 32768 | 192.2 |
+| MiMo-V2.6-Flash | 2 | 131072 | 158.1 |
 | MiMo-V2.6-Flash | 2 | 262144 | 127.9 |
 | MiMo-V2.6-Flash | 2 | 524288 | 92.5 |
 | MiMo-V2.6-Flash | 2 | 1048576 | 59.6 |
-| GLM-5.3-Flash | 2 | 8192 | 121.2 |
+| GLM-5.3-Flash | 2 | 8192 | 121.1 |
 | GLM-5.3-Flash | 2 | 32768 | 121.0 |
 | GLM-5.3-Flash | 2 | 131072 | 120.5 |
 | GLM-5.3-Flash | 2 | 262144 | 119.9 |
@@ -129,7 +129,7 @@ Acceptance from `npumodel.specdec` (DSpark paper Table 1, Qwen3-8B, code domain)
 | model | method | best gamma | tau | tokens/s/user | speed-up |
 |---|---|---|---|---|---|
 | MiniMax-M3.1-Flash | dspark | 7 | 5.28 | 555.8 | 2.73 |
-| MiMo-V2.6-Flash | dflash | 7 | 4.46 | 346.6 | 2.19 |
+| MiMo-V2.6-Flash | dflash | 7 | 4.46 | 346.3 | 2.19 |
 | DeepSeek V4.1 Flash | dspark | 5 | 4.43 | 524.0 | 1.66 |
 | Mistral Large 4 | dspark | 3 | 3.32 | 200.6 | 1.76 |
 | GLM-5.3-Flash | mtp | 3 | 2.95 | 165.5 | 1.37 |
@@ -149,6 +149,6 @@ Acceptance from `npumodel.specdec` (DSpark paper Table 1, Qwen3-8B, code domain)
 | MiniMax-M3.1-Flash | 4 | 9% | 66% | 1% | 12% | 0% | 12% | 100% |
 | Mistral Large 4 | 8 | 14% | 78% | 1% | 4% | 0% | 2% | 100% |
 | Muse Spark Open | 8 | 8% | 60% | 25% | 0% | 0% | 6% | 99% |
-| Qwen3.8-Flash-Next | 2 | 15% | 67% | 1% | 2% | 11% | 3% | 100% |
+| Qwen3.8-Flash-Next | 2 | 15% | 67% | 1% | 2% | 11% | 4% | 100% |
 | Step 5 Preview | 8 | 18% | 72% | 4% | 1% | 0% | 5% | 100% |
 

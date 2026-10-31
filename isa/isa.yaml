@@ -1,0 +1,578 @@
+# NPU ISA, single source of truth (docs/spec/isa.md explains the programming model).
+# isa/isa.py validates this file and generates isa/gen/isa_pkg.sv, isa/gen/isa.h and docs/spec/isa_ref.md (`make isa`).
+# Bit ranges are [msb, lsb], inclusive. Every instruction is one 128-bit word.
+version: "0.1"
+word_bits: 128
+
+machine:
+  scalar_regs: 32          # R0 reads as zero
+  scalar_bits: 64
+  semaphores: 64           # per core, 32-bit unsigned; S0 means "none" in sync fields
+  sem_bits: 32
+  td_entries: 256          # tile descriptors per core (DTAB)
+  td_bytes: 32
+  imem_bytes: 65536        # 4096 instructions
+  spm_bytes: 4194304
+  spm_banks: 32
+  spm_bank_bytes: 64       # bank = addr[10:6] ^ addr[15:11]
+  acc_rows: 2048           # MXU accumulator: 2048 rows x 64 FP32 = 512 KB
+  acc_cols: 64
+  mxu: {rows: 64, cols: 64, dot: 4, k_tile_fp8: 256, k_tile_bf16: 128, wload_bytes_per_cycle: 512}
+  vpu: {lanes: 16, lane_width: 16, fp32_fma_per_cycle: 256}
+  sfu_per_cycle: 128
+  dma_outstanding_reads: 512      # 256 B granules in flight per core (128 KB, about 2x HBM bandwidth x latency)
+  queue_depth: 16
+
+queues:
+  FE:  {id: 0, desc: "front end: scalar, branch and semaphore instructions execute in order here"}
+  DQ0: {id: 1, desc: "DMA queue 0"}
+  DQ1: {id: 2, desc: "DMA queue 1"}
+  DQ2: {id: 3, desc: "DMA queue 2"}
+  DQ3: {id: 4, desc: "DMA queue 3"}
+  MQ:  {id: 5, desc: "MXU queue"}
+  VQ:  {id: 6, desc: "VPU / SFU / top-k queue"}
+
+enums:
+  dtype:
+    FP32: 0
+    BF16: 1
+    FP16: 2
+    E4M3: 3          # FP8 E4M3 (OCP, max 448, NaN = S.1111.111, no Inf)
+    E5M2: 4          # FP8 E5M2 (IEEE-like, Inf and NaN)
+    MXFP8: 5         # E4M3 elements + E8M0 scale per 32 (scale array separate)
+    MXFP4: 6         # E2M1 elements, 2 per byte, + E8M0 scale per 32
+    NVFP4: 7         # E2M1 elements + E4M3 scale per 16 + FP32 tensor scale
+    INT8: 8
+    UINT8: 9
+    INT16: 10
+    INT32: 11
+    INT64: 12
+    E8M0: 13         # power-of-two scale byte
+    UINT32: 14
+  space:
+    GLOBAL: 0        # register holds a 49-bit global address (memmap.md)
+    SPM: 1           # register holds a byte offset into this core's scratchpad
+    ACC: 2           # register holds an accumulator row index; row = 64 FP32
+    DTAB: 3          # register holds a byte offset into this core's descriptor table (DMA destination only)
+    IMEM: 4          # register holds a byte offset into this core's instruction memory (DMA destination only)
+  td_flags:          # bit positions inside the TD flags byte
+    PAGED: 0         # outer address goes through a page table (DMA idx_reg = table base in SPM)
+    IDX64: 1         # index lists are int64 (default int32)
+    WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
+    SCALE_INLINE: 3  # block scales follow each row instead of a separate array (DMA gather of MXFP8 rows)
+  cvt:               # DMA conversion on the way into the destination (source format -> destination format)
+    NONE: 0
+    MXFP4_E4M3: 1    # writes E4M3 data + FP32 column scale per (row, 256-element K tile) to aux_reg
+    NVFP4_E4M3: 2    # same contract; per-16 scales folded, residual rounded RNE (numerics.md N-2)
+    MXFP8_E4M3: 3    # same contract
+    MXFP4_BF16: 4    # exact
+    NVFP4_BF16: 5    # exact; the FP32 tensor scale goes to aux_reg as column scales (one per 128-deep BF16 K tile)
+    MXFP8_BF16: 6
+    E4M3_BF16: 7
+    E5M2_BF16: 8
+    BF16_FP32: 9
+    FP32_BF16: 10    # RNE
+  wop:               # what a DMA write does at the destination (SRAM targets only for ADD/MAX)
+    WRITE: 0
+    ADD_F32: 1
+    ADD_BF16: 2
+    MAX_F32: 3
+  acc_mode:
+    OVERWRITE: 0     # first K tile overwrites ACC, later tiles accumulate
+    ACCUM: 1         # every K tile accumulates into existing ACC contents
+    RESCALE: 2       # ACC <- rowscale[m] * ACC before the first K tile (online-softmax O update), then accumulate
+  mxu_mode:
+    NORMAL: 0
+    BF16X3: 1        # FP32-like: A and W split into BF16 hi + lo, 3 passes (hi*hi + hi*lo + lo*hi)
+  vew_func:
+    COPY: 0          # also dtype conversion: dst dtype from its TD
+    NEG: 1
+    ABS: 2
+    EXP: 3
+    EXP2: 4
+    LOG: 5
+    RECIP: 6
+    RSQRT: 7
+    SQRT: 8
+    SIGMOID: 9
+    SILU: 10
+    SOFTPLUS: 11
+    TANH: 12
+    GELU_TANH: 13
+    RELU: 14
+    SQUARE: 15
+    SSQRT: 16        # sign(x) * sqrt(|x|)
+    SQRTSOFTPLUS: 17 # sqrt(softplus(x)) (DeepSeek router)
+    ADD: 32
+    SUB: 33
+    MUL: 34
+    DIV: 35
+    MAX: 36
+    MIN: 37
+    AXPBY: 38        # a*s0 + b*s1, (a, b) = FP32 pair in p_reg
+    AXPB: 39         # a*s0 + b
+    SWIGLU: 40       # silu(s0) * s1
+    SWIGLU_OAI: 41   # clamped SwiGLU: (a = alpha, b = limit) in p_reg
+    CMP_LT: 42       # 1.0 / 0.0
+    FMA: 48          # s0 * s1 + s2
+    SELECT: 49       # s2 != 0 ? s0 : s1
+    IADD: 64
+    ISUB: 65
+    IMUL: 66
+    ISHR: 67
+    ISHL: 68
+    IAND: 69
+    IMIN: 70
+    IMAX: 71
+  vred_func:
+    SUM: 0
+    MAX: 1
+    MIN: 2
+    SUMSQ: 3
+    MEAN: 4
+    AMAX: 5          # max |x| (quantization)
+    ARGMAX: 6        # int32 index, lowest index wins ties
+    ARGMIN: 7
+    LOGSUMEXP: 8
+    WSUM_RELU: 9     # sum_j w[j] * relu(x[j]), w = s1 (indexer scores)
+  vscan_func:
+    CUMSUM: 0
+    CUMPROD: 1
+    LOGCUMSUMEXP: 2
+  norm_func:
+    RMS: 0
+    LAYER: 1
+    RMS_GROUPED: 2   # RMS over groups of imm.group elements (q/k norm per head, Qwen HC grouped norm)
+    RMS_STAT: 3      # writes only rsqrt(mean(x^2) + eps) per row (HC_MIX input)
+  rope_mode:
+    HALF: 0          # rotate (x[i], x[i + r/2])
+    INTERLEAVED: 1   # rotate (x[2i], x[2i+1])
+  mask_mode:
+    NONE: 0
+    CAUSAL: 1        # key position <= query position
+    WINDOW: 2        # causal and query position - key position < window
+  topk_mode:
+    PLAIN: 0
+    BLOCKMAX: 1      # max over p_reg.block consecutive scores, then top-k blocks (MiniMax MSA)
+  route_score:
+    SOFTMAX: 0
+    SIGMOID: 1
+    SQRTSOFTPLUS: 2
+  quant_fmt:
+    E4M3_ROW: 0      # per-row FP32 scale = amax / 448
+    MXFP8: 1
+    MXFP4: 2
+    NVFP4: 3         # per-16 E4M3 scale, FP32 tensor scale from p_reg
+    E4M3_TENSOR: 4   # one FP32 scale from p_reg
+  hc_post_func:
+    MHC: 0           # x_new[i] = post[i] * y + sum_j comb[j][i] * x[j]
+    GATED: 1         # x_new[i] = x[i] + 2*sigmoid(g[i]/4) * y   (Qwen gated HC)
+  csr:
+    CORE_ID: 0x000   # {node[6:0], y[2:0], x[3:0]}
+    NODE_ID: 0x001
+    CYCLE: 0x002
+    PC: 0x003
+    STATUS: 0x004    # queue busy bits, fault bit
+    FAULT_CAUSE: 0x005
+    FAULT_ADDR: 0x006
+    PERF_SEL: 0x010
+    PERF_CNT0: 0x011
+    PERF_CNT1: 0x012
+    SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
+
+# Tile descriptor (TD): 256 bits in DTAB. Shapes are up to 4-D, innermost dim contiguous.
+# Element (i0, i1, i2, i3) is at base + i0*esize + i1*s1 + i2*s2 + i3*s3. A stride of 0 broadcasts.
+td:
+  fields:
+    dtype: [4, 0]
+    space: [7, 5]
+    flags: [15, 8]
+    n0:    [31, 16]     # elements in dim 0 (contiguous)
+    n1:    [47, 32]
+    n2:    [63, 48]
+    n3:    [79, 64]
+    s1:    [111, 80]    # signed byte strides
+    s2:    [143, 112]
+    s3:    [175, 144]
+    aux0:  [207, 176]   # PAGED: page_shift[4:0]; block formats: scale-array row stride in bytes
+    aux1:  [239, 208]   # gather/scatter: row bytes; block formats: scale-array base offset
+    rsv:   [255, 240]
+
+# Field layouts. Every tile-queue format starts with the sync block; front-end formats leave it zero.
+sync:
+  wsem: [119, 114]     # wait until sem[wsem] >= R[wreg] + wimm before starting (S0 = no wait)
+  wreg: [113, 109]
+  wimm: [108, 101]     # signed
+  ssem: [100, 95]      # sem[ssem] += sinc when the instruction's effects are complete (S0 = none)
+  sinc: [94, 91]
+
+formats:
+  S_NONE: {}
+  S_RRR:  {rd: [90, 86], rs1: [85, 81], rs2: [80, 76]}
+  S_RRI:  {rd: [90, 86], rs1: [85, 81], imm: [63, 0]}
+  S_RI:   {rd: [90, 86], imm: [63, 0]}
+  S_BR:   {rs1: [85, 81], rs2: [80, 76], imm: [63, 0]}          # imm = signed offset in instructions
+  S_MEM:  {rd: [90, 86], rs1: [85, 81], rs2: [80, 76], size: [75, 73], imm: [63, 0]}
+  S_SEM:  {sem: [75, 70], rs1: [85, 81], imm: [63, 0]}
+  S_CSR:  {rd: [90, 86], rs1: [85, 81], csr: [75, 64]}
+  S_FENCE: {qmask: [76, 70]}                                    # bit i = queue id i
+  S_IRQ:  {imm: [31, 0]}
+  T_DMA:
+    sync: true
+    fields: {dq: [90, 89], src_reg: [88, 84], src_td: [83, 76], dst_reg: [75, 71], dst_td: [70, 63], cvt: [62, 58],
+             wop: [57, 55], idx_reg: [54, 50], n_reg: [49, 45], rsem: [44, 39], scale_reg: [38, 34], aux_reg: [33, 29]}
+  T_DMAMC:
+    sync: true
+    fields: {dq: [90, 89], src_reg: [88, 84], src_td: [83, 76], dst_reg: [75, 71], dst_td: [70, 63], rsem: [44, 39],
+             x0: [20, 17], x1: [16, 13], y0: [12, 10], y1: [9, 7]}
+  T_DMAL:
+    sync: true
+    fields: {dq: [90, 89], list_reg: [88, 84], n_reg: [83, 79], imm: [31, 0]}     # count = R[n_reg] + imm
+  T_SIG:
+    sync: true
+    fields: {dq: [90, 89], addr_reg: [88, 84], val_reg: [83, 79], mode: [78, 77], imm: [31, 0]}
+  T_MXU:
+    sync: true
+    fields: {a_reg: [90, 86], a_td: [85, 78], w_reg: [77, 73], w_td: [72, 65], acc_reg: [64, 60], m_reg: [59, 55],
+             rs_reg: [54, 50], cs_reg: [49, 45], acc_mode: [44, 43], mode: [42, 40], trans_w: [39, 39]}
+  T_VPU:
+    sync: true
+    fields: {func: [90, 83], d_reg: [82, 78], d_td: [77, 70], s0_reg: [69, 65], s0_td: [64, 57], s1_reg: [56, 52],
+             s1_td: [51, 44], s2_reg: [43, 39], s2_td: [38, 31], p_reg: [30, 26], p2_reg: [25, 21], imm: [20, 0]}
+
+# Field value types: reg (scalar register index), td (DTAB index), sem (semaphore index), enum:<name>, uint, sint.
+field_types:
+  rd: reg
+  rs1: reg
+  rs2: reg
+  imm: sint
+  size: uint
+  sem: sem
+  csr: enum:csr
+  qmask: uint
+  dq: uint
+  src_reg: reg
+  dst_reg: reg
+  idx_reg: reg
+  n_reg: reg
+  scale_reg: reg
+  aux_reg: reg
+  list_reg: reg
+  addr_reg: reg
+  val_reg: reg
+  a_reg: reg
+  w_reg: reg
+  acc_reg: reg
+  m_reg: reg
+  rs_reg: reg
+  cs_reg: reg
+  d_reg: reg
+  s0_reg: reg
+  s1_reg: reg
+  s2_reg: reg
+  p_reg: reg
+  p2_reg: reg
+  src_td: td
+  dst_td: td
+  a_td: td
+  w_td: td
+  d_td: td
+  s0_td: td
+  s1_td: td
+  s2_td: td
+  cvt: enum:cvt
+  wop: enum:wop
+  rsem: sem
+  acc_mode: enum:acc_mode
+  mode: uint
+  trans_w: uint
+  func: uint
+  x0: uint
+  x1: uint
+  y0: uint
+  y1: uint
+  wsem: sem
+  wreg: reg
+  wimm: sint
+  ssem: sem
+  sinc: uint
+
+# Instructions. `queue` is where the instruction executes; DMA instructions go to DQ<dq>.
+# `func_enum` names the enum the func field takes; `imm_fields` documents how a VPU imm is split.
+instructions:
+  # ---- front end: control and scalar
+  NOP:    {op: 0x00, fmt: S_NONE, queue: FE, desc: "No operation."}
+  HALT:   {op: 0x01, fmt: S_NONE, queue: FE, desc: "Wait until every queue is empty and every write is acknowledged, then stop and raise the done interrupt."}
+  FENCE:  {op: 0x02, fmt: S_FENCE, queue: FE, desc: "Stall the front end until the queues in qmask are empty and their writes are acknowledged."}
+  IRQ:    {op: 0x03, fmt: S_IRQ, queue: FE, desc: "Send an interrupt with code imm to the command processor."}
+  LI:     {op: 0x08, fmt: S_RI, queue: FE, desc: "R[rd] = imm (64-bit)."}
+  ADD:    {op: 0x09, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] + R[rs2]."}
+  ADDI:   {op: 0x0A, fmt: S_RRI, queue: FE, desc: "R[rd] = R[rs1] + imm."}
+  SUB:    {op: 0x0B, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] - R[rs2]."}
+  MUL:    {op: 0x0C, fmt: S_RRR, queue: FE, desc: "R[rd] = low 64 bits of R[rs1] * R[rs2]."}
+  MULI:   {op: 0x0D, fmt: S_RRI, queue: FE, desc: "R[rd] = low 64 bits of R[rs1] * imm."}
+  AND:    {op: 0x0E, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] & R[rs2]."}
+  ANDI:   {op: 0x0F, fmt: S_RRI, queue: FE, desc: "R[rd] = R[rs1] & imm."}
+  OR:     {op: 0x10, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] | R[rs2]."}
+  XOR:    {op: 0x11, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] ^ R[rs2]."}
+  SHLI:   {op: 0x12, fmt: S_RRI, queue: FE, desc: "R[rd] = R[rs1] << imm[5:0]."}
+  SHRI:   {op: 0x13, fmt: S_RRI, queue: FE, desc: "R[rd] = R[rs1] >> imm[5:0] (logical)."}
+  SRAI:   {op: 0x14, fmt: S_RRI, queue: FE, desc: "R[rd] = R[rs1] >> imm[5:0] (arithmetic)."}
+  MIN:    {op: 0x15, fmt: S_RRR, queue: FE, desc: "R[rd] = min(R[rs1], R[rs2]) (signed)."}
+  MAX:    {op: 0x16, fmt: S_RRR, queue: FE, desc: "R[rd] = max(R[rs1], R[rs2]) (signed)."}
+  BEQ:    {op: 0x18, fmt: S_BR, queue: FE, desc: "If R[rs1] == R[rs2], PC += imm."}
+  BNE:    {op: 0x19, fmt: S_BR, queue: FE, desc: "If R[rs1] != R[rs2], PC += imm."}
+  BLT:    {op: 0x1A, fmt: S_BR, queue: FE, desc: "If R[rs1] < R[rs2] (signed), PC += imm."}
+  BGE:    {op: 0x1B, fmt: S_BR, queue: FE, desc: "If R[rs1] >= R[rs2] (signed), PC += imm."}
+  BLTU:   {op: 0x1C, fmt: S_BR, queue: FE, desc: "If R[rs1] < R[rs2] (unsigned), PC += imm."}
+  LD:     {op: 0x20, fmt: S_MEM, queue: FE, desc: "R[rd] = SPM[R[rs1] + imm]; size: 0 = 8 B, 1 = 4 B signed, 2 = 4 B unsigned, 3 = 2 B unsigned, 4 = 1 B unsigned. Not ordered against queued instructions: wait on a semaphore first."}
+  ST:     {op: 0x21, fmt: S_MEM, queue: FE, desc: "SPM[R[rs1] + imm] = R[rs2] (size as LD)."}
+  CSRR:   {op: 0x24, fmt: S_CSR, queue: FE, desc: "R[rd] = CSR[csr]."}
+  CSRW:   {op: 0x25, fmt: S_CSR, queue: FE, desc: "CSR[csr] = R[rs1]."}
+  SWAIT:  {op: 0x28, fmt: S_SEM, queue: FE, desc: "Stall the front end until sem[sem] >= R[rs1] + imm (unsigned 32-bit compare)."}
+  SSET:   {op: 0x29, fmt: S_SEM, queue: FE, desc: "sem[sem] = R[rs1] + imm. Only legal while no queued instruction references sem."}
+  SINC:   {op: 0x2A, fmt: S_SEM, queue: FE, desc: "sem[sem] += R[rs1] + imm, in program order with respect to the front end only."}
+
+  # ---- DMA (queue DQ<dq>)
+  DMA_COPY:
+    op: 0x40
+    fmt: T_DMA
+    queue: DQ
+    desc: >-
+      Copy the tile described by (src_reg, src_td) to (dst_reg, dst_td), converting with cvt and writing with wop.
+      Shapes must have the same element count; the destination TD sets the order. n_reg != 0 overrides the outermost
+      count of both TDs. A PAGED TD translates its outermost dimension through the page table at SPM[idx_reg].
+      Block formats read their scales from scale_reg (TD aux fields give the layout); FP8-target conversions write
+      FP32 column scales to SPM[aux_reg]. rsem != 0: every packet adds its payload bytes to sem[rsem] of the core that
+      owns the destination address once the data is written.
+  DMA_GATHER:
+    op: 0x41
+    fmt: T_DMA
+    queue: DQ
+    desc: >-
+      Row gather. src TD aux1 = row bytes (any size, no alignment needed); the index list (int32 or int64 per
+      IDX64) is at SPM[idx_reg] with count from the dst TD outer dims or n_reg. Row i of the destination =
+      source row index[i] (base = src_reg, row pitch = src TD s1). PAGED: indices are logical rows translated
+      through the page table given by scale_reg. Conversions as DMA_COPY (MXFP8 rows with SCALE_INLINE).
+      Keeps up to dma_outstanding_reads granules in flight.
+  DMA_SCATTER:
+    op: 0x42
+    fmt: T_DMA
+    queue: DQ
+    desc: >-
+      Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into
+      SRAM). PAGED as DMA_GATHER.
+  DMA_MCAST:
+    op: 0x43
+    fmt: T_DMAMC
+    queue: DQ
+    desc: >-
+      Copy a local SPM tile to the same SPM offset (dst_reg, dst_td) in every core of the mesh rectangle
+      x0..x1, y0..y1 of this die (XY-tree multicast in the network). rsem applies at each destination.
+  DMA_LIST:
+    op: 0x44
+    fmt: T_DMAL
+    queue: DQ
+    desc: >-
+      Execute R[n_reg] + imm DMA descriptors stored back to back at SPM[R[list_reg]] (each 32 B: an encoded
+      DMA_COPY/GATHER/SCATTER/MCAST/SIGNAL operand block with absolute addresses instead of registers). Used for
+      collective schedules and other precomputed transfer lists. Completion = all listed transfers complete.
+  SIGNAL:
+    op: 0x45
+    fmt: T_SIG
+    queue: DQ
+    desc: >-
+      After every earlier instruction in this DMA queue has completed (writes acknowledged), write to the
+      semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it. Release semantics
+      for producer/consumer hand-off across cores, dies and packages.
+
+  # ---- MXU (queue MQ)
+  MXU_MM:
+    op: 0x60
+    fmt: T_MXU
+    queue: MQ
+    desc: >-
+      ACC(acc_reg) (+)= A x W. A = (a_reg, a_td) in SPM: M rows (a_td n1, or R[m_reg] when m_reg != 0) by K
+      (a_td n0). W = (w_reg, w_td) in SPM: K x N, or N x K when trans_w = 1 (the HF [out, in] layout). The MXU
+      loops over 64-column N tiles and K tiles (256 FP8 or 128 BF16 deep) internally; N tile j lands in ACC rows
+      acc + j*M .. acc + j*M + M - 1. acc_mode OVERWRITE / ACCUM / RESCALE (rowscale FP32 [M] at SPM[rs_reg]).
+      cs_reg != 0: column scales FP32 [K tiles x N] at SPM[cs_reg] multiply each K tile's partial sum before it is
+      accumulated (block-scaled weights). mode BF16X3 emulates FP32 with three BF16 passes.
+
+  # ---- VPU / SFU / top-k (queue VQ). All arithmetic is FP32 inside; inputs convert from their TD dtype,
+  # ---- outputs round to the destination dtype (RNE, saturating for FP8; numerics.md).
+  VEW:
+    op: 0x80
+    fmt: T_VPU
+    queue: VQ
+    func_enum: vew_func
+    desc: >-
+      Element-wise d = func(s0, s1, s2) over the shape of d_td; sources broadcast through zero strides.
+      p_reg holds two FP32 parameters (a in bits 31:0, b in bits 63:32).
+  VRED:
+    op: 0x81
+    fmt: T_VPU
+    queue: VQ
+    func_enum: vred_func
+    imm_fields: {axis: [0, 0], group: [16, 1]}
+    desc: >-
+      Reduction of s0 along dim 0 (axis 0) or dim 1 (axis 1). group != 0 reduces groups of `group` elements
+      instead of the whole axis (e.g. Step 5 8-token region pooling). WSUM_RELU uses weights s1.
+  VSCAN:
+    op: 0x82
+    fmt: T_VPU
+    queue: VQ
+    func_enum: vscan_func
+    imm_fields: {exclusive: [0, 0], axis: [1, 1]}
+    desc: "Prefix scan of s0 along the axis (linear-attention decay products, MoE offsets)."
+  VNORM:
+    op: 0x83
+    fmt: T_VPU
+    queue: VQ
+    func_enum: norm_func
+    imm_fields: {group: [15, 0]}
+    desc: >-
+      Row normalization of s0 with gain s1 (and bias s2 for LAYER); eps = FP32 in p_reg bits 31:0.
+      RMS_GROUPED normalizes each group of `group` elements; RMS_STAT writes rsqrt(mean(x^2) + eps) only.
+  VROPE:
+    op: 0x84
+    fmt: T_VPU
+    queue: VQ
+    func_enum: rope_mode
+    imm_fields: {rot_dims: [9, 0], rows_per_token: [17, 10]}
+    desc: >-
+      Rotary embedding on the first rot_dims of each row of s0 with cos = s1, sin = s2 tables
+      ([tokens x rot_dims/2], gathered by position beforehand); rows_per_token rows share one table row.
+  VSOFTMAX:
+    op: 0x85
+    fmt: T_VPU
+    queue: VQ
+    func_enum: mask_mode
+    imm_fields: {rows_per_token: [7, 0], softcap: [8, 8]}
+    desc: >-
+      One online-softmax step (FlashAttention). s0 = scores [R x C] (ACC or SPM, FP32); s1 = state, three FP32
+      arrays m[R], l[R], alpha[R] back to back; d = P [R x C] (E4M3 or BF16). p_reg = (scale FP32, window int32),
+      p2_reg = (query position of row 0 int32, key position of column 0 int32). Updates m and l, writes
+      alpha = exp(m_old - m_new) for MXU_MM RESCALE. softcap = 1 applies c*tanh(s/c) with c from the TD aux0.
+  VQUANT:
+    op: 0x86
+    fmt: T_VPU
+    queue: VQ
+    func_enum: quant_fmt
+    desc: >-
+      Quantize s0 into d (packed elements) and s1 (scales); p_reg = tensor scale (NVFP4, E4M3_TENSOR).
+      KV-cache writes and dynamic FP8 activations.
+  VTOPK:
+    op: 0x87
+    fmt: T_VPU
+    queue: VQ
+    func_enum: topk_mode
+    imm_fields: {k: [11, 0], init: [12, 12], final: [13, 13]}
+    desc: >-
+      Streaming top-k per row: merges the scores s0 [R x C] into the running state d (values FP32 [R x k] then
+      indices int32 [R x k]). Column c has index p2_reg + c. init clears the state; final sorts it descending.
+      Ties keep the lower index. BLOCKMAX: block size in p_reg bits 31:0.
+  VROUTE:
+    op: 0x88
+    fmt: T_VPU
+    queue: VQ
+    func_enum: route_score
+    imm_fields: {k: [5, 0], n_group: [11, 6], topk_group: [17, 12], bias: [18, 18], norm: [19, 19]}
+    desc: >-
+      MoE router: s0 = logits [T x E] FP32, s1 = correction bias [E]. score = func(logit); selection uses
+      score + bias; group-limited selection keeps the topk_group best of n_group groups (group score = sum of its
+      top-2); weights = score of the selected experts, normalized when norm = 1, times routed_scale (p_reg FP32).
+      d = expert ids int32 [T x k] then weights FP32 [T x k].
+  VBUCKET:
+    op: 0x89
+    fmt: T_VPU
+    queue: VQ
+    imm_fields: {n_bins: [12, 0]}
+    desc: >-
+      Counting sort of int32 ids s0 [N]: d = counts [n_bins], s1 = exclusive offsets [n_bins + 1],
+      s2 = permutation [N] (positions sorted by id, stable). MoE dispatch lists.
+  VXPOSE:
+    op: 0x8A
+    fmt: T_VPU
+    queue: VQ
+    desc: "d = transpose of the 2-D tile s0 (1, 2 or 4-byte elements)."
+  VMATVEC:
+    op: 0x8B
+    fmt: T_VPU
+    queue: VQ
+    desc: "d [R x N] = s0 [R x K] x s1 [K x N] in FP32 on the VPU, N <= 32 (exact FP32 hyper-connection mixer)."
+  VTRINV:
+    op: 0x8C
+    fmt: T_VPU
+    queue: VQ
+    imm_fields: {n: [6, 0], negate: [7, 7]}
+    desc: >-
+      d = (I + A)^-1 (or (I - A)^-1 when negate) for the strictly lower-triangular FP32 block A = s0, n <= 64
+      (chunked DeltaNet / KDA WY form).
+  HC_MIX:
+    op: 0x90
+    fmt: T_VPU
+    queue: VQ
+    imm_fields: {n_streams: [3, 0]}
+    desc: >-
+      mHC coefficients: s0 = projection [T x (2n + n^2)] FP32, s1 = rsqrt stat [T], s2 = parameters
+      (alpha_pre, alpha_post, alpha_res, then bias [2n + n^2]). d = pre = sigmoid(.) + eps, post = 2*sigmoid(.),
+      comb logits = alpha_res * m + bias; eps in p_reg.
+  HC_SINKHORN:
+    op: 0x91
+    fmt: T_VPU
+    queue: VQ
+    imm_fields: {iters: [7, 0], n_streams: [11, 8]}
+    desc: "Row-softmax start then `iters` alternating row/column normalizations of each n x n block of s0 (in place allowed); eps in p_reg."
+  HC_PRE:
+    op: 0x92
+    fmt: T_VPU
+    queue: VQ
+    imm_fields: {n_streams: [3, 0], mean: [4, 4]}
+    desc: >-
+      d [T x D] = sum_i s1[T, i] * s0[T, i, D] (mHC collapse). mean = 1: d = mean_i sigmoid(s1[T, i, D]) * s0[T, i, D]
+      with element-wise gate logits s1 [T x n x D] (Qwen gated HC).
+  HC_POST:
+    op: 0x93
+    fmt: T_VPU
+    queue: VQ
+    func_enum: hc_post_func
+    imm_fields: {n_streams: [3, 0]}
+    desc: >-
+      Residual update of the n streams: s0 = sublayer output y [T x D], s1 = streams x [T x n x D],
+      s2 = coefficients (MHC: the HC_MIX row with post and Sinkhorn comb; GATED: g [T x n]). d = new streams.
+
+# Global address map (docs/spec/memmap.md). Offsets are die-local (bits 41:0 of a global address).
+memmap:
+  gpa_bits: 49
+  node_field: [48, 42]      # node = 2 * package + die; 0x7F = this die
+  node_self: 0x7F
+  max_nodes: 64
+  regions:
+    HBM:     {base: 0x00000000000, size: 0x02400000000, desc: "144 GiB: stack s at s * 36 GiB (stack-contiguous, no cross-stack interleave)"}
+    HBM_RSV: {base: 0x02400000000, size: 0x1DC00000000, desc: "reserved for larger HBM configurations; access faults"}
+    SPM:     {base: 0x20000000000, stride: 0x400000, count: 64, size: 0x400000, desc: "core c scratchpad, 4 MiB (32 cores populated)"}
+    GSRAM:   {base: 0x20010000000, stride: 0x100000, count: 64, size: 0x100000, desc: "global SRAM slice in core tile c, 1 MiB"}
+    CORECTL: {base: 0x20020000000, stride: 0x100000, count: 64, size: 0x20000, desc: "core c control block"}
+    DIECTL:  {base: 0x20030000000, stride: 0x100000, count: 16, size: 0x100000, desc: "die blocks: 0 CP, 1 host interface, 2-5 HBM controllers, 6 D2D bridge, 7 C2C bridge, 8 NoC"}
+  corectl:                  # offsets inside a core control block
+    IMEM:    {offset: 0x00000, size: 0x10000}
+    DTAB:    {offset: 0x10000, size: 0x02000}
+    SEM:     {offset: 0x12000, size: 0x00100, desc: "64 x 32-bit; a write sets, a read returns the value"}
+    SEM_ADD: {offset: 0x12100, size: 0x00100, desc: "a write (or DMA wop ADD) adds to the semaphore"}
+    CSR:     {offset: 0x13000, size: 0x01000, desc: "csr enum x 8 B"}
+  hbm:
+    stack_bytes: 0x900000000   # 36 GiB, 12-Hi of 24 Gb dies
+    sid_bytes:   0x300000000   # 12 GiB per stack ID (3 SIDs)
+    pcs: 32
+    leaf_of_pc: [4, 3]         # pc bits that pick the HBM leaf router (8 PCs per leaf)
+    fields:                    # bits of p = (stack offset) mod 12 GiB
+      byte:   [4, 0]
+      col_lo: [7, 5]
+      pc:     [12, 8]          # hashed: pc ^= p[17:13] ^ row[4:0]
+      col_hi: [14, 13]
+      bg:     [16, 15]         # hashed: bg ^= row[6:5]
+      ba:     [18, 17]         # hashed: ba ^= row[8:7]
+      row:    [33, 19]         # 0 .. 24575
+    rows: 24576
+  spm_bank: "bank = addr[10:6] ^ addr[15:11]"

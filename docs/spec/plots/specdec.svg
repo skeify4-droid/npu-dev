@@ -40,15 +40,15 @@
 <circle cx="470.2" cy="114.9" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>MiniMax-M3.1-Flash (dspark): 5, 2.358</title></circle>
 <circle cx="547.0" cy="92.7" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>MiniMax-M3.1-Flash (dspark): 6, 2.553</title></circle>
 <circle cx="623.9" cy="72.9" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"><title>MiniMax-M3.1-Flash (dspark): 7, 2.727</title></circle>
-<path d="M86.1,269.9 L163.0,236.7 L239.8,207.2 L316.6,183.9 L393.4,165.6 L470.2,151.5 L547.0,141.1 L623.9,134.0" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
+<path d="M86.1,269.9 L163.0,236.7 L239.8,207.2 L316.6,183.9 L393.4,165.5 L470.2,151.5 L547.0,141.3 L623.9,134.1" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="86.1" cy="269.9" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 0, 1</title></circle>
 <circle cx="163.0" cy="236.7" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 1, 1.291</title></circle>
-<circle cx="239.8" cy="207.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 2, 1.549</title></circle>
-<circle cx="316.6" cy="183.9" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 3, 1.753</title></circle>
-<circle cx="393.4" cy="165.6" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 4, 1.914</title></circle>
-<circle cx="470.2" cy="151.5" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 5, 2.038</title></circle>
-<circle cx="547.0" cy="141.1" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 6, 2.129</title></circle>
-<circle cx="623.9" cy="134.0" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 7, 2.191</title></circle>
+<circle cx="239.8" cy="207.2" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 2, 1.55</title></circle>
+<circle cx="316.6" cy="183.9" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 3, 1.754</title></circle>
+<circle cx="393.4" cy="165.5" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 4, 1.915</title></circle>
+<circle cx="470.2" cy="151.5" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 5, 2.037</title></circle>
+<circle cx="547.0" cy="141.3" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 6, 2.127</title></circle>
+<circle cx="623.9" cy="134.1" r="4" fill="var(--s1)" stroke="var(--bg)" stroke-width="2"><title>MiMo-V2.6-Flash (dflash): 7, 2.19</title></circle>
 <path d="M86.1,269.9 L163.0,246.0 L239.8,228.1 L316.6,214.8 L393.4,203.7 L470.2,194.0" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="86.1" cy="269.9" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash (dspark): 0, 1</title></circle>
 <circle cx="163.0" cy="246.0" r="4" fill="var(--s2)" stroke="var(--bg)" stroke-width="2"><title>DeepSeek V4.1 Flash (dspark): 1, 1.209</title></circle>
@@ -61,11 +61,11 @@
 <circle cx="163.0" cy="237.9" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4 (dspark): 1, 1.281</title></circle>
 <circle cx="239.8" cy="208.8" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4 (dspark): 2, 1.536</title></circle>
 <circle cx="316.6" cy="182.7" r="4" fill="var(--s3)" stroke="var(--bg)" stroke-width="2"><title>Mistral Large 4 (dspark): 3, 1.764</title></circle>
-<path d="M86.1,269.9 L163.0,251.3 L239.8,238.0 L316.6,227.4" fill="none" stroke="var(--s4)" stroke-width="2" stroke-linejoin="round"/>
+<path d="M86.1,269.9 L163.0,251.2 L239.8,238.0 L316.6,227.3" fill="none" stroke="var(--s4)" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="86.1" cy="269.9" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 0, 1</title></circle>
-<circle cx="163.0" cy="251.3" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 1, 1.163</title></circle>
-<circle cx="239.8" cy="238.0" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 2, 1.279</title></circle>
-<circle cx="316.6" cy="227.4" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 3, 1.373</title></circle>
+<circle cx="163.0" cy="251.2" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 1, 1.164</title></circle>
+<circle cx="239.8" cy="238.0" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 2, 1.28</title></circle>
+<circle cx="316.6" cy="227.3" r="4" fill="var(--s4)" stroke="var(--bg)" stroke-width="2"><title>GLM-5.3-Flash (mtp): 3, 1.373</title></circle>
 <line x1="656" x2="674" y1="54" y2="54" stroke="var(--s0)" stroke-width="2"/>
 <circle cx="665" cy="54" r="4" fill="var(--s0)" stroke="var(--bg)" stroke-width="2"/>
 <text class="t1" x="680" y="58">MiniMax-M3.1-Flash (dspark)</text>
