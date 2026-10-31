@@ -23,7 +23,7 @@ Phase 2 refines the micro-architecture under these numbers. Changing one of them
 | NoC | 8 x 4 2D mesh, **2 planes** of 128 B/cycle/link/direction *(P2)*, HBM controllers on 16 edge leaf routers ([noc.md](noc.md)) | carries 3.3 KB/cycle of HBM ingress at <= 80% link load |
 | Weight formats | FP8 E4M3/E5M2, BF16, MXFP8 (E8M0 scale / 32), MXFP4 (E8M0 / 32), **NVFP4 (E4M3 scale / 16 + FP32 tensor scale)**; 4-bit and MXFP8 are dequantized to FP8 in the DMA path | |
 | KV / cache formats | FP8, BF16, **NVFP4** (DeepSeek global KV, MiniMax KV and index keys as served), MXFP4 index keys (DeepSeek) | |
-| Recurrent state | FP32 (as published), BF16 option to evaluate in Phase 2 numerics | |
+| Recurrent state | FP32 (as published); BF16 evaluated and rejected in Phase 2 ([numerics.md](numerics.md) D3) | |
 
 Changes from the Phase 0 plan: the SFU rate is set at 128 per core instead of being left open, NVFP4 is added to the weight and
 KV formats, and the VPU rate is fixed at 512 FLOP/cycle/core. Everything else is unchanged.
@@ -115,7 +115,7 @@ Where Phase 2 covers each one: [isa.md](isa.md) §6 (instruction per feature), [
   The scoring is `sum_h w_h relu(q_h . s)`.
 - **Linear-attention state** (GLM-5.3-Flash, Ling, Qwen):
   - FP32 state is 0.25–0.6 GB per sequence-step of HBM traffic at short context.
-  - That is too large for SRAM, so it streams from HBM. A BF16-state experiment goes in `numerics.md`.
+  - That is too large for SRAM, so it streams from HBM. A BF16 state would gain 3-6% decode but adds 0.7-2% recurrent output error, so it stays FP32 (`numerics.md` D3).
 - **Spec decode:**
   - Verify batches of gamma + 1 tokens per sequence.
   - DSpark's Markov head runs gamma sequential `r x V` GEMVs (MiniMax: 7 x 102 MB of BF16 weights per round unless cached).
@@ -128,6 +128,7 @@ Where Phase 2 covers each one: [isa.md](isa.md) §6 (instruction per feature), [
 |---|---|---|
 | 2026-11-01 | Frozen. SFU 128/cycle/core; NVFP4 weights and KV; VPU 512 FLOP/cycle/core; package counts fixed. | `docs/reports/phase1_sweeps.md` |
 | 2026-11-01 | Phase 2: D2D 5 -> 1.4 TB/s per direction; NoC 2 mesh planes; + 16 MB ACC and 2.3 MB IMEM/DTAB per die; no central collective engine (distributed write-add, multicast, semaphores). Package counts unchanged; decode within 0.2%. | [microarch.md](microarch.md) §8, [noc.md](noc.md) §5, `make sweep` rerun |
+| 2026-11-01 | Phase 2 numerics: no frozen number changes. BF16 at half rate confirmed as a 2-way BF16 dot product per PE (microarch.md had quarter rate); recurrent state stays FP32; NVFP4 takes the exact BF16 path when memory-bound. | [numerics.md](numerics.md) N-3, N-7; `make numerics` |
 
 ## 6. Model limits (what the roofline does not capture)
 

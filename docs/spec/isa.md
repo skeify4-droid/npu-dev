@@ -108,8 +108,8 @@ Rules:
   - `OVERWRITE` (first K tile writes);
   - `ACCUM`;
   - `RESCALE`: multiply existing ACC rows by `rowscale` first; this is the FlashAttention `O = alpha * O + P V` update.
-- `mode = BF16X3` emulates FP32 with three BF16 passes. It is used for the hyper-connection mixer if numerics.md says BF16 alone is
-  not enough.
+- `mode = BF16X3` emulates FP32 with three BF16 passes (numerics.md N-3). The hyper-connection mixer uses its two-pass form (the
+  stream is exact in BF16, so the `A_lo` pass is dropped; numerics.md D2).
 
 **VPU (`VQ`), all arithmetic in FP32, outputs rounded to the destination dtype:**
 - `VEW`: element-wise, unary/binary/ternary. Includes the router scoring functions, SwiGLU (also clamped), integer index math.
@@ -215,7 +215,8 @@ Floating-point exceptions do not trap. NaN/Inf/saturation behavior is defined in
 
 ## 11. Open items
 
-- numerics.md (next Phase 2 step): rounding and saturation of every conversion; the NVFP4 -> E4M3 residual rounding error (N-2) against
-  the exact BF16 path; HC mixer precision (BF16 vs `BF16X3` vs `VMATVEC` FP32); BF16 linear-attention state.
+- Closed by numerics.md: rounding and saturation of every conversion (N-2), the NVFP4 -> E4M3 residual (D1: exact BF16 path when
+  memory-bound, fold when compute-bound), HC mixer precision (D2: BF16 hi/lo), BF16 linear-attention state (D3: rejected, FP32 stays).
+  `FP_STATUS` CSR added (N-5).
 - An assembler and a golden instruction-level model (`sw/compiler`, Phase 3) on top of `isa/isa.py`'s encoder.
 - Instruction count and front-end stall rates are to be measured once the compiler emits real kernels (Phase 5/7).

@@ -193,13 +193,15 @@ start until they are met.
 **Step 1 done (2026-11-01):** micro-architecture (`docs/spec/microarch.md`: weight-stationary MXU, ACC, SPM banking, DMA, core and die
 blocks, TINY/MID/FULL configs, interface tables), ISA v0.1 (`docs/spec/isa.md`, `isa/isa.yaml` with validator, encoder/decoder and
 SV/C++/Markdown generators: `make isa`), memory map (`docs/spec/memmap.md`), NoC and deadlock strategy (`docs/spec/noc.md`, checked by
-`sim/analytic/noc.py`). Remaining: `numerics.md`, `hbm.md`, `d2d_c2c.md`, spec review.
+`sim/analytic/noc.py`). **Step 2 done (2026-11-01):** numerics (`docs/spec/numerics.md`, golden model `sw/npumodel/numerics.py`,
+experiments `make numerics`). Remaining: `hbm.md`, `d2d_c2c.md`, spec review.
 - **Done (v0.1).** `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
   MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE; hyper-connection ops HC_MIX / HC_SINKHORN / HC_PRE / HC_POST /
   HC_GATED_MIX; DMA_GATHER_ROWS with unaligned rows and MXFP8 dequantization). Decoupled access/execute queues per core.
   As built: COLLECTIVE became `DMA_LIST` + write-add + `DMA_MCAST` + semaphores (isa.md §10); HC_GATED_MIX folded into
   `HC_PRE mean=1` and `HC_POST GATED`; DMA_GATHER_ROWS is `DMA_GATHER`.
-- `numerics.md`: FP8/BF16/MXFP4/NVFP4 formats, rounding (RNE), saturation, accumulation order, NaN/Inf policy; the hyper-connection mixer-precision experiment.
+- **Done.** `numerics.md`: FP8/BF16/MXFP4/NVFP4 formats, rounding (RNE), saturation, accumulation order, NaN/Inf policy; the hyper-connection mixer-precision experiment.
+  As built: also the NVFP4 fold residual (exact BF16 path when memory-bound, fold when compute-bound), BF16 recurrent state (rejected), RTL test tolerances.
 - **Done.** `memmap.md`: global address map (HBM address interleaving across stacks/PCs/banks, scratchpad, global SRAM, remote die/package windows).
 - **Done.** `noc.md`: topology, routing (XY), virtual channels for deadlock freedom (request/response separation), credit flow control.
 - `hbm.md`: controller architecture (per-PC queues, FR-FCFS scheduler, open/close page policy, refresh,

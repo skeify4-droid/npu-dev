@@ -401,6 +401,7 @@ package isa_pkg;
   localparam logic [5:0] CSR_STATUS = 6'd4;
   localparam logic [5:0] CSR_FAULT_CAUSE = 6'd5;
   localparam logic [5:0] CSR_FAULT_ADDR = 6'd6;
+  localparam logic [5:0] CSR_FP_STATUS = 6'd7;
   localparam logic [5:0] CSR_PERF_SEL = 6'd16;
   localparam logic [5:0] CSR_PERF_CNT0 = 6'd17;
   localparam logic [5:0] CSR_PERF_CNT1 = 6'd18;

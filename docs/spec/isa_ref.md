@@ -139,4 +139,4 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 - `route_score`: SOFTMAX = 0, SIGMOID = 1, SQRTSOFTPLUS = 2
 - `quant_fmt`: E4M3_ROW = 0, MXFP8 = 1, MXFP4 = 2, NVFP4 = 3, E4M3_TENSOR = 4
 - `hc_post_func`: MHC = 0, GATED = 1
-- `csr`: CORE_ID = 0, NODE_ID = 1, CYCLE = 2, PC = 3, STATUS = 4, FAULT_CAUSE = 5, FAULT_ADDR = 6, PERF_SEL = 16, PERF_CNT0 = 17, PERF_CNT1 = 18, SEM_BASE_GPA = 32
+- `csr`: CORE_ID = 0, NODE_ID = 1, CYCLE = 2, PC = 3, STATUS = 4, FAULT_CAUSE = 5, FAULT_ADDR = 6, FP_STATUS = 7, PERF_SEL = 16, PERF_CNT0 = 17, PERF_CNT1 = 18, SEM_BASE_GPA = 32

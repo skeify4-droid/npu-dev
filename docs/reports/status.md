@@ -198,3 +198,46 @@
 ### Next
 - `numerics.md`: conversion rounding, the NVFP4 -> E4M3 residual error, HC mixer precision, BF16 linear-attention state.
 - `hbm.md`, `d2d_c2c.md`, then the Phase 2 spec review.
+
+## Phase 2 step 2: numerics (2026-11-01)
+
+### Changes
+- `docs/spec/numerics.md`:
+  - every format's bits, including the FP4 packing;
+  - every conversion's rounding, saturation and NaN/Inf rule;
+  - the block-scale fold algorithm and when it is exact;
+  - `VQUANT` recipes (OCP MX, NVIDIA NVFP4);
+  - the MXU PE arithmetic and accumulation order, and `BF16X3`;
+  - VPU reductions and SFU error bounds, online softmax and top-k corner cases;
+  - write-add ordering and a deterministic-collective mode;
+  - RTL test tolerances.
+- `sw/npumodel/numerics.py`: the bit-accurate golden model (formats, codecs, MX/NVFP4 quantizers, DMA fold, MXU order, BF16X3).
+- `sim/analytic/numerics_exp.py` (`make numerics`, 40 s, 0.4 GB) generates `docs/reports/numerics_experiments.md` (E1-E4).
+- `isa/isa.yaml`: new `FP_STATUS` CSR (sticky INVALID / OVERFLOW / SATURATE / NAN_IN).
+- `microarch.md`: corrected the BF16 MXU rate. It said quarter rate; it is now a 2-way BF16 dot product per PE, half rate, as frozen.
+- `arch.md`, `isa.md`, `hyper_connections.md`: decisions recorded. No frozen number changed.
+
+### Results
+- **NVFP4 → E4M3 fold (E1):**
+  - It changes 13-23% of elements and adds 2.1-2.3% GEMM error. That is about the E4M3 activation error every FP8 GEMM pays, and under
+    half the error of MiniMax's served W4A4 path.
+  - The MXFP4 fold is exact; MXFP8 is below 1e-6.
+  - The exact BF16 path would cost +44% on MiniMax prefill. Decision: exact path when memory-bound (decode), fold when compute-bound.
+- **mHC mixer (E2):**
+  - Two BF16 passes over hi/lo weights match FP32 (KL about 1e-11).
+  - Plain BF16 passes the KL < 1e-3 bound (own contribution 2e-6 to 2e-5); E4M3 fails it.
+  - Decision: BF16 hi/lo.
+- **BF16 recurrent state (E3):**
+  - Rounding the state every token gives 0.7-2% output error, 4-12x the BF16 output rounding. Stochastic rounding is worse.
+  - The gain would be +3-6% decode tokens/s.
+  - Decision: the state stays FP32.
+- **Accumulation (E4):** the PE order is within 2-4 ulp at K = 16384, against 4-41 ulp for a naive FP32 loop.
+- `ml_dtypes` rounds float64 inputs twice (through float32). The golden model rounds once; tests compare on FP32 inputs.
+
+### Tests
+- `make pytest`: 89 passed (68 before, + 21 numerics).
+- The golden model matches `ml_dtypes` on every E4M3, E5M2 and E2M1 code, and on all rounding midpoints.
+
+### Next
+- `hbm.md`, `d2d_c2c.md`, then the Phase 2 spec review.
+- Open: confirm D2 on the real DeepSeek `hc_fn` weights (range requests, 2 MB per sublayer).

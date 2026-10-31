@@ -2,7 +2,7 @@
 
 Status: **draft for review, 2026-11-01.** Refines the frozen numbers of [`arch.md`](arch.md) into blocks, datapaths and interfaces.
 Companion specs: [`isa.md`](isa.md) (programming model, `isa/isa.yaml`), [`memmap.md`](memmap.md) (address map),
-[`noc.md`](noc.md) (network and deadlock freedom). Still to come in Phase 2: `numerics.md`, `hbm.md`, `d2d_c2c.md`.
+[`noc.md`](noc.md) (network and deadlock freedom), [`numerics.md`](numerics.md) (formats, rounding, accumulation order). Still to come in Phase 2: `hbm.md`, `d2d_c2c.md`.
 Items marked *(P2)* are decisions made here; §8 lists what they changed in `arch.md`.
 
 ## 1. Die
@@ -73,7 +73,8 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
 
 ### 2.2 MXU: weight-stationary *(P2)*
 - 64 x 64 PEs. Each PE holds 4 stationary FP8 values (K = 4) and computes a 4-way dot product plus the partial sum from the PE above.
-  A stationary tile is K = 256 x N = 64 (16 KiB FP8; BF16: K = 128, each A row takes 2 cycles).
+  A stationary tile is K = 256 x N = 64 (16 KiB FP8; BF16: K = 128, each PE a 2-way BF16 dot product, A rows still one per cycle, so
+  half the FP8 MAC rate; numerics.md N-3).
 - A rows stream from the left (256 B/cycle, skewed). Partial sums flow down the columns and leave at the bottom: 64 FP32 per cycle into ACC.
 - **Stationary load port 512 B/cycle, double-buffered (shadow weights).**
   - A tile loads in 32 cycles while the previous tile streams.

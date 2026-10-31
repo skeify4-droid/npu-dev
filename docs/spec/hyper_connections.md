@@ -51,7 +51,8 @@ leaving the rest for weight and KV tiles), and fuse collapse, norm and expand in
 
 **HC-2: mixing projection precision.** DeepSeek and GLM keep the mixer weights in fp32 and do the projection in fp32. The baseline MXU is FP8 with BF16
 at half rate and FP32 accumulate. Proposal *(P1)*: run the projection as BF16 hi/lo split (3 passes) on the MXU; at 0.5 M MACs per sublayer the cost is
-under 1% of the layer either way. Alternative: fp32 FMA on the VPU. **A Phase 2 numerics experiment decides** (compare against the reference fp32 on real activations; proposed acceptance *(P1)*: logits KL < 1e-3).
+under 1% of the layer either way. Alternative: fp32 FMA on the VPU. **Decided in Phase 2 (numerics.md D2):** two BF16 MXU passes over pre-split `W_lo`, `W_hi` (the stream is exact in BF16, so this equals BF16X3);
+KL to the FP32 mixer about 1e-11 in a toy 80-sublayer model, while plain BF16 gives 2e-6 to 2e-5 (fallback) and E4M3 fails the KL < 1e-3 bound.
 The skinny shape (`N = 24` against a 64-wide array, 37% utilization) is irrelevant at this size.
 
 **HC-3: Sinkhorn on the VPU.** Per token a 4x4 matrix, 20 iterations of row sum, reciprocal, scale, column sum, reciprocal, scale: about 2.8 kFLOP per sublayer.
@@ -108,6 +109,6 @@ it reuses the HC ops above.
 
 ## 6. Open items
 
-- HC-2 numerics (decided by experiment, Phase 2).
+- HC-2 numerics: decided (numerics.md D2); confirm on the real `hc_fn` weights (numerics.md N-9).
 - Whether decode keeps the stream replicated rather than sharded for small batches (trade the HC-5 collectives for 4x more residual storage per core).
 - DeepSeek's `hc_head` / final collapse and GLM's "hyper head" are one more `HC_PRE`-like op before the output norm; included in HC-4.

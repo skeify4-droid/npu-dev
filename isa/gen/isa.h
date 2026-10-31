@@ -344,6 +344,7 @@ enum class Csr : uint16_t {
   STATUS = 4,
   FAULT_CAUSE = 5,
   FAULT_ADDR = 6,
+  FP_STATUS = 7,
   PERF_SEL = 16,
   PERF_CNT0 = 17,
   PERF_CNT1 = 18,

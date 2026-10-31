@@ -175,6 +175,7 @@ enums:
     STATUS: 0x004    # queue busy bits, fault bit
     FAULT_CAUSE: 0x005
     FAULT_ADDR: 0x006
+    FP_STATUS: 0x007   # sticky FP flags, write 1 to clear: [0] INVALID [1] OVERFLOW [2] SATURATE [3] NAN_IN (numerics.md N-5)
     PERF_SEL: 0x010
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
