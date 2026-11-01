@@ -233,6 +233,12 @@ session checks the fixes next.
     (`isa.staging_ring`); semaphores belong to one call site and move only after a final credit; a stale link `ERR` frees no
     tag. No frozen number changed. `core/dma` waits for one more verification pass, which starts with the ring
     deadlock probe against the chosen rule. `core/seq` has no open item: W-3 is a compiler and runtime rule.
+  - **Verified a third time, then fixed (2026-11-01).** The third verification (d015351) found Z-1 to Z-8. A fourth fix
+    session resolved all eight on branch `spec-verification3-fixes` (8f6cf62, 4c0cb8b, 27184c4; spec_review.md
+    "Resolutions (verification 3 fixes)"). Every DMA read belongs to one ring entry, and `isa.staging_ring` models byte
+    ranges and a queued HBM share. Converting reads are paced by CSR `DMA_PACE` (72 KiB, the user's choice). Inline-scaled
+    Engram rows are defined. Semaphores move after a drain wait, and the link-down restart waits for every core, the bridges
+    and a drain time. No frozen number changed. `core/dma` waits for one more verification pass.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)

@@ -451,3 +451,44 @@ fixed all six on branch `spec-verification2-fixes`, one commit per group, with `
   against the chosen rule), then Phase 3 RTL on `core/dma`. `hbm`, `common`, `arith` and `core/seq` can start now.
 - Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2), the golden-model checks (X-6 detector,
   V-2 / W-3 semaphore order, W-4 (a) write order), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fixes for the third verification (2026-11-01)
+
+### Changes
+The third verification (d015351) found Z-1 to Z-8 (spec_review.md, Verification 3). This session fixed all eight on branch
+`spec-verification3-fixes`, one commit per group, with `make pytest` green before each. The "Resolutions (verification 3
+fixes)" section of `docs/reports/spec_review.md` has one row per finding.
+- **Group 1 (8f6cf62), `core/dma`:**
+  - Z-1: every data read and every conversion unit belongs to exactly one staging-ring entry; a granule two entries share is
+    two partial reads. `isa.staging_ring` takes HBM byte ranges, and the rejected shared-granule reading deadlocks with four DQs
+    at the verifier's cycle numbers.
+  - Z-3: `DMA_STAGE` is at least 2 KiB; the quarter-of-the-ring entry bound is a rate target; inline entries are whole rows.
+  - Z-4: `SCALE_INLINE` rows (Engram) are exempt from the block-aligned base rule; a row is its elements and then their
+    scales (`isa.inline_addr`).
+  - Z-8: scale reads go first within their DQ and take ceil(bytes / 256) tags.
+- **Group 2 (4c0cb8b), Z-2:** with the HBM share as a queue, greedy issue leaves converting streams 8-12% short of the share at a 500-cycle round trip and 23-28% at 845.
+  The user chose an in-flight limit on converting reads: CSR `DMA_PACE`, 72 KiB by default, which gives the paced rates back.
+  The ring stays 16 KiB.
+- **Group 3 (27184c4), compiler, runtime and Phase 4:**
+  - Z-5: a semaphore moves only after a drain wait for its old call site's full count.
+  - Z-6: credit semaphores per buffer parity, and multi-adder flags under the parity-and-credit rule.
+  - Z-7: after a link-down, the CP restarts once every core of the step is idle, the bridges report `err_done` and a 10 µs
+    drain has passed. A recovery time budget is a runtime availability item, not a spec number.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 unchanged; `make numerics`, `make hbm`, `make links` not rerun
+  (no input changed).
+- Ring rates with `DMA_PACE` at 72 KiB, queue model: NVFP4 → BF16 weights 155 / 150 / 127 and the paged NVFP4 KV gather
+  155 / 154 / 130 elements/cycle at 500 / 845 / 1,000-cycle round trips, against a need of 155. Without it: 142 / 119 / 111
+  and 136 / 111 / 104.
+
+### Tests
+- `make pytest`: 218 passed (212 before). `test_isa.py` 37 → 43.
+- `make isa` (Verilator lint of `isa_pkg`) clean; the generated files changed for `DMA_PACE`. No RTL changed.
+
+### Next
+- A verification pass on these fixes (check-first list at the end of spec_review.md, starting with an independent queue
+  model of the ring under `DMA_PACE`), then Phase 3 RTL on `core/dma`. `hbm`, `common`, `arith` and `core/seq` can start now.
+- Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7), the golden-model checks (X-6
+  detector, V-2 / W-3 / Z-5 / Z-6 semaphore order, W-4 (a) write order), the Phase 7 converting-rate check (Z-2), vendor PHY
+  latencies, and the DeepSeek `hc_fn` check for numerics D2.
