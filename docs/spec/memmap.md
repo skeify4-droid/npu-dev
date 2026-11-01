@@ -171,7 +171,7 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     i3 * s3`, inside `aux0`. Its dtype is `UINT8`. The KV write path uses it: the data rows and the scale rows of a new token are
     two transfers, and `cvt = NONE` never moves scales on its own.
   - Non-paged block-format operands (weights) keep the published separate scale array `[rows, K / block]`, row stride `aux0`,
-    unless the TD has `SCALE_INLINE` (below).
+    (`SCALE_INLINE`, below, is reserved in v1).
     `R[scale_reg]` points at the scale of the base element's block. The scale of element (i0, i1, i2, i3) is at
     `R[scale_reg] + i1 * aux0 + floor(o / block_bytes)`, with `o = i0 * esize + i2 * s2 + i3 * s3`.
     - **The base element starts a block** *(review finding W-5)*: the base address, `s1`, `s2` and `s3` are multiples of
@@ -181,7 +181,10 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     - Rejected: adding the base's in-block offset to `o`. It would make the formula general, but a dim-0 run that starts
       inside a block can also split a conversion unit across granules, and no layout needs it.
     - Reference: `isa.block_addr`, tested in `test_isa.py` (`test_block_addr_requires_block_aligned_base`).
-  - **Inline scales (`SCALE_INLINE`) *(review finding Z-4)*.** A row holds its n0 elements and then their n0 / block one-byte
+  - **Inline scales (`SCALE_INLINE`) *(review findings Z-4, X-16)*.** **Reserved in v1 (the user's choice, 2026-11-01):** a TD
+    with `SCALE_INLINE` faults `ILLEGAL_FIELD`, and the v1 DMA has no inline entries. No surveyed model uses it, and it
+    would cost the DMA a second ring-allocation trigger, an inline address path and the checks below, all to be verified
+    in Phase 3. The definition stays for a later version. A row holds its n0 elements and then their n0 / block one-byte
     scales, so an MXFP8 row of 256 elements is 256 B + 8 B = 264 B. No surveyed table is stored this way: the Engram table
     keeps its published separate scale array (256 B rows, `aux0` = 8; hyper_connections.md G-3, review finding Y-7), and
     `SCALE_INLINE` serves a table a runtime repacks. The scale of element i0 is at the row start + n0 * esize +
@@ -191,8 +194,9 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     - `ILLEGAL_FIELD` otherwise: a `SCALE_INLINE` operand is non-paged and in a block format; a row is one dim-0 run of
       whole blocks (n2 = n3 = 1, n0 a multiple of the block); `s1` is at least the row's size; a gather's `row_bytes` is
       the row's size (264; 0 included, review finding Y-7: `DMA_COPY` ignores `row_bytes`). `scale_reg` is unused.
-    - Reference: `isa.inline_addr` (`isa.block_addr` uses it for a `SCALE_INLINE` TD), tested in `test_isa.py`
-      (`test_engram_inline_gather`). The DMA stages each row raw and converts it whole (microarch.md §2.5, inline entries).
+    - Reference: `isa.inline_addr` (`isa.block_addr` faults a `SCALE_INLINE` TD in v1 and uses it with `v1=False`), tested
+      in `test_isa.py` (`test_engram_inline_gather`). The DMA stages each row raw and converts it whole (microarch.md §2.5,
+      inline entries).
 - **Writing scale rows *(review finding V-5)*.** A DMA write packet holds contiguous destination bytes. Adjacent runs merge,
   including consecutive rows of one page, up to a 256 B granule boundary, and `HBM_ALIGN` is checked per packet (microarch.md
   §2.5). So a `SCALE_REGION` TD with n1 = 32 / `aux0` rows, starting at a row that is a multiple of that count, writes one aligned

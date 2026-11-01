@@ -124,7 +124,12 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     - **(b)** a response or write ack for a tag or burst id that is not outstanding is dropped (after a fault every response
       is dropped, isa.md §8), and so is one whose `epoch` differs from the core's `NI_EPOCH` (f);
     - **(c)** during a link-down event `FAULT_ADDR` is advisory. The CP restarts every core of the step, whichever cores
-      faulted and with whatever address;
+      faulted and with whatever address. **It restarts every step that has a core faulted with `LINK` or `TIMEOUT`
+      *(review finding X-13 (c))*:** a die can run several steps on disjoint cores, and a stale replay-buffer `ERR` faults
+      the initiator of the replayed request even when its step's transfers all completed (W-2). Each such step is
+      restarted on its own cores, with its own conditions 1-3 (e) and its own `NI_EPOCH` toggle (f); a step with no
+      faulted core keeps running. A `LINK` fault that arrives after the CP has restarted the other steps is handled the
+      same way for its own step;
     - **(d)** a faulted core's tags and burst ids are freed only by their responses or acks (dropped) or by the per-request
       timeout. `STATUS` shows the DMA busy until all are free, and the CP restarts a core only after that: at most one timeout
       (100 µs by default) after the fault, added to a recovery that already includes a link retrain. A late response or
@@ -166,7 +171,7 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     (isa.md §8).
   - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
     It faults with `TIMEOUT`, not `LINK`, because a timeout alone does not show that a link failed (review finding I-15).
-  - Recovery is a runtime action: retrain, then restart the step.
+  - Recovery is a runtime action: retrain, then restart every step with a faulted core (c).
 - **Error injection:** the behavioral PHY flips bits at a configurable rate, or on chosen flits. The Phase 4 tests require that every
   injected error is replayed and that the delivered data is unchanged.
 
@@ -389,4 +394,6 @@ with TP > 2:
   (X-5, V-7); with only the reverse path failed, cores whose transfers completed may also fault with `LINK`, and no late
   response of the old step is accepted after the restart (W-2); a `LINK` `ERR` held on the mesh past the last tag's release
   does not fault the restarted step, because the CP waits for every core of the step, `err_done` and `T_DRAIN` (Z-7), and
-  one held past `T_DRAIN` is dropped by its epoch (Y-10).
+  one held past `T_DRAIN` is dropped by its epoch (Y-10), as are a late response and ack (X-13); two steps on one die that
+  both used the failed link are both restarted, each with its own conditions and epoch toggle, while a step that did not
+  keeps running (X-13 (c)); and a second link failure right after a restart (X-13 (a)).

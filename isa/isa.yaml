@@ -39,7 +39,7 @@ enums:
     FP16: 2
     E4M3: 3          # FP8 E4M3 (OCP, max 448, NaN = S.1111.111, no Inf)
     E5M2: 4          # FP8 E5M2 (IEEE-like, Inf and NaN)
-    MXFP8: 5         # E4M3 elements + E8M0 scale per 32 (scale array separate, or inline with SCALE_INLINE)
+    MXFP8: 5         # E4M3 elements + E8M0 scale per 32 (scale array separate; inline with SCALE_INLINE in a later version)
     MXFP4: 6         # E2M1 elements, 2 per byte, + E8M0 scale per 32
     NVFP4: 7         # E2M1 elements + E4M3 scale per 16 + FP32 tensor scale
     INT8: 8
@@ -59,7 +59,7 @@ enums:
     PAGED: 0         # dim 1 (the row) is translated through a page table (DMA pt_reg; memmap.md section 6)
     IDX64: 1         # index lists are int64 (default int32)
     WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
-    SCALE_INLINE: 3  # block scales follow each row's n0 elements instead of a separate array (MXFP8 rows of 256 + 8 B, for a table a runtime repacks; the Engram table as published keeps a separate scale array, review Y-7); non-paged; base and s1 need no block alignment; a gather's row_bytes must be the row's size, 0 included (memmap.md section 6, isa.inline_addr, review Z-4, Y-7)
+    SCALE_INLINE: 3  # RESERVED in v1: a TD with this flag faults ILLEGAL_FIELD (review X-16; no surveyed model uses it). Defined for a later version: block scales follow each row's n0 elements instead of a separate array (MXFP8 rows of 256 + 8 B, for a table a runtime repacks; the Engram table as published keeps a separate scale array, review Y-7); non-paged; base and s1 need no block alignment; a gather's row_bytes must be the row's size, 0 included (memmap.md section 6, isa.inline_addr, review Z-4, Y-7)
     SCALE_REGION: 4  # PAGED: address the scale region of each page (offset sc_off, row stride aux0) instead of its data
   cvt:               # DMA conversion on the way into the destination (source format -> destination format)
     NONE: 0
@@ -183,7 +183,7 @@ enums:
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
     DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request; the DQs allocate in turns of 8 data granules when one waits for the ring, and a turn passes as soon as its holder has no entry it could start but for ring space, credits, pace or the issue turn (review Y-3, X-7, X-10; isa.staging_ring)
     DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2, Y-2, Y-6): [17:0] the most weighted bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; NVFP4 counts its bytes, MXFP4 half, MXFP8 a quarter, and the reads of an entry whose data is one granule (a row gather) count in full (review X-14); the limit is min(this, 4.5 x the DMA_STAGE size); a converting read may always issue when none is in flight; 18-bit counter; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
-    NI_EPOCH: 0x023      # [0] epoch put in every request header (noc_header epoch); the CP toggles it on every core of a step while the step is stopped, before a restart; a LINK ERR whose epoch differs is dropped without a fault (d2d_c2c.md L-4 (e), review Y-10)
+    NI_EPOCH: 0x023      # [0] epoch put in every request header (noc_header epoch); the CP toggles it on every core of a step while the step is stopped, before a restart; a response, ack or LINK ERR whose epoch differs is dropped without a fault (d2d_c2c.md L-4 (f), review Y-10, X-13)
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
@@ -474,7 +474,8 @@ instructions:
       stride TD aux0; a PAGED operand's scales are in the scale region of the same page. Either way the scale of an
       element is found from its row (dim 1) and its whole in-row offset (dims 0, 2, 3 and the paged pointer's byte;
       the non-paged base or the byte, s1, s2 and s3 must be multiples of the block's bytes, else ILLEGAL_FIELD;
-      memmap.md section 6, isa.block_addr and isa.paged_addr). A SCALE_INLINE operand (non-paged) keeps each row's
+      memmap.md section 6, isa.block_addr and isa.paged_addr). SCALE_INLINE is reserved in v1 (ILLEGAL_FIELD, review
+      X-16); in a later version a SCALE_INLINE operand (non-paged) keeps each row's
       scales after its n0 elements, so its base and s1 need no alignment (isa.inline_addr, review Z-4). cvt = NONE
       moves only the bytes the TDs address, never the scales; a SCALE_REGION TD addresses the scale rows.
       Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, and a conversion
@@ -497,7 +498,8 @@ instructions:
       source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a
       logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page.
       Operand spaces, conversions and scale operands as DMA_COPY. Engram rows as published (review Y-7): MXFP8, s1 =
-      row_bytes = 256, scales at scale_reg with aux0 = 8. MXFP8 rows with SCALE_INLINE (a repacked table): row_bytes =
+      row_bytes = 256, scales at scale_reg with aux0 = 8. In a later version (SCALE_INLINE is reserved in v1, review
+      X-16), MXFP8 rows with SCALE_INLINE (a repacked table): row_bytes =
       n0 elements + n0 / 32 scales (264 B; 0 is ILLEGAL_FIELD), s1 any pitch of at least that; each row is staged raw and
       converted whole.
       Keeps up to dma_outstanding_reads granules in flight.

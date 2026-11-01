@@ -185,7 +185,8 @@ Rules:
 - A tile operand is a register (base address) plus a DTAB index. Operands include DMA source/destination, MXU A/W, and VPU d/s0/s1/s2.
 - The descriptor gives:
   - dtype and space (GLOBAL, SPM, ACC, DTAB, IMEM);
-  - flags (PAGED, IDX64, WRAP, SCALE_INLINE, SCALE_REGION);
+  - flags (PAGED, IDX64, WRAP, SCALE_INLINE, SCALE_REGION; SCALE_INLINE is reserved in v1 and faults `ILLEGAL_FIELD`,
+    review finding X-16);
   - up to 4 dimensions (`n0` contiguous, `n1`-`n3` with signed byte strides `s1`-`s3`; stride 0 broadcasts);
   - `aux0`: the scale row stride of a block format (or the `VSOFTMAX` softcap);
   - `row_bytes`: the row size of a gather or scatter;
@@ -280,8 +281,9 @@ Rules:
   entry without raw slots covers at most one data request, which is what keeps the rate at long round trips (Y-1).
 - **Scale location and write packets** (review findings V-4, V-5, W-5): an element's block scale is found from its row and its
   whole in-row offset (dims 0, 2, 3). Every dim-0 run starts on a block: the base (or the paged pointer's `byte`), `s1`, `s2` and
-  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` rows (a repacked table; the Engram table keeps its separate scale array, Y-7) are exempt: each row is its elements
-  followed by their scales, so any base and `s1` work (memmap.md §6, review finding Z-4). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
+  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` is reserved in v1 (`ILLEGAL_FIELD`, review finding X-16); in a later version its rows (a repacked table; the
+  Engram table keeps its separate scale array, Y-7) are exempt: each row is its elements followed by their scales, so any
+  base and `s1` work (memmap.md §6, review finding Z-4). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
   32 B block of 4 B or 8 B scale rows is one aligned write. memmap.md §6 walks two KV appends field by field, and the batched
   (`DMA_SCATTER`) form (review finding W-4).
 
@@ -327,7 +329,7 @@ Rules:
 | Block top-k (MiniMax) | `MXU_MM` index scan, `VTOPK BLOCKMAX` |
 | Step 5 CSA region summaries | `VEW EXP`, `VRED` grouped, `VEW DIV`, `VQUANT E4M3` |
 | Linear attention (KDA, Gated DeltaNet) | `MXU_MM`, `VSCAN`, `VTRINV`, `VEW` |
-| Hyper-connections, n-gram gather | `HC_*`, `VMATVEC` / `MXU_MM BF16X3`, `DMA_GATHER` with `SCALE_INLINE` |
+| Hyper-connections, n-gram gather | `HC_*`, `VMATVEC` / `MXU_MM BF16X3`, `DMA_GATHER` (MXFP8 rows, separate scale array; Y-7) |
 | KV writes (NVFP4 / FP8 / BF16) | `VQUANT` + `DMA_COPY` / `DMA_SCATTER` (paged) |
 | Collectives (TP all-reduce, EP all-to-all, HC-5 small all-reduces) | `DMA_LIST`, `DMA_* wop=ADD`, `DMA_MCAST`, `rsem`, `SIGNAL` |
 
@@ -360,7 +362,7 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
   requests. A response for a tag that is not outstanding is dropped, faulted or not. A tag is freed by its response, by an
   `ERR` other than `LINK`, or by its timeout, and `STATUS` shows the DMA busy until every tag and burst id is free; the CP
   restarts the core only then (d2d_c2c.md L-4, review finding W-2). A core the CP stops without a fault behaves the same.
-  After a link-down event the CP restarts the step only once every core of the step is idle, faulted or stopped, every down
+  After a link-down event the CP restarts each step with a faulted core (L-4 (c)) only once every core of that step is idle, faulted or stopped, every down
   bridge reports `err_done` and the drain time `T_DRAIN` has passed, so no stale `ERR` (`LINK`) reaches the new step
   (d2d_c2c.md L-4 (e), review finding Z-7). Before the restart the CP toggles each core's CSR `NI_EPOCH`, which every
   request header carries and every target echoes in its response, ack or `ERR`, and a core drops a response, ack or `ERR`
@@ -378,7 +380,8 @@ Causes:
 - a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4). A request the
   far side had already accepted gets no `ERR` and faults with `TIMEOUT` instead. A replay-buffer `ERR` can be stale and name a
   tag that is free or reused (review finding W-2): an `ERR` (`LINK`) of the core's current epoch always faults the core (one of the other epoch is dropped, Y-10), frees no tag, and makes
-  `FAULT_ADDR` advisory; the CP restarts every core of the step;
+  `FAULT_ADDR` advisory; the CP restarts every core of the step, and every step with a core faulted `LINK` or `TIMEOUT`,
+  each with its own drain conditions and `NI_EPOCH` toggle (d2d_c2c.md L-4 (c), review finding X-13);
 - a DMA request with no response within the timeout CSR (`TIMEOUT`; review finding I-15, which separates it from `LINK`);
 - an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);
 - a `DMA_MCAST` without `rsem` (`ILLEGAL_FIELD`).

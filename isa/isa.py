@@ -356,13 +356,16 @@ def paged_addr(isa, td, ptr, frames, r_off, i0=0, i2=0, i3=0):
     return start + q * td["s1"] + o_bits // 8, sc_base + o_bits // blk_bits
 
 
-def block_addr(isa, td, base, scale, i0=0, i1=0, i2=0, i3=0, gather=False):
+def block_addr(isa, td, base, scale, i0=0, i1=0, i2=0, i3=0, gather=False, v1=True):
     """Reference for a non-paged operand (memmap.md section 6, review findings V-4, W-5): (byte address, scale byte address
     or None) of element (i0, i1, i2, i3). base = R[src_reg] or R[dst_reg], scale = R[scale_reg], the address of the scale
     of the base element's block in the operand's scale array (row stride TD aux0). Block formats need base, s1, s2 and s3
     to be multiples of the block's bytes (ILLEGAL_FIELD), so the base element starts a block and o has no in-block part.
-    SCALE_INLINE operands keep their scales in the row and have no such rule: see inline_addr (review Z-4)."""
+    SCALE_INLINE is reserved in v1 (ILLEGAL_FIELD, review X-16). With v1=False (the definition kept for a later
+    version), SCALE_INLINE operands keep their scales in the row and have no such rule: see inline_addr (review Z-4)."""
     if td["flags"] >> isa["enums"]["td_flags"]["SCALE_INLINE"] & 1:
+        if v1:
+            raise IsaError("ILLEGAL_FIELD: SCALE_INLINE is reserved in v1 (review X-16)")
         return inline_addr(isa, td, base, i0, i1, gather)             # review Z-4: no block-aligned base or s1
     dt = {v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]
     info = isa["dtype_info"][dt]
@@ -391,7 +394,8 @@ def inline_addr(isa, td, base, i0=0, i1=0, gather=False):
     n0 not whole blocks, s1 shorter than the row, or row_bytes other than the row's size (gather=True: DMA_GATHER /
     DMA_SCATTER, where 0 is ILLEGAL_FIELD too, review Y-7; DMA_COPY ignores row_bytes and allows 0).
     No surveyed table is stored this way: the Engram table keeps its published separate scale array (review Y-7), and
-    SCALE_INLINE serves a table a runtime repacks."""
+    SCALE_INLINE would serve a table a runtime repacks. It is reserved in v1 (review X-16): this is the definition kept
+    for a later version."""
     dt = {v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]
     info = isa["dtype_info"][dt]
     fl = isa["enums"]["td_flags"]
@@ -641,7 +645,8 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
     response), data responses, data bytes, elements converted, and optionally the HBM byte address of the entry's first
     data byte (its data is contiguous). With addr, `reads` is ignored: the reads are the granule pieces of [addr, addr +
     data), grouped into requests inside one 2 KiB block. An entry with raw > 0 is converted from the ring once all its data
-    has landed. A plain read is an entry with scale = raw = 0. Other items (review X-7, X-11):
+    has landed. A plain read is an entry with scale = raw = 0. An entry with raw > 0 and no scale read is a SCALE_INLINE
+    entry, reserved in v1 (review X-16) and kept for a later version. Other items (review X-7, X-11):
       ("write", bytes)    a write transfer from SPM (to remote SPM): 256 B packets, no tag, credit, pace or ring; it
                           completes when its acks return, one round trip after each packet;
       ("wait", s, n)      the DQ's next instruction waits until semaphore s has reached n (isa.md section 3): no later

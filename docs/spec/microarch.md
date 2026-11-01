@@ -324,12 +324,12 @@ isa.md §5) a cheap multiply at the ACC input.
     responses are plain SPM writes. The DMA reads scales a round trip ahead, so the rate is unchanged; the first data of a
     transfer starts one round trip later (the second verifier's estimate: about 0.33 µs per dependent converting transfer,
     at most about 2% of a batch-1 DeepSeek or MiniMax decode step).
-  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: an
-    inline-scaled row (`SCALE_INLINE`, such as a 264 B MXFP8 row of a repacked table: 256 B of elements, then their 8 B of scales; memmap.md
-    §6), or a fold tile that is not inside one 256 B granule (a fold
-    weight row that is not a whole number of 256-element tiles, or a K slice that does not start on one). Its responses are
-    written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add to the DMA's SPM write
-    and read traffic.
+  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: a
+    fold tile that is not inside one 256 B granule (a fold weight row that is not a whole number of 256-element tiles, or a
+    K slice that does not start on one), or, in a later version, an inline-scaled row (`SCALE_INLINE`, reserved in v1,
+    review finding X-16; a 264 B MXFP8 row of a repacked table: 256 B of elements, then their 8 B of scales; memmap.md §6).
+    Its responses are written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add
+    to the DMA's SPM write and read traffic.
   - **Staging ring:** an SPM region given by CSR `DMA_STAGE` (base and size), reserved by the runtime and shared by the four DQs.
     Size 0 makes block-format conversion fault (`ILLEGAL_FIELD`).
   - **Ring allocation *(review findings W-1, Z-1)*.** The ring is allocated in **entries**. An entry is a run of whole
@@ -353,10 +353,12 @@ isa.md §5) a cheap multiply at the ACC input.
         contiguous non-split stream ends its entries on 2 KiB blocks, so cuts come from entries with raw slots (fold tiles
         from byte 64, contiguous inline rows) and from rows that share a granule.
     - **An entry's scales and the raw slots of all its split units are one allocation, taken when its first scale read is
-      issued** (when its first data read is issued if it has no scale read, as for inline-scaled rows). Its data reads then
+      issued**. In v1 every entry that uses the ring has a scale read (`SCALE_INLINE` is reserved, X-16; a later version's
+      inline entries are allocated at their first data read). Its data reads then
       need only tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the
       oldest one frees its space, and the ring always drains.
-    - **Inline entries *(review finding Z-3)*.** An entry of `SCALE_INLINE` rows (memmap.md §6) has no scale read. It holds
+    - **Inline entries *(review findings Z-3, X-16; a later version: not in the v1 `core/dma`)*.** An entry of `SCALE_INLINE`
+      rows (memmap.md §6) has no scale read. It holds
       whole rows, each with all its reads: a 264 B inline row that crosses a 2 KiB block is two reads, both in the row's
       entry. Its raw slot holds the rows, 272 B per row in 16 B units.
     - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
@@ -374,7 +376,7 @@ isa.md §5) a cheap multiply at the ACC input.
         data request, about one per 27 cycles at the share.
       - **An entry with raw slots is at most a quarter of the ring.** Split units and inline rows hold their data in the
         ring, so those streams are ring-bound anyway (below); the quarter keeps one entry from taking the ring.
-      - No single unit's entry is larger than 272 B (a 264 B inline row; a split MXFP8 fold tile is 256 + 8 B, a split 4-bit
+      - No single unit's entry is larger than 272 B (a split MXFP8 fold tile is 256 + 8 B, as is a later version's 264 B inline row; a split 4-bit
         tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, and a non-split unit lies inside one granule, so
         inside one request. The DMA can therefore always meet both rules. A ring below the 16 KiB default lowers the rate
         (below), never liveness.
@@ -486,7 +488,7 @@ isa.md §5) a cheap multiply at the ACC input.
       of them, that takes about 1 µs, issued at the start of the step and hidden (hyper_connections.md G-1). A remote
       row's longer round trip lowers the rate in proportion, still hidden. Rows staged through the sibling arrive with
       their scale rows unconverted and convert SPM to SPM, with a short round trip.
-    - Inline-scaled rows (a repacked table) stay split, because a 264 B row always spans two granules. The ring carries
+    - Inline-scaled rows (a repacked table; reserved in v1, X-16) stay split, because a 264 B row always spans two granules. The ring carries
       about 62 of them per round trip, 0.12 rows/cycle per core at 500 cycles.
   - Ready therefore depends only on the converter and the local SPM ports, which drain at a fixed rate without waiting for the
     network. A response is still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.

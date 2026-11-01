@@ -64,7 +64,8 @@ Add one fused microcoded instruction `HC_SINKHORN` *(P1)* so the sequence does n
 `HC_POST` (1->4 expand + comb mix), and for the gated variant `HC_GATED_MIX` (grouped RMSNorm, SiLU, sigmoid on the low-rank path). All are elementwise or small-GEMM
 compositions of existing MXU/VPU/SFU capability; no new datapath is required, only fused instructions and scratchpad layouts for `[tokens, 4, d]`.
 *Phase 2:* defined in `isa/isa.yaml` as `HC_MIX`, `HC_SINKHORN`, `HC_PRE` (with `mean=1` for the gated variant) and `HC_POST` (`MHC` or `GATED`);
-the stream layout is in `docs/spec/memmap.md` §7, and `DMA_GATHER_ROWS` is `DMA_GATHER` with `SCALE_INLINE`.
+the stream layout is in `docs/spec/memmap.md` §7, and `DMA_GATHER_ROWS` is `DMA_GATHER` with MXFP8 conversion from the table's
+separate scale array (review findings Y-7, X-16; `SCALE_INLINE` is reserved in v1).
 
 **HC-5: tensor parallelism.** With the stream sharded along `d`, each mixer needs one all-reduce of `[tokens, 25]` fp32 (24 outputs plus the RMS statistic):
 80 extra latency-critical collectives per step for DeepSeek. This is small in bytes and large in count. The distributed schedule (reduce-scatter by write-add,
@@ -94,7 +95,7 @@ the same path as the planned MXFP4 decompression), destination scratchpad addres
 *As built (review findings Z-4, Y-7; layout chosen by the user, 2026-11-01):* `DMA_GATHER` with `cvt` from MXFP8, `s1` = `row_bytes` = 256 and the published
 separate scale array (`scale_reg`, `aux0` = 8 B per row; memmap.md §6). The runtime stores the table as published, so it needs no load-time repack of the 197 G
 elements. Each row is one aligned 256 B granule plus an 8 B scale read in its own ring entry: not split, so not staged raw, at about 0.33 rows/cycle per core
-at a 500-cycle round trip (0.30 at 845; its one-granule entries are paced in full, microarch.md §2.5, review finding X-14) (`test_isa.py` `test_engram_separate_array_gather`). Inline 264 B rows (`SCALE_INLINE`) remain legal for a table a runtime repacks, at
+at a 500-cycle round trip (0.30 at 845; its one-granule entries are paced in full, microarch.md §2.5, review finding X-14) (`test_isa.py` `test_engram_separate_array_gather`). Inline 264 B rows (`SCALE_INLINE`) are reserved in v1 (review finding X-16); a later version could take them for a table a runtime repacks, at
 about 0.12 rows/cycle, with the same 288 B of HBM reads per row. Qwen's BF16 rows are plain (no conversion, no scales).
 - Rejected (Y-7): inline rows built by a runtime repack. No spec or plan item owned the pass over about 203 GB, the gather is slower (raw staging), and it saves
   no bytes. Before Y-7 the specs described inline rows while the checkpoint has a separate array: a gather with s1 = 256 then faults `ILLEGAL_FIELD`, and one with

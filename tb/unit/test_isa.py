@@ -918,17 +918,21 @@ def test_block_addr_requires_block_aligned_base(isa):
 
 
 def test_engram_inline_gather(isa):
-    """Z-4: a DMA_GATHER of inline-scaled MXFP8 rows (SCALE_INLINE: 256 B of elements, then 8 B of scales, 264 B per row;
+    """X-16: SCALE_INLINE is reserved in v1, so a TD with it faults ILLEGAL_FIELD; the definition below is kept for a
+    later version (block_addr with v1=False).
+    Z-4: a DMA_GATHER of inline-scaled MXFP8 rows (SCALE_INLINE: 256 B of elements, then 8 B of scales, 264 B per row;
     a table a runtime repacks, since the Engram table as published keeps a separate scale array, review Y-7). The base and the row pitch s1 = 264 need no block alignment, because every row starts its own first block; the
     scale of element i0 is at the row start + 256 + floor(i0 / 32). Before Z-4, isa.block_addr faulted ILLEGAL_FIELD at row 0.
     A row that crosses a 2 KiB block is two reads, both in the row's inline entry (no scale read; 264 B raw slot)."""
     td = _td(isa, dtype="MXFP8", space="GLOBAL", flags=("SCALE_INLINE",), n0=256, n1=1, s1=264, row_bytes=264)
     assert I.inline_row_bytes(isa, td) == 264
     table = 0x40_0000_0008                      # any byte address
+    with pytest.raises(I.IsaError, match="reserved in v1"):
+        I.block_addr(isa, td, table, 0, 0, 1)
     for idx in (0, 1, 7, 12345, (1 << 20) + 3):
         row = table + idx * 264
         for i0 in (0, 31, 32, 255):
-            assert I.block_addr(isa, td, table, 0, i0, idx) == (row + i0, row + 256 + i0 // 32)
+            assert I.block_addr(isa, td, table, 0, i0, idx, v1=False) == (row + i0, row + 256 + i0 // 32)
             assert I.inline_addr(isa, td, table, i0, idx) == (row + i0, row + 256 + i0 // 32)
     sep = _td(isa, dtype="MXFP8", space="GLOBAL", n0=256, n1=1, s1=264, aux0=8)   # separate scale array: W-5 still applies
     with pytest.raises(I.IsaError):
@@ -938,7 +942,7 @@ def test_engram_inline_gather(isa):
             I.inline_addr(isa, dict(td, **bad), table, 0, 0)
     assert I.inline_addr(isa, dict(td, row_bytes=0), table, 0, 1)[0] == table + 264         # DMA_COPY: row_bytes unused
     with pytest.raises(I.IsaError):                                          # Y-7: a gather's row_bytes is the row's size
-        I.block_addr(isa, dict(td, row_bytes=0), table, 0, 0, 1, gather=True)
+        I.block_addr(isa, dict(td, row_bytes=0), table, 0, 0, 1, gather=True, v1=False)
     with pytest.raises(I.IsaError):                                          # PAGED keeps scales in the page's region
         I.inline_addr(isa, dict(td, flags=td["flags"] | 1 << isa["enums"]["td_flags"]["PAGED"]), table, 0, 0)
     # Ring entries of the gather: one row each, staged raw (inline scales are part of the row's bytes).
