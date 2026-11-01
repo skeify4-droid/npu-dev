@@ -282,11 +282,11 @@ group; the group column of the table maps to them.
 
 | Group | Commit | Findings |
 |---|---|---|
-| 1 | (group 1) | I-1, I-2, I-3, X-3, I-12(b) |
-| 2 | (group 2) | I-4, I-5, I-11, I-12(a) |
-| 3 | (group 3) | I-9, I-10, X-1, X-2 |
-| 4 | (group 4) | I-6, I-7, I-8, I-14, X-4, X-5, X-6 |
-| 5 | (group 5) | I-13, I-15 |
+| 1 | 72fd92c | I-1, I-2, I-3, X-3, I-12(b) |
+| 2 | 2a62587 | I-4, I-5, I-11, I-12(a) |
+| 3 | 4a21399 | I-9, I-10, X-1, X-2 |
+| 4 | fad67ca | I-6, I-7, I-8, I-14, X-4, X-5, X-6 |
+| 5 | 18752f0 | I-13, I-15 |
 
 | # | Status | Group | What was done |
 |---|---|---|---|
@@ -312,3 +312,25 @@ group; the group column of the table maps to them.
 | X-6 | fixed (detector: Phase 7) | 4 | Took the schedule rule (local puts before any remote wait) and added two the suggestion implied: remote waits in a queue nothing else depends on, grouped into one `DMA_LIST` with per-entry waits (group 2), and no credit wait ahead of the same core's forwards. The "every engine blocked on a semaphore" detector is listed in PLAN Phase 7 and for the golden model. |
 | I-13 | fixed; optional hash change rejected | 5 | (a) Text corrected with the measured spread, and a compiler rule: pad power-of-two SPM pitches by 512 B (1 KiB at 16 KiB), conflict-free for two-row loads at every pitch 2-128 KiB; `isa.spm_bank` and a test check these claims. Rejected the optional `addr[20:16]` fold: it still collides at 2 and 4 KiB; a full bit-spreading hash fixes powers of two but regresses 6 and 7 KiB pitches. (b) NI target (128) and MXU scales (64) added; the read budget is 2,240 B/cycle, 9% over the port, stated as such. |
 | I-15 | fixed | 5 | (a) PLAN Phase 3: `core/mxu` weight-stationary, `core/seq` without scoreboard, `core/dma` full conversion set, new `core/acc` and `core/ni` rows. (b) isa.md §7 combine uses `ADD_BF16` for BF16 rows. (c) Top-k k ≤ 2048, `ILLEGAL_FIELD` above. (d) Block → BF16 keeps subnormals, matching N-5 and the golden model (`bf16(ftz=False)`). (e) `memmap.diectl` table (block, leaf) with 4 D2D and 4 C2C bridges, the CP `MAILBOX`, `START` / `STOP` in CORECTL; validator checks overlaps. (f) `SEM_ADD` adds an unsigned 32-bit integer, float wops fault. (g) Resolved with I-6(b). (h) New `fault_cause` `TIMEOUT`; `LINK` only from a bridge's `ERR`. |
+
+**Proposals not taken as written** (the note in each row says why):
+- I-1: forbid the pair instead of a hardware bounce buffer. I-2: pages counted in rows, not a byte offset shifted by `page_shift`.
+  I-3: no conversion in the MXU load path (arch.md §1 puts it in the DMA). I-4: no kernel-boundary barrier; bases carried forward.
+  I-5: no per-destination multicast acks. I-6(b): no `rsem` on HBM; `SIGNAL` instead. I-11: TDs read at start, not captured.
+  I-13: the optional hash change rejected after measurement.
+
+**Still open:**
+- X-2 (a), (c), (d), (e) and the `ACT_CK` and `tRREFDA` values: hbm.md H-9 JESD238 checklist.
+- Phase 4: the link tests of X-4, X-5 and I-7 and the SV checker's rule-removal test (PLAN Phase 4). Phase 7 and the golden model:
+  the X-6 deadlock detector (PLAN Phase 7).
+- No arch.md frozen number changed. I-8 option A would have changed DeepSeek's "weights only" count; the user chose B.
+
+**For the verification session, check first:**
+1. I-2 end to end: one NVFP4 paged KV gather and one KV append (data rows, scale rows by `SCALE_REGION`, tail-block rewrite) through
+   the TD, `paged_ptr` and `T_DMA` fields, against memmap.md §6.
+2. X-3 with I-3: `ni_rsp` backpressure and the ack rules (noc.md §2) together keep noc.md §4 rule 2; `noc.ack_coalescer` matches
+   the text.
+3. I-4: the kernel-base rule in isa.md §3 covers a producer that starts the next kernel before the consumer finishes this one.
+4. The rule-removal test in `test_hbm.py` and the `Channel` slot-order rule (commands must be presented in slot order).
+5. I-5 + I-6: every multicast and HBM-buffered transfer still has a completion that the consumer can wait on.
+

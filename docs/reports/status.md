@@ -330,3 +330,47 @@
 - In parallel: Phase 3 `common` and `arith`; nothing in the review blocks them.
 - Later: Phase 4 `link` / `noc` items (I-7, X-4, X-5) and compiler / runtime items (I-6, I-8, I-14, X-6).
 - Open: vendor HBM3e timing (tCCD_L, X-2 checklist), PHY latencies, the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fix session for the independent review (2026-11-01)
+
+### Changes
+One commit per group, `make pytest` green before each. The Resolutions section of `docs/reports/spec_review.md` has one row per
+finding (status, group, what was done); the reviewer's tables are unchanged.
+- **Group 1 (72fd92c), high severity:** a DMA has at most one `GLOBAL` operand (I-1); row-granular pages with an in-page scale region,
+  split TD fields, `T_DMA` `pt_reg` / `ts_reg`, `paged_ptr` (I-2); DMA SPM write 512 B/cycle, converter 256 elements/cycle,
+  `ni_rsp` valid/ready (I-3); `blen` in every write plus an idle flush as the ack trigger (X-3); `noc_header` layout (I-12(b)).
+- **Group 2 (2a62587), ISA and sequencer:** serial-number semaphore compare and never-reset network semaphores (I-4); multicast
+  completes on injection, `rsem` required (I-5); `q_push` widths, MXU `dtab_rd`, DTAB ordering rule (I-11); `dma_list_entry` with an
+  optional per-entry wait (I-12(a)).
+- **Group 3 (4a21399), HBM:** PREA, REFpb → ACT of any bank, REFpb → REFpb same bank, REFab → REFab, unknown commands rejected
+  (I-9, X-1); bank XOR in the reduced-config fold (I-10); `hbm.Channel` and a phase-order row-bus arbiter (X-2(b)). The scheduler
+  became `PcSched` (bit-identical results with the new gap set to zero). PLAN Phase 2 gating findings closed.
+- **Group 4 (fad67ca), links and compiler rules:** buffer, `rsem` and semaphore-parity rules for the staged all-to-all (I-6);
+  per-VN link queues (I-7); Engram rows staged through the sibling die (I-8, the user's decision); tail-block rewrite of scale rows
+  (I-14); cumulative per-VN credits (X-4); a link-down bridge keeps sinking (X-5); issue-order rules (X-6).
+- **Group 5 (18752f0), low severity:** SPM bank text, pitch padding rule and read budget (I-13); the eight I-15 text items, including
+  a DIECTL block/leaf table, CORECTL `START` / `STOP` and a `TIMEOUT` fault cause.
+
+### Results
+- No arch.md frozen number changed. The two that could have moved: I-3 keeps D1 (NVFP4 → BF16 now 1.65x at 0.85 share at every
+  stage, was 0.83x at the old write port); I-8 option A would have raised DeepSeek's "weights only" count from 2 to 4, option B
+  (chosen) changes nothing.
+- Regenerated: `make numerics` (D1 feed table), `make hbm` (new gap: single-PC numbers move by at most 0.02, random 64 B 0.42 → 0.40;
+  new H6 reduced configs: MID 0.68 / 0.72 → 0.99, TINY 0.55 → 0.98; new H7 channel pair: at most 0.001 lost), `make links` (new L7,
+  table-gather options), `make isa`.
+- Proposals changed or rejected, with reasons in the Resolutions rows: I-1, I-2, I-3, I-4, I-5, I-6(b), I-11, I-13 (optional hash).
+
+### Tests
+- `make pytest`: 190 passed (137 before). `test_isa.py` 8 → 18 (layouts fit and never share bits within a type, header and list
+  widths, serial compare, DIECTL, SPM banks); `test_noc.py` 8 → 17 (I-1 and I-7 rejected variants, ack coalescing completes and the
+  old rule hangs); `test_hbm.py` 40 → 72 (a violating and an exact-gap sequence per rule, channel bus, rule-removal test, reduced
+  configs within 0.02 of FULL, channel scheduler); `test_links.py` 7 → 9.
+- `make isa` (Verilator lint of `isa_pkg`) clean. No RTL changed, so `make lint unit` is unaffected.
+
+### Next
+- Verification session (prompt in the user's request; first checks listed at the end of spec_review.md Resolutions).
+- Then Phase 3 RTL on `core/dma`, `core/seq`, `hbm`; `common` and `arith` were never blocked.
+- Open: the hbm.md H-9 JESD238 checklist (X-2 (a), (c)-(e), `ACT_CK`, `tRREFDA`); Phase 4 link tests (X-4, X-5, I-7) and the SV
+  checker's rule-removal test; the Phase 7 / golden-model deadlock detector (X-6); vendor PHY latencies; the DeepSeek `hc_fn` check
+  for numerics D2.
+

@@ -135,7 +135,7 @@ Rules:
   | `idx_reg` | SPM offset of the index list (gather, scatter) |
   | `n_reg` | override of the outermost count (0: from the TD) |
   | `scale_reg` | address of the scale array of a non-paged block-format operand (row stride TD `aux0`) |
-  | `aux_reg` | SPM offset where FP8- and NVFP4-target conversions write the FP32 column scales (R0: none) |
+  | `aux_reg` | SPM offset where the FP8-target conversions and `NVFP4_BF16` write the FP32 column scales (R0: none) |
   | `pt_reg` | SPM offset of the page table of the PAGED operand (at most one operand is PAGED) |
   | `ts_reg` | NVFP4 FP32 tensor scale in bits [31:0] (R0: 1.0) |
 
