@@ -336,3 +336,81 @@ changed DeepSeek's "weights only" count; the user chose B.
 4. The rule-removal test in `test_hbm.py` and the `Channel` slot-order rule (commands must be presented in slot order).
 5. I-5 + I-6: every multicast and HBM-buffered transfer still has a completion that the consumer can wait on.
 
+# Verification (2026-11-01)
+
+**Who:** a verification session (Opus 5.5), not the author, reviewer or fix session. No spec, model or test was changed; this
+section is the only edit.
+
+**Method:**
+- Read the five fix commits (72fd92c, 2a62587, 4a21399, fad67ca, 18752f0) and the two record commits (23522a1, f607326). For each
+  finding: does the new text close the reviewer's failure scenario, and does it open a new one? The five "check first" items above
+  were walked end to end.
+- Executable checks:
+  - `make pytest`: 190 passed (rc 0, 18 s, 65 MB peak), as the status note says.
+  - `hbm.report()`, `links.report()` and `numerics_exp.main()` regenerated into a scratch directory: identical to the committed
+    reports. `isa/isa.py` rerun: generated files unchanged.
+- Probes (scratch, not committed):
+  - register operands per format, counted from `isa.yaml`;
+  - `isa.spm_bank` two-row loads at the padded pitches, over every 256 B-aligned tile base below 128 KiB.
+
+Verdicts: **resolved** (scenario closed, nothing new); **resolved, gap** (scenario closed, but a residual or new case is listed
+below as V-n); **not resolved**.
+
+| # | Verdict | Notes |
+|---|---|---|
+| I-1 | resolved | `TD_SPACE` on two `GLOBAL` operands removes the RSP → REQ edge; `dma_forwards=True` is a cycle in `test_noc.py`. `DMA_LIST` entries are not said to obey the rule (V-6). |
+| I-2 | resolved, gap | (a)-(f) each closed: separate TD fields, `pt_reg`, an in-page scale region, `ts_reg`, and row-granular pages (576 B rows: 64 rows = 9 frames). The examples match the descriptors: MiniMax 4 x 128 NVFP4 KV, DeepSeek 512-wide NVFP4 KV and a 128-wide MXFP4 index key. Two gaps on item 1: the scale address ignores dims 2 and 3 (V-4), and the scale-row append is not expressible as specified (V-5). |
+| I-3 | rate resolved; sink **not resolved** | Rate: the regenerated D1 table gives 1.65x at every stage for NVFP4 → BF16 (need 155 elements/cycle, capacity 256). Sink: the new `ni_rsp` ready waits on the converter, and the converter waits on scale responses that arrive on the same channel (V-1). |
+| X-3 | resolved | `blen` plus the idle flush completes every burst. The flush is needed: after an eviction, the burst's second entry can never reach `blen`. `noc.ack_coalescer` matches noc.md §2 rules 1-4 ("oldest" = first allocated, idle = since the last arrival). The burst-to-target scope is not stated (V-10 b). |
+| I-12(b) | resolved | Fields fit and never share bits within a type (validator and test). The 4-bit `cause` holds `TIMEOUT` = 14. ERR detail: V-10 (a). |
+| I-4 | resolved, gap | The serial compare and the never-reset rule close the wrap and the reset race. The kernel-base rule conflicts with I-5's CP barrier, and without that barrier it does not protect multi-producer semaphores (V-2). The window is stated one way only (V-11). |
+| I-5 | resolved | Completion = injected; `rsem` required; destinations wait on counts. So every multicast has a count to wait on (item 5). Its "the CP waits for every core to halt" is the barrier V-2 is about. |
+| I-11 | resolved | `isa.yaml` has 8 register operands for T_DMA, 6 for T_MXU and T_VPU, and 2 for T_DMAMC, T_DMAL and T_SIG, which matches `q_push`. A DQ entry is 672 bits; queue storage is 7.4 KiB at 16 entries. The rule that TDs are read at instruction start is sound. The port tables do not show the arbitration (V-9). |
+| I-12(a) | resolved, gap | The layout fits, and the per-entry wait is present. The spec does not say whether a waiting entry holds the shared DMA engine (V-3). |
+| I-9 | resolved | PREA, `tRREFDA` and same-bank RFCPB across a round each have a violating and an exact-gap case. |
+| I-10 | resolved | The XOR keeps the map one-to-one (test over 32 x 4 x 16). H6 regenerated identical: MID 0.99, TINY 0.98. `row_bits` 17 / 18 matches H-5. |
+| X-1 | resolved | `test_rule_cases_cover_rules` shows every rule is either a case or listed as redundant with its condition asserted. The rule-removal test catches every non-redundant rule (item 4). Unknown commands are rejected. |
+| X-2 | (b) resolved; (a), (c)-(e) deferred | Channel rule and H-3 step 7 arbiter. `simulate_channel` presents PC 0, then PC 1, each cycle, and a PC's row and column commands share a slot. So the checker's slot-order precondition holds (item 4). The rest is on the H-9 checklist. |
+| I-6 | resolved | (a) Full-size destinations, and staging slots freed by forward acks, so nothing waits on consumption. (b) HBM buffers end with a `SIGNAL` after the acks. HBM acks when the write is queued, and later reads see queued writes (H-2), so the release holds (item 5). (c) One semaphore per buffer parity. List entries: V-6. |
+| I-7 | resolved | Per-VN RX queues and per-VN TX arbitration are required. `link_vn=False` is a cycle in `test_noc.py`. |
+| I-8 | resolved | The user's decision; L7 regenerated identical. Both steps have one local operand: a C2C gather by the sibling (on the owner's rail) into its SPM, then a D2D put with `rsem`. |
+| I-14 | resolved, gap | The intent closes the 41%, but the transfer it needs cannot be written as specified (V-5). |
+| X-4 | resolved (by argument) | The sender does the accounting and refills the reserve first, so in-flight flits stay ≤ pool + 8 and RSP always progresses on its reserve. 2^12 > 2 x 520. A lost idle flit or a stale replayed one is absorbed by the cumulative value. The tests are in Phase 4. |
+| X-5 | resolved, gap | The sinking bridge drains the mesh. But not every affected core faults with `LINK` as the text and the Phase 4 test say, and the drain needs faulted cores to keep sinking (V-7). |
+| X-6 | resolved, gap | Rules 1-3 break the reviewer's cycle, provided the four DQs progress independently. The spec does not say they do (V-3). |
+| I-13 | resolved, gap | (a) The measured spread is confirmed. The padding is conflict-free at base 0 for every pitch, but not at 8 KiB + 512 B for tile bases that are not 2 KiB aligned (V-8). (b) The 2,240 B/cycle budget is stated. |
+| I-15 | resolved | (a)-(h) are done as listed; the DIECTL validator and test pass. The subnormal claim holds: MXFP4 products are at least 2^-128 with 2 significant bits, so they are exact in BF16, and NVFP4 products never reach the subnormal range. (h) leads to the wording conflict in V-7. |
+
+## Verification findings
+
+| # | Sev | From | Finding | Failure scenario | Suggested resolution |
+|---|---|---|---|---|---|
+| V-1 | H | I-3 | **The `ni_rsp` sink depends on the network.** Ready "depends only on the converter and the SPM write port". But the converter cannot convert a block-format granule until its scales arrive. The scales are separate read responses (the `scale_reg` array, or the page's scale region) on the same RSP channel, returning in any order. The same holds for a fold tile split over two granules (rows whose byte length is not a multiple of 128 B). Nothing orders scales before data. | A paged NVFP4 KV gather: the 4-flit buffer fills with data granules whose scale responses are queued behind them in the RSP VC. Ready stays low, so the scales never eject. The RSP VC then blocks every packet routed through it. noc.md §4 rule 2 fails, and `noc.py` cannot see this (no protocol edge for it). | Scales must be local before any data that needs them can arrive. Either the DMA reads a tile's scales into a scale buffer reserved at issue and issues the data reads only after they land, or data sinks raw into its reserved SPM space and is converted from SPM. Apply the same rule to fold tiles that straddle granules. State it in microarch.md §2.5 and noc.md §4 rule 2. |
+| V-2 | M | I-4, I-5 | **Kernel boundaries are specified two ways.** I-4 (isa.md §3) says adds of the next kernel "from a faster producer may already have arrived", which means no barrier. I-5 says the CP waits for every core to halt before it loads the next kernel, which is a barrier. Without the barrier, the carried base gives the right target but does not separate kernels. | Reduce-scatter: 32 contributors write-add into an owner's buffer with `rsem` on one semaphore. Contributor A halts kernel k, starts k + 1 and adds to the same semaphore while B's kernel-k write is still in flight. The owner reaches its kernel-k target early and multicasts an incomplete sum. A single producer is safe, because its `HALT` waits for its acks. | Choose one. (a) State the barrier: a kernel starts on a core only after every core that shares a network-facing semaphore with it has halted. Then drop the "faster producer" text. (b) Or forbid next-kernel adds to a semaphore until its consumer has passed its last kernel-k wait (a credit), or alternate semaphore sets by kernel parity. The golden model checks the chosen rule. |
+| V-3 | M | I-12(a), X-6 | **A waiting list entry and the shared DMA engine.** "Four queues share one engine" (microarch.md §2.5) does not say whether a started `DMA_LIST` whose entry waits on a semaphore holds the engine. X-6 rule 2 relies on the other DQs still progressing. | DQ1 holds a list of chunk forwards waiting on remote counts. DQ0 holds this core's local puts, which the peer forwarder waits for. If the engine serves one instruction at a time, DQ0 never starts and the X-6 cycle returns. | State that the engine serves the four DQs independently: an instruction or list entry waiting on a semaphore holds nothing another DQ needs (tag table, address generator, SPM ports). Add this to the `core/dma` interface table. |
+| V-4 | M | I-2 | **The paged scale address ignores dims 2 and 3.** memmap.md §6 takes `e` from `byte` plus `i0` only, although dims 2 and 3 may also address inside a row. | An NVFP4 KV row of 4 groups read with n0 = 128, n2 = 4, s2 = 64 B: groups 1-3 are converted with group 0's scales. The data is wrong and nothing faults. | Use the whole in-row offset: `e = (byte + i0 * esize + i2 * s2 + i3 * s3) / esize`. Or forbid n2, n3 > 1 on block formats. |
+| V-5 | M | I-2, I-14 | **The tail-block rewrite cannot be expressed as specified.** A `SCALE_REGION` TD addresses rows of `aux0` bytes (4 or 8 B), and dims 0, 2 and 3 must stay within one row. So an aligned 32 B block is 4-8 rows, and nothing says the DMA packs consecutive paged rows into one write. | A DeepSeek index-key append writes 8 scale rows of 4 B. That is either 8 writes of 4 B (`HBM_ALIGN`) or one 32 B row (`RANGE`). Item 1's KV append fails at this step. | Specify that a PAGED transfer writes rows that are contiguous in one page as one write per 32 B-aligned span (the DMA already knows the page). Or let a `SCALE_REGION` TD address a whole aligned block of rows. Add the append to the `core/dma` tests. |
+| V-6 | L | I-1, I-5, I-6 | `dma_list_entry` and the `DMA_LIST` text do not say that entries obey the one-`GLOBAL` rule, the required `rsem` on `MCAST`, or the SRAM-only `rsem`. | A list `COPY` entry with two `GLOBAL` addresses brings back I-1 if the RTL checks only `DMA_COPY`. | One sentence in isa.md §5 and the yaml description: entries are checked like the instruction they encode (`TD_SPACE`, `ILLEGAL_FIELD`). |
+| V-7 | L | X-5, I-15(h) | **Link-down fault cause and draining.** Some initiators never get an `ERR`: those with requests in the discarded replay buffer, and those whose responses the bridge drops. They fault with `TIMEOUT` after 100 µs. Yet L-4 and the PLAN Phase 4 test say every core with a transfer through the link faults with `LINK`. The drain also assumes that a faulted core's DMA keeps sinking its outstanding responses and its NI keeps serving target requests. isa.md §8 ("a fault stops the core") does not say this. | The Phase 4 `PKG_TINY` test fails on a core whose request was already in flight. Or a faulted core stops accepting `ni_rsp` and blocks RSP on its die. | Answer request heads in the discarded replay buffer with `ERR` (`LINK`), or let the test accept `LINK` or `TIMEOUT`. State that a fault stops the front end and the engines but not the NI: responses are sunk and dropped, and targets keep serving. |
+| V-8 | L | I-13 | The padding claim holds at base 0, which is all the test checks. At an 8 KiB + 512 B pitch, half of the 256 B-aligned tile bases collide (none of the 2 KiB-aligned ones do). Every other padded pitch from 2 to 128 KiB is conflict-free at every 256 B-aligned base. | A W tile at SPM offset 0x200 with an 8.5 KiB pitch loses half of its stationary-load rate. | Require 2 KiB-aligned tile bases for padded pitches (or pad 8 KiB by 1 KiB), and make the test cover several bases. |
+| V-9 | L | I-11 | `core/dtab` has one read port, round-robin over DMA, MXU and VPU. Only the MXU `dtab_rd` row says "arbitrated"; the DMA and VPU rows still say "1-cycle". | RTL built from the DMA or VPU table assumes a fixed-latency read. | Make all three `dtab_rd` rows request/grant. |
+| V-10 | L | I-12(b), X-3 | (a) `ERR` carries `tag`, but nothing says whether it is a read tag or a write burst id; these are two separate 9-bit spaces. (b) A write burst is "≤ 2 KiB" but is not required to stay on one target. | (a) The DMA cannot tell which table the tag indexes, so it cannot set `FAULT_ADDR` from the right one. (b) A burst split over two targets (a 264 B scatter row across a 2 KiB boundary) reaches `blen` at neither and completes only by the idle flush: correct, but 64 cycles late. | (a) A read/write bit in `ERR` (the `rsv` bits are free) or one shared tag space. (b) State that a burst stays inside one 2 KiB-aligned block (the DMA splits there), as reads do. |
+| V-11 | L | I-4 | isa.md §3 states the serial window one way only (the target less than 2^31 ahead). The compare also fails when the value is more than 2^31 past a target. | A wait on a stale target of a byte counter blocks. Buffer sizes bound this in practice. | Write `|value - target| < 2^31`, as `isa.sem_ready` already says. |
+
+## Before Phase 3, after verification
+
+| Block | Still open |
+|---|---|
+| `core/dma` | V-1, V-3, V-4, V-5; text only: V-6, V-9, V-10 (a) |
+| `core/seq` | V-2 (a decision on the kernel launch rule) |
+| `hbm` | none. I-9, I-10, I-12(b), X-1, X-2(b) and X-3 are verified; X-2 (a), (c)-(e) stay on the H-9 checklist |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | V-7 |
+| compiler / runtime | V-2, V-8 |
+
+**Not checked:**
+- the JESD238 items (still unavailable);
+- the generated SV and C++ beyond the lint in `make isa`;
+- the L7 inputs (lookups per token, table dimensions) beyond regenerating the table;
+- X-4 against an executable model (checked by argument; the tests are in Phase 4).
+
