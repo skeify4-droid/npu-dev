@@ -158,7 +158,8 @@ Rules:
 - **Different queues:** only semaphores order them. The hardware does not check SPM address overlaps between queues; the golden model
   does (a race checker in simulation).
   - The four DQs progress independently: a DQ whose head instruction or list entry waits on a semaphore holds nothing the others
-    need (microarch.md §2.5, review finding V-3).
+    need (microarch.md §2.5, review finding V-3). That includes the ring-allocation turn, which passes as soon as its holder
+    has no entry to start (review finding X-7).
 - **Front-end interaction:**
   - `SWAIT` stalls the front end (needed before `LD` reads data produced by an engine, e.g. MoE token counts).
   - `FENCE` waits for selected queues to drain.
@@ -261,10 +262,15 @@ Rules:
 - **Width of the inbound path** (review findings I-3, V-1): the converter produces 256 elements per cycle and the DMA writes SPM at
   512 B/cycle, shared with the block scales it stages before the data, so the exact NVFP4 → BF16 path carries 1.60x a core's HBM
   share (numerics.md D1). Converting reads are paced: at most min(CSR `DMA_PACE`, 4.5 x the `DMA_STAGE` size) of them are
-  in flight (reset 72 KiB), counted in bytes weighted by format (NVFP4 x1, MXFP4 x1/2, MXFP8 x1/4), so a converting stream's
+  in flight (reset 72 KiB), counted in bytes weighted by format (NVFP4 x1, MXFP4 x1/2, MXFP8 x1/4; the reads of an entry
+  whose data is one granule, a row gather, in full: X-14), so a converting stream's
   scale reads do not queue behind its own data. A converting read may always issue when none is in flight (microarch.md
   §2.5, review findings Z-2, Y-2, Y-6). A read request takes one tag and one granule credit per granule (512 of each). The four
-  DQs take credits in turns of 8, the winner holding its turn until they are free, and ring space in turns of 256 B (Y-3).
+  DQs take credits in turns of 8 (a write packet counts one, X-11), the winner holding its turn while its request waits
+  for credits, and while it waits only for the pace holding it against converting DQs only (X-8). Ring space is taken in
+  turns of 8 data granules (X-10), only when a DQ waits for the ring, and the turn passes as soon as its holder cannot
+  start an entry for a reason other than ring space, credits, pace or the issue turn: no entry left, a semaphore wait or
+  `SIGNAL` at its head, or a plain read or write next (X-7). So a DQ that waits on a semaphore holds no turn (Y-3).
 - **Scales before data** (review findings V-1, W-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the
   data that uses them, and a conversion unit that spans several responses is staged raw there. A unit's raw slot is taken
   with its scales, when the scale read is issued, so a started entry never waits for ring space. Every data read and every

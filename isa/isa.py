@@ -512,43 +512,94 @@ def _granule_pieces(lo, hi, granule=256):
     return out
 
 
+def _is_marker(x):
+    return isinstance(x[0], str) and x[0] != "write"
+
+
+def _entry_formats(stream, f0):
+    """Per entry of a DQ's stream, its format: f0, changed by ("fmt", name) items for the entries after them."""
+    out = []
+    for x in stream:
+        if x[0] == "fmt":
+            f0 = x[1]
+        elif not _is_marker(x):
+            out.append(f0)
+    return out
+
+
+def _split_stream(stream):
+    """A DQ's stream as (entries, markers): markers[i] are the control items (wait, signal, gap) before entry i, and
+    markers[len(entries)] those after the last entry."""
+    ents, ctrl, cur = [], [], []
+    for x in stream:
+        if _is_marker(x):
+            if x[0] not in ("wait", "signal", "gap", "fmt"):
+                raise ValueError(f"unknown stream item {x!r}")
+            if x[0] != "fmt":
+                cur.append(x)
+        else:
+            ents.append(x)
+            ctrl.append(cur)
+            cur = []
+    ctrl.append(cur)
+    return ents, ctrl
+
+
 def _ring_reads(stream, boundary):
     """Data reads of one DQ's entries. Per entry a list of reads [granule or None, bytes, parts, deps]: parts = [(entry, bytes)]
-    that the response delivers, deps = the entries whose scales must be in the ring before it is issued."""
-    if not stream:
-        return []
-    if len(stream[0]) == 5:                                   # no addresses: `reads` equal reads, each in its own entry
-        return [[[None, e[3] / e[2], [(i, e[3] / e[2])], (i,)] for _ in range(e[2])] for i, e in enumerate(stream)]
-    pieces = [_granule_pieces(e[5], e[5] + e[3]) for e in stream]
-    plans = [[] for _ in stream]
-    last = None
-    for i, ps in enumerate(pieces):
-        for j, (g, b) in enumerate(ps):
-            if boundary == "shared" and j == 0 and last is not None and last[0] == g and last[3][-1] == i - 1:
-                last[1] += b                                  # one read of a granule two entries share (rejected, Z-1)
-                last[2].append((i, b))
-                last[3] += (i,)
-            else:                                             # "cut": the shared granule is two partial reads
-                last = [g, b, [(i, b)], (i,)]
-                plans[i].append(last)
+    that the response delivers, deps = the entries whose scales must be in the ring before it is issued. A write entry
+    ("write", bytes) has one item per write packet (at most 256 B). Control markers (wait, signal, gap) are skipped."""
+    stream = [x for x in stream if not _is_marker(x)]
+    plans, last = [], None
+    for i, e in enumerate(stream):
+        if e[0] == "write":
+            n = e[1]
+            plans.append([[None, min(256, n - k), [], ()] for k in range(0, n, 256)])
+            last = None
+        elif len(e) == 5:                                     # no addresses: `reads` equal reads, each in its own entry
+            plans.append([[None, e[3] / e[2], [(i, e[3] / e[2])], (i,)] for _ in range(e[2])])
+            last = None
+        else:
+            plan = []
+            for j, (g, b) in enumerate(_granule_pieces(e[5], e[5] + e[3])):
+                if boundary == "shared" and j == 0 and last is not None and last[0] == g and last[3][-1] == i - 1:
+                    last[1] += b                              # one read of a granule two entries share (rejected, Z-1)
+                    last[2].append((i, b))
+                    last[3] += (i,)
+                else:                                         # "cut": the shared granule is two partial reads
+                    last = [g, b, [(i, b)], (i,)]
+                    plan.append(last)
+            plans.append(plan)
     return plans
 
 
 def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=256, tags=512, unit=16, max_req=8,
                  boundary="cut", hbm="paced", inflight=None, sizing="rate", arb="fair", rsp="granule", fmt=None,
-                 pace="format", pace_idle=True, ring_turn=True, ring_q_bytes=256):
-    """Reference for the DMA staging ring (microarch.md section 2.5, review findings V-1, W-1, Z-1 to Z-3, Z-8, Y-1 to Y-3, Y-6): a cycle
-    model of one core's inbound conversion path that tracks only what the ring allocation rule decides.
+                 pace="shape", pace_idle=True, ring_turn=True, ring_q_bytes=256, ring_q="granules", ring_pass="idle",
+                 pace_hold="converting", write_turn=True, ring_take="contended"):
+    """Reference for the DMA staging ring (microarch.md section 2.5, review findings V-1, W-1, Z-1 to Z-3, Z-8, Y-1 to Y-3, Y-6,
+    X-7, X-8, X-10, X-11, X-14): a cycle model of one core's inbound conversion path that tracks only what the ring
+    allocation rule and the read-issue arbiter decide.
 
-    streams: one list per DQ of entries in issue order. An entry is the scale reads of a run of whole conversion units and
-    the data reads of those units: (scale, raw, reads, data, elems[, addr]) = bytes of out-of-line block scales (0: inline
-    or none, no scale read), bytes of split units staged raw (0: every unit converts from its own response), data
-    responses, data bytes, elements converted, and optionally the HBM byte address of the entry's first data byte (its
-    data is contiguous). With addr, `reads` is ignored: the reads are the granule pieces of [addr, addr + data), grouped
-    into requests inside one 2 KiB block. An entry with raw > 0 is converted from the ring once all its data has landed.
-    `tags` counts granule credits (review Y-3: a request takes one tag, from a 512-entry table that never binds first, and
-    one credit per granule): a scale read takes ceil(scale / 256) (review Z-8, scale reads assumed aligned); an entry whose
-    scales cross a 2 KiB block is several scale reads, allocated together, which the model counts as one request.
+    streams: one list per DQ of entries and control items in issue order. An entry is the scale reads of a run of whole
+    conversion units and the data reads of those units: (scale, raw, reads, data, elems[, addr]) = bytes of out-of-line
+    block scales (0: inline or none, no scale read), bytes of split units staged raw (0: every unit converts from its own
+    response), data responses, data bytes, elements converted, and optionally the HBM byte address of the entry's first
+    data byte (its data is contiguous). With addr, `reads` is ignored: the reads are the granule pieces of [addr, addr +
+    data), grouped into requests inside one 2 KiB block. An entry with raw > 0 is converted from the ring once all its data
+    has landed. A plain read is an entry with scale = raw = 0. Other items (review X-7, X-11):
+      ("write", bytes)    a write transfer from SPM (to remote SPM): 256 B packets, no tag, credit, pace or ring; it
+                          completes when its acks return, one round trip after each packet;
+      ("wait", s, n)      the DQ's next instruction waits until semaphore s has reached n (isa.md section 3): no later
+                          entry starts, while started entries keep issuing;
+      ("signal", s, n)    a SIGNAL: once every earlier entry of the DQ is complete (converted, or acked), s += n; later
+                          entries start after it;
+      ("gap", c)          the next instruction reaches the head c cycles later (a slow front end or list fetch);
+      ("fmt", name)       the format (PACE_WEIGHT key) of the DQ's later entries, as `fmt` gives it for the first.
+    Semaphores start at 0. `tags` counts granule credits (review Y-3: a request takes one tag, from a 512-entry table that
+    never binds first, and one credit per granule): a scale read takes ceil(scale / 256) (review Z-8, scale reads assumed
+    aligned); an entry whose scales cross a 2 KiB block is several scale reads, allocated together, which the model counts
+    as one request.
     rule, when ring space is taken:
       "atomic"  (the rule, W-1): the scales and every raw slot of the entry, one allocation, when its scale read is
                 issued (when its first data read is issued if it has no scale read). Its data reads need only tags.
@@ -563,12 +614,14 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
       "server"  (delivery-limited, Z-2): requests issue greedily (tags, `inflight`) and reach a FIFO server of `share`
                 B/cycle half a round trip later; a response returns half a round trip after the server finishes it. So rt
                 (plus the request's service time) is the minimum round trip, and the core's own queue adds to it.
+      Writes do not use the HBM share (they go to SRAM).
     rsp ("server" only): "granule" (the rule: one RD_RSP per granule piece, served in order, each freeing one credit) or
     "request" (the model before Y-3: a request's responses return together).
     inflight: DMA_PACE, the most bytes of converting reads in flight (scale and data reads of entries that use the ring;
     review Z-2; None: tags only). Plain reads (no scales, no raw slot) are limited by tags only. pace:
-      "format"  (the rule, Y-2): bytes are weighted by the DQ's format (fmt, a list of PACE_WEIGHT keys per DQ; None:
-                NVFP4), and the limit is min(inflight, 4.5 x ring).
+      "format"  (Y-2): bytes are weighted by the transfer's format (fmt, a list of PACE_WEIGHT keys per DQ, or ("fmt",
+                name) items; None: NVFP4), and the limit is min(inflight, 4.5 x ring).
+      "shape"   (the rule, X-14): as "format", but the reads of an entry whose data is one granule count in full.
       "flat"    (the Z-2 rule): bytes in full, no cap.
     pace_idle: a converting read may issue when none is in flight (the rule, Y-6); False is the literal limit, which
     never issues a read larger than a nonzero limit.
@@ -586,63 +639,117 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                 multi-credit requests starve one-credit ones.
       "greedy"  (rejected): a DQ whose request lacks credits or pace passes the turn, so one-credit requests starve
                 multi-credit ones.
-      "shrink"  (rejected; the model before Y-3): a data request shrinks to the free credits and pace.
-    ring_turn (the rule, Y-3): DQs that cannot start their next entry queue for the ring, and the head allocates for
-    ring_q_bytes of ring before the turn passes; data reads of allocated entries still issue. False: whoever fits
-    allocates, so small entries can starve large ones.
+      "shrink"  (rejected; the model before Y-3): a data request shrinks to the free credits and pace. No writes.
+    pace_hold ("fair" / "hold"; review X-8): what a turn held for pace holds against.
+      "converting" (the rule): while the holder's request waits only for pace, a DQ whose next request is plain (a
+                plain read or a write) may issue it, outside the turn (one request per cycle still).
+      "all"     (the text before X-8): nothing overtakes the holder, so a plain DQ gets one turn per paced request.
+    write_turn (review X-11): a write packet counts one credit toward the max_req-credit turn (the rule); False is the
+    text before X-11, where a write takes no credit and its DQ keeps the turn until its writes run out.
+    ring_turn (the rule, Y-3): DQs that cannot start their next entry queue for the ring, and the head allocates for a
+    quantum of ring before the turn passes; data reads of allocated entries still issue. False: whoever fits allocates,
+    so small entries can starve large ones. ring_q, the quantum: "granules" (the rule, X-10: max_req data granules of
+    the allocated entries, one data request of any format) or "bytes" (before X-10: ring_q_bytes of ring, which splits
+    converting DQs of different formats by their scale bytes). ring_take: "contended" (the rule, the text of Y-3: a DQ
+    that allocates while no DQ waits takes no turn) or "always" (the reference before X-7: every allocation takes the
+    turn, so a DQ that waits on a semaphore after a free allocation still holds it).
+    ring_pass, when the ring turn passes before its quantum (review X-7):
+      "idle"    (the rule): whenever its holder cannot start an entry for a reason other than ring space, credits, pace
+                or the issue turn: its stream has ended, a wait, SIGNAL or gap is at its head, or its next entry is a
+                plain read or a write. A DQ at the head of the queue that is idle this way leaves the queue.
+      "end"     (the reference before X-7): only when the holder has no entry left or its next entry needs no ring;
+                a semaphore wait inside the turn keeps it.
+      "quantum" (the text before X-7): only after the quantum.
     Per cycle at most one request is issued, round-robin over the DQs that have one ready. Within its turn a DQ reads
     scales ahead as far as the ring allows (greedy read-ahead: its scale read goes before its own data reads whenever its
     space can be taken), and otherwise issues its oldest entry's data reads, in order, once their scales have landed (at
     most max_req granules per request). Responses free their tags on arrival (they sink unconditionally), the converter
     takes `conv` elements per cycle oldest first, and an entry's space is freed once all its elements are converted.
-    Returns dict(done, cycle, rate, bw, bw_dq, deadlock, peak, peak_infl): rate is elements per cycle and bw delivered
-    data bytes per cycle, between 25% and 75% of the elements; bw_dq is per DQ, over the part of that window in which every
-    DQ still has data to receive (where the streams overlap); deadlock is the cycle of the last progress if
-    the model stops with work left; peak_infl is the largest weighted pace count."""
+    Returns dict(done, cycle, rate, bw, bw_dq, deadlock, peak, peak_infl, nreq, sems): rate is elements per cycle and bw
+    delivered data bytes per cycle, between 25% and 75% of the elements; bw_dq is per DQ (data read, or written),
+    over the window from the latest DQ's 5% mark to the earliest DQ's 95% mark of its own data, where every DQ still
+    receives data (review X-15), or None when there is no such window (a DQ that moves no data gets None); deadlock is
+    the cycle of the last progress if the model stops with work left; peak_infl is the largest weighted pace count;
+    nreq is per DQ [scale reads, data reads, write packets]."""
     if rule not in ("atomic", "split", "capped") or boundary not in ("cut", "shared") or hbm not in ("paced", "server") \
             or sizing not in ("rate", "quarter", "ring") or arb not in ("shrink", "greedy", "hold", "fair") \
-            or rsp not in ("request", "granule") or pace not in ("flat", "format"):
-        raise ValueError((rule, boundary, hbm, sizing, arb, rsp, pace))
+            or rsp not in ("request", "granule") or pace not in ("flat", "format", "shape") \
+            or ring_q not in ("bytes", "granules") or ring_pass not in ("idle", "end", "quantum") \
+            or pace_hold not in ("converting", "all") or ring_take not in ("always", "contended"):
+        raise ValueError((rule, boundary, hbm, sizing, arb, rsp, pace, ring_q, ring_pass, pace_hold))
     if ring < RING_MIN:
         raise ValueError(f"a ring below {RING_MIN} B faults ILLEGAL_FIELD (review Z-3)")
     lim = ring if sizing == "ring" else ring // 4
+    split = [_split_stream(s) for s in streams]
+    ents = [x[0] for x in split]
+    ctrl = [x[1] for x in split]
+    nd = len(streams)
 
     def rnd(n):
         return -(-n // unit) * unit
 
-    for s in streams:
+    def is_write(e):
+        return e[0] == "write"
+
+    for s in ents:
         for e in s:
+            if is_write(e):
+                if arb == "shrink":
+                    raise ValueError("arb='shrink' models no writes")
+                continue
             if rnd(e[0] + e[1]) > lim:
                 raise ValueError(f"entry of {rnd(e[0] + e[1])} B above {lim} B (the DMA shortens it; review Z-3)")
             if sizing == "rate" and e[1] == 0 and e[0] and (e[3] > 2048 or
                                                             (len(e) > 5 and e[5] // 2048 != (e[5] + e[3] - 1) // 2048)):
                 raise ValueError("an entry without raw slots covers at most one data request (review Y-1)")
-    wts = [PACE_WEIGHT[f] if pace == "format" and f else 1.0 for f in (fmt or [None] * len(streams))]
-    if inflight is not None and pace == "format":
+    efmt = [_entry_formats(s, f) for s, f in zip(streams, fmt or [None] * nd)]
+    if inflight is not None and pace != "flat":
         inflight = min(inflight, ring * 9 // 2)   # the hardware cap, 4.5 x DMA_STAGE (review Y-2): 72 KiB at 16 KiB
     rg = _Ring(ring, unit)
-    rmax = max([e[1] for s in streams for e in s] + [0])
-    total = sum(e[4] for s in streams for e in s)
-    plans = [_ring_reads(s, boundary) for s in streams]
-    nxt = [0] * len(streams)                 # per DQ: next entry to start
-    started = [deque() for _ in streams]     # per DQ: started entries with data reads left, oldest first
-    states = [dict() for _ in streams]       # per DQ: entry index -> state, from its start
-    arrivals = {}                            # cycle -> list of (kind, tags, bytes, payload)
+    rmax = max([e[1] for s in ents for e in s if not is_write(e)] + [0])
+    total = sum(e[4] for s in ents for e in s if not is_write(e))
+    wleft = sum(e[1] for s in ents for e in s if is_write(e))   # write bytes not yet acked
+    plans = [_ring_reads(s, boundary) for s in ents]
+    nxt = [0] * nd                           # per DQ: next entry to start
+    cq = [deque(c[0]) for c in ctrl]         # per DQ: control items at the head, before entry nxt[d]
+    gap_end = [None] * nd
+    sems = {}
+    cdone = [0] * nd                         # per DQ: entries complete
+    started = [deque() for _ in ents]        # per DQ: started entries with reads (or packets) left, oldest first
+    states = [dict() for _ in ents]          # per DQ: entry index -> state, from its start
+    arrivals = {}                            # cycle -> list of (kind, tags, bytes, payload, weighted pace, pieces)
     convq = []                               # [entry state, elements ready]
     budget, free_tags, rr, infl, srv, hold, peak_infl, used = 0.0, tags, 0, 0, 0.0, None, 0, 0
     done_el, t, last, peak, got = 0, 0, 0, 0, 0
-    got_dq = [0] * len(streams)
-    ring_q = deque()                         # ring_turn: DQs waiting to allocate, in order
-    ring_own = [None, 0]                     # ring_turn: the DQ holding the allocation turn, ring bytes it has taken
-    dq_data = [sum(e[3] for e in st) for st in streams]
-    first_done = None                        # (cycle, got_dq) when the first DQ received its last data byte
+    got_dq = [0] * nd
+    nreq = [[0, 0, 0] for _ in ents]
+    ring_qd = deque()                        # ring_turn: DQs waiting to allocate, in order
+    ring_own = [None, 0]                     # ring_turn: the DQ holding the allocation turn, quantum it has taken
+    dq_data = [sum(e[1] if is_write(e) else e[3] for e in st) for st in ents]
+    dmarks = [dict() for _ in ents]          # per DQ: {0.05: (cycle, got_dq), 0.95: ...} of its own data
     marks = {}
     idle = rt + int(2 * max_req * 256 / share) + 4
 
     def new_state(d, i):
-        e = streams[d][i]
-        return dict(i=i, d=d, scale=e[0], raw=e[1], data=e[3], elems=e[4], ri=0, landed=0, conv=0, sc_ok=e[0] == 0,
-                    allocs=[], raw_ok=e[1] == 0 or rule == "atomic")
+        e = ents[d][i]
+        if is_write(e):
+            return dict(i=i, d=d, write=True, scale=0, raw=0, data=e[1], elems=0, ri=0, landed=0, conv=0, sc_ok=True,
+                        allocs=[], raw_ok=True)
+        return dict(i=i, d=d, write=False, scale=e[0], raw=e[1], data=e[3], elems=e[4], ri=0, landed=0, conv=0,
+                    sc_ok=e[0] == 0, allocs=[], raw_ok=e[1] == 0 or rule == "atomic")
+
+    def wt(d, i):
+        """Pace weight of entry i's reads (0: plain or write)."""
+        e = ents[d][i]
+        if is_write(e) or not e[0] + e[1]:
+            return 0
+        if pace == "shape" and len(plans[d][i]) <= 1:     # an entry whose data is one granule counts in full (X-14)
+            return 1.0
+        f = efmt[d][i]
+        return PACE_WEIGHT[f] if pace != "flat" and f else 1.0
+
+    def needs_ring(e):
+        return not is_write(e) and e[0] + e[1] > 0
 
     def ready(d, i):
         st = states[d].get(i)
@@ -654,6 +761,32 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
         limit below one request."""
         return not w or inflight is None or (pace_idle and infl == 0) or infl + n * w <= inflight
 
+    def head_ready(d):
+        """Run the control items at the DQ's head; True when its next entry may start (nothing waits at the head)."""
+        nonlocal last
+        while cq[d]:
+            m = cq[d][0]
+            if m[0] == "wait":
+                if sems.get(m[1], 0) < m[2]:
+                    return False
+            elif m[0] == "signal":                       # release: every earlier entry of the DQ is complete
+                if cdone[d] < nxt[d]:
+                    return False
+                sems[m[1]] = sems.get(m[1], 0) + m[2]
+            else:                                         # gap
+                if gap_end[d] is None:
+                    gap_end[d] = t + m[1]
+                if t < gap_end[d]:
+                    return False
+                gap_end[d] = None
+            cq[d].popleft()
+            last = t
+        return True
+
+    def ring_idle(d):
+        """X-7: the DQ cannot start an entry for a reason other than ring space, credits, pace or the issue turn."""
+        return nxt[d] >= len(ents[d]) or bool(cq[d]) or not needs_ring(ents[d][nxt[d]])
+
     def _may_alloc(d, need):
         """Ring turn: a DQ that cannot start its next entry (it does not fit, or another DQ waits) joins a queue, and only
         the head allocates. Data reads still issue, and allocated entries need only tags, so the ring drains and the
@@ -663,52 +796,68 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
         if not ring_turn:
             return rg.fits(need)
         own = ring_own[0]
-        if (own == d or (own is None and (not ring_q or ring_q[0] == d))) and rg.fits(need):
+        if (own == d or (own is None and (not ring_qd or ring_qd[0] == d))) and rg.fits(need):
             return True
-        if own != d and d not in ring_q:
-            ring_q.append(d)
+        if own != d and d not in ring_qd:
+            ring_qd.append(d)
         return False
 
-    def _allocated(d, n):
+    def _allocated(d, n, i):
         if ring_own[0] != d:
+            if ring_take == "contended" and not (ring_qd and ring_qd[0] == d):
+                return                       # no DQ waits: a free allocation takes no turn
             ring_own[:] = [d, 0]
-            if ring_q and ring_q[0] == d:
-                ring_q.popleft()
-        ring_own[1] += n
-        if ring_own[1] >= ring_q_bytes:      # the turn passes after ring_q_bytes of ring
+            if ring_qd and ring_qd[0] == d:
+                ring_qd.popleft()
+        ring_own[1] += n if ring_q == "bytes" else len(plans[d][i])
+        if ring_own[1] >= (ring_q_bytes if ring_q == "bytes" else max_req):   # the turn passes after its quantum
             ring_own[:] = [None, 0]
 
-    def _ring_release(d):
-        """The allocation turn passes when its holder has no entry left to allocate."""
-        if ring_own[0] == d and (nxt[d] >= len(streams[d]) or not streams[d][nxt[d]][0] + streams[d][nxt[d]][1]):
+    def _ring_release_end(d):
+        """ring_pass='end' (the reference before X-7): the turn passes when its holder has no entry left to allocate."""
+        if ring_own[0] == d and (nxt[d] >= len(ents[d]) or not needs_ring(ents[d][nxt[d]])):
             ring_own[:] = [None, 0]
 
-    def _issue_whole(d):
-        """arb 'greedy' / 'hold' (review Y-3): the DQ's next request is formed whole (scale read, or up to max_req granules
-        of data in one 2 KiB block), never shrunk to the free tags or pace. Ring space is a readiness condition (a DQ
-        whose next entry cannot be allocated offers its data reads instead); tags and pace are not. Returns the request,
-        None (nothing ready) or 'hold' (ready, but tags or pace are short: 'hold' keeps the turn, 'greedy' passes it)."""
+    def _start(d, need):
+        st2 = new_state(d, nxt[d])
+        if need:
+            st2["allocs"].append(rg.alloc(need))
+            _allocated(d, need, nxt[d])
+        states[d][nxt[d]] = st2
+        nxt[d] += 1
+        cq[d].extend(ctrl[d][nxt[d]])
+        started[d].append(st2)
+        return st2
+
+    def _issue_whole(d, plain_only=False):
+        """arb 'greedy' / 'hold' / 'fair' (review Y-3): the DQ's next request is formed whole (scale read, up to max_req
+        granules of data in one 2 KiB block, or one write packet), never shrunk to the free tags or pace. Ring space is a
+        readiness condition (a DQ whose next entry cannot be allocated offers its data reads instead); tags and pace are
+        not. Returns the request, None (nothing ready), 'hold' (ready, but credits are short) or 'pace' (ready, credits
+        free, the pace short). plain_only (X-8): offer only a plain read or a write, with no side effect on a converting
+        entry, and return None instead of 'hold' / 'pace'."""
         cand = None
-        if nxt[d] < len(streams[d]):
-            e = streams[d][nxt[d]]
-            need = e[0] + (e[1] if rule == "atomic" else 0)
-            ok = (e[0] > 0 or not started[d]) and _may_alloc(d, need)
-            if ok and need and rule == "capped" and e[0] and not rg.fits(e[0], rmax):
-                ok = False
-            if ok and e[0]:
-                cand = ("scale", max(1, -(-e[0] // 256)), e[0], (e[0] + e[1] > 0) * wts[d])
-            elif ok:                                 # no scale read: allocate at its turn, then offer its data read
-                st2 = new_state(d, nxt[d])
-                st2["allocs"] += [rg.alloc(need)] if need else []
-                _allocated(d, need)
-                states[d][nxt[d]] = st2
-                nxt[d] += 1
-                started[d].append(st2)
+        if nxt[d] < len(ents[d]) and not cq[d]:
+            e = ents[d][nxt[d]]
+            if is_write(e) or not needs_ring(e):
+                if not started[d]:                   # a plain read or a write starts once earlier reads are issued
+                    _start(d, 0)
+            elif not plain_only:
+                need = e[0] + (e[1] if rule == "atomic" else 0)
+                ok = (e[0] > 0 or not started[d]) and _may_alloc(d, need)
+                if ok and need and rule == "capped" and e[0] and not rg.fits(e[0], rmax):
+                    ok = False
+                if ok and e[0]:
+                    cand = ("scale", max(1, -(-e[0] // 256)), e[0], wt(d, nxt[d]))
+                elif ok:                             # no scale read: allocate at its turn, then offer its data read
+                    _start(d, need)
         if cand is None:
             while started[d] and started[d][0]["ri"] == len(plans[d][started[d][0]["i"]]):
                 started[d].popleft()
             st = started[d][0] if started[d] else None
             if st is None or not st["sc_ok"]:
+                return None
+            if plain_only and wt(d, st["i"]):
                 return None
             if not st["raw_ok"]:
                 a = rg.alloc(st["raw"])
@@ -717,38 +866,69 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                 st["allocs"].append(a)
                 st["raw_ok"] = True
             plan = plans[d][st["i"]]
-            if not all(ready(d, x) for x in plan[st["ri"]][3]):
-                return None
-            blk = None if plan[st["ri"]][0] is None else plan[st["ri"]][0] // 8
-            j, nb = st["ri"], 0
-            while j < len(plan) and j - st["ri"] < max_req:
-                g, b, parts, deps = plan[j]
-                if j > st["ri"] and ((blk is not None and g // 8 != blk) or not all(ready(d, x) for x in deps)):
-                    break
-                nb, j = nb + b, j + 1
-            cand = ("data", j - st["ri"], nb, (st["scale"] + st["raw"] > 0) * wts[d])
+            if st["write"]:
+                cand = ("write", 0, plan[st["ri"]][1], 0)
+            else:
+                if not all(ready(d, x) for x in plan[st["ri"]][3]):
+                    return None
+                blk = None if plan[st["ri"]][0] is None else plan[st["ri"]][0] // 8
+                j, nb = st["ri"], 0
+                while j < len(plan) and j - st["ri"] < max_req:
+                    g, b, parts, deps = plan[j]
+                    if j > st["ri"] and ((blk is not None and g // 8 != blk) or not all(ready(d, x) for x in deps)):
+                        break
+                    nb, j = nb + b, j + 1
+                cand = ("data", j - st["ri"], nb, wt(d, st["i"]))
         kind, k, nb, w = cand
-        if free_tags < k or not room(nb, w):
-            return "hold" if arb in ("hold", "fair") else None
+        if free_tags < k:
+            return None if plain_only else "hold" if arb in ("hold", "fair") else None
+        if not room(nb, w):
+            return None if plain_only else "pace" if arb in ("hold", "fair") else None
         if kind == "scale":
-            e = streams[d][nxt[d]]
-            st2 = new_state(d, nxt[d])
-            need = e[0] + (e[1] if rule == "atomic" else 0)
-            st2["allocs"].append(rg.alloc(need))
-            _allocated(d, need)
-            states[d][nxt[d]] = st2
-            nxt[d] += 1
-            started[d].append(st2)
+            e = ents[d][nxt[d]]
+            st2 = _start(d, e[0] + (e[1] if rule == "atomic" else 0))
             return ("scale", k, nb, st2, w, None)
         st = started[d][0]
         plan = plans[d][st["i"]]
+        if kind == "write":
+            st["ri"] += 1
+            if st["ri"] == len(plan):
+                started[d].popleft()
+            return ("write", 0, nb, st, 0, None)
         pcs = [(b, [(states[d][x], y) for x, y in parts]) for g, b, parts, deps in plan[st["ri"]:st["ri"] + k]]
         st["ri"] += k
         if st["ri"] == len(plan):
             started[d].popleft()
         return ("data", k, nb, [p for _, ps in pcs for p in ps], w, pcs)
 
-    while done_el < total:
+    def _send(req, d):
+        nonlocal free_tags, infl, peak_infl, budget, srv, last
+        kind, k, nb, pay, cv, pcs = req
+        nreq[d][{"scale": 0, "data": 1, "write": 2}[kind]] += 1
+        free_tags -= k
+        infl += nb * cv
+        peak_infl = max(peak_infl, infl)
+        last = t
+        if kind == "write":                             # acked one round trip later; no HBM share
+            arrivals.setdefault(t + rt, []).append(req)
+        elif hbm == "paced":
+            budget -= nb
+            arrivals.setdefault(t + rt, []).append(req)
+        elif rsp == "granule" and kind == "data":       # one response per granule piece, one tag each (RD_RSP)
+            for b, ps in pcs:
+                srv = max(srv, t + rt / 2) + b / share
+                arrivals.setdefault(int(-(-(srv + rt / 2) // 1)), []).append(("data", 1, b, ps, cv, None))
+        else:                                           # the share serves requests in arrival order, half a round trip out
+            srv = max(srv, t + rt / 2) + nb / share
+            arrivals.setdefault(int(-(-(srv + rt / 2) // 1)), []).append(req)
+
+    def _got(d, b):
+        got_dq[d] += b
+        for f in (0.05, 0.95):
+            if f not in dmarks[d] and got_dq[d] >= f * dq_data[d] - 1e-9:
+                dmarks[d][f] = (t, list(got_dq))
+
+    while done_el < total or wleft > 1e-9:
         t += 1
         if hbm == "paced":
             budget = min(budget + share, max_req * 256 + share)
@@ -759,11 +939,16 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
             if kind == "scale":
                 pay["sc_ok"] = True
                 continue
+            if kind == "write":
+                wleft -= nb
+                _got(pay["d"], nb)
+                pay["landed"] += nb
+                if pay["landed"] >= pay["data"] - 1e-9:
+                    cdone[pay["d"]] += 1
+                continue
             got += nb
             for st, b in pay:
-                got_dq[st["d"]] += b
-                if first_done is None and dq_data[st["d"]] and got_dq[st["d"]] >= dq_data[st["d"]] - 1e-9:
-                    first_done = (t, list(got_dq))
+                _got(st["d"], b)
                 st["landed"] += b
                 if st["raw"] == 0:
                     convq.append([st, st["elems"] * b / st["data"]])
@@ -780,38 +965,43 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
             last = t
             if q[1] <= 1e-9:
                 convq.pop(0)
-            if q[0]["conv"] >= q[0]["elems"] - 1e-9:
+            if q[0]["conv"] >= q[0]["elems"] - 1e-9 and not q[0].get("done"):
+                q[0]["done"] = True
+                cdone[q[0]["d"]] += 1
                 for a in q[0]["allocs"]:
                     rg.free(a)
                 q[0]["allocs"] = []
         for f in (0.25, 0.75):
             if f not in marks and done_el >= f * total:
                 marks[f] = (t, done_el, got, list(got_dq))
+        for d in range(nd):
+            head_ready(d)
+        if ring_turn and ring_pass == "idle":           # X-7: the ring turn passes when its holder is idle
+            if ring_own[0] is not None and ring_idle(ring_own[0]):
+                ring_own[:] = [None, 0]
+            while ring_qd and ring_own[0] is None and ring_idle(ring_qd[0]):
+                ring_qd.popleft()
         order = [] if hbm == "paced" and budget <= 0 else [hold] if hold is not None else \
-            [(rr + j) % len(streams) for j in range(len(streams))]
+            [(rr + j) % nd for j in range(nd)]
         for d in order:                                                           # issue: one request per cycle
-            _ring_release(d)
+            if ring_pass == "end":
+                _ring_release_end(d)
             if arb == "shrink":
                 req = None
-                if nxt[d] < len(streams[d]):         # read ahead: start the next entry
-                    e = streams[d][nxt[d]]
+                if nxt[d] < len(ents[d]) and not cq[d]:     # read ahead: start the next entry
+                    e = ents[d][nxt[d]]
                     stags = -(-e[0] // 256)
                     need = e[0] + (e[1] if rule == "atomic" else 0)
                     ok = (e[0] > 0 or not started[d]) and free_tags >= max(1, stags) and \
-                        room(e[0], (e[0] + e[1] > 0) * wts[d]) and _may_alloc(d, need)
+                        room(e[0], wt(d, nxt[d])) and _may_alloc(d, need)
                     if ok and need and rule == "capped" and e[0] and not rg.fits(e[0], rmax):
                         ok = False
-                    a = rg.alloc(need) if ok and need else None
-                    if a is not None:
-                        _allocated(d, need)
-                    if ok and (a is not None or not need):
-                        st2 = new_state(d, nxt[d])
-                        st2["allocs"] += [a] if a else []
-                        states[d][nxt[d]] = st2
-                        nxt[d] += 1
-                        started[d].append(st2)
+                    if ok and need and not rg.fits(need):
+                        ok = False
+                    if ok:
+                        st2 = _start(d, need)
                         if e[0]:
-                            req = ("scale", stags, e[0], st2, wts[d], None)
+                            req = ("scale", stags, e[0], st2, wt(d, st2["i"]), None)
                 while req is None and started[d] and started[d][0]["ri"] == len(plans[d][started[d][0]["i"]]):
                     started[d].popleft()            # an entry whose reads all belong to an older entry (shared)
                 st = started[d][0] if started[d] else None
@@ -822,7 +1012,7 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                             st["allocs"].append(a)
                             st["raw_ok"] = True
                     plan = plans[d][st["i"]]
-                    cv = (st["scale"] + st["raw"] > 0) * wts[d]
+                    cv = wt(d, st["i"])
                     if st["raw_ok"] and all(ready(d, x) for x in plan[st["ri"]][3]) and room(plan[st["ri"]][1], cv):
                         blk = None if plan[st["ri"]][0] is None else plan[st["ri"]][0] // 8
                         k, nb, pay, pcs = 0, 0, [], []
@@ -840,45 +1030,45 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                         req = ("data", k, nb, pay, cv, pcs)
             else:
                 req = _issue_whole(d)
-                if req == "hold":
+                if req in ("hold", "pace"):
                     hold = d
+                    if req == "pace" and pace_hold == "converting":   # X-8: a plain request may pass a pace hold
+                        for j in range(1, nd):
+                            d2 = (d + j) % nd
+                            r2 = _issue_whole(d2, plain_only=True)
+                            if r2 is not None:
+                                _send(r2, d2)       # outside the turn: the holder keeps it
+                                break
                     break
                 if req is None:
                     if hold == d:
                         hold, used = None, 0
                     continue
-                used += req[1]                  # "fair": the turn lasts until it has taken max_req credits
+                used += req[1] if req[0] != "write" else int(write_turn)   # X-11: a write packet counts one credit
                 hold = d if arb == "fair" and used < max_req else None
                 used = used if hold is not None else 0
             if req is not None:
-                kind, k, nb, pay, cv, pcs = req
-                free_tags -= k
-                infl += nb * cv
-                peak_infl = max(peak_infl, infl)
-                if hbm == "paced":
-                    budget -= nb
-                    arrivals.setdefault(t + rt, []).append(req)
-                elif rsp == "granule" and kind == "data":   # one response per granule piece, one tag each (RD_RSP)
-                    for b, ps in pcs:
-                        srv = max(srv, t + rt / 2) + b / share
-                        arrivals.setdefault(int(-(-(srv + rt / 2) // 1)), []).append(("data", 1, b, ps, cv, None))
-                else:                           # the share serves requests in arrival order, half a round trip out
-                    srv = max(srv, t + rt / 2) + nb / share
-                    arrivals.setdefault(int(-(-(srv + rt / 2) // 1)), []).append(req)
-                rr = (d + 1) % len(streams)
-                last = t
+                _send(req, d)
+                rr = (d + 1) % nd
                 break
         peak = max(peak, rg.used)
-        if t - last > idle and not arrivals:
-            return dict(done=False, cycle=t, rate=0.0, bw=0.0, deadlock=last, peak=peak, peak_infl=peak_infl)
-    (t0, e0, g0, q0), (t1, e1, g1, q1) = marks[0.25], marks[0.75]
-    w = max(1, t1 - t0)
-    if first_done is not None and t0 < first_done[0] < t1:  # per DQ: only while every DQ still has data to receive
-        t2, q2 = first_done
+        if t - last > idle and not arrivals and not any(g is not None for g in gap_end):
+            return dict(done=False, cycle=t, rate=0.0, bw=0.0, bw_dq=None, deadlock=last, peak=peak,
+                        peak_infl=peak_infl, nreq=nreq, sems=sems)
+    if total:
+        (t0, e0, g0, q0), (t1, e1, g1, q1) = marks[0.25], marks[0.75]
     else:
-        t2, q2 = t1, q1
+        t0 = t1 = e0 = e1 = g0 = g1 = 0
+    w = max(1, t1 - t0)
+    act = [d for d in range(nd) if dq_data[d]]
+    bw_dq = None
+    if act:
+        ta, qa = max((dmarks[d][0.05] for d in act), key=lambda x: x[0])
+        tb, qb = min((dmarks[d][0.95] for d in act), key=lambda x: x[0])
+        if tb > ta:
+            bw_dq = [(qb[d] - qa[d]) / (tb - ta) if dq_data[d] else None for d in range(nd)]
     return dict(done=True, cycle=t, rate=(e1 - e0) / w, bw=(g1 - g0) / w, deadlock=None, peak=peak, peak_infl=peak_infl,
-                bw_dq=[(b - a) / max(1, t2 - t0) for a, b in zip(q0, q2)])
+                bw_dq=bw_dq, nreq=nreq, sems=sems)
 
 
 def queue_of(isa, name, fields):

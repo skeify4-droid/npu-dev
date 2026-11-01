@@ -93,8 +93,8 @@ the same path as the planned MXFP4 decompression), destination scratchpad addres
 (Qwen's 320 B rows).
 *As built (review findings Z-4, Y-7; layout chosen by the user, 2026-11-01):* `DMA_GATHER` with `cvt` from MXFP8, `s1` = `row_bytes` = 256 and the published
 separate scale array (`scale_reg`, `aux0` = 8 B per row; memmap.md §6). The runtime stores the table as published, so it needs no load-time repack of the 197 G
-elements. Each row is one aligned 256 B granule plus an 8 B scale read in its own ring entry: not split, so not staged raw, at about 0.27 rows/cycle per core
-at a 500-cycle round trip (`test_isa.py` `test_engram_separate_array_gather`). Inline 264 B rows (`SCALE_INLINE`) remain legal for a table a runtime repacks, at
+elements. Each row is one aligned 256 B granule plus an 8 B scale read in its own ring entry: not split, so not staged raw, at about 0.33 rows/cycle per core
+at a 500-cycle round trip (0.30 at 845; its one-granule entries are paced in full, microarch.md §2.5, review finding X-14) (`test_isa.py` `test_engram_separate_array_gather`). Inline 264 B rows (`SCALE_INLINE`) remain legal for a table a runtime repacks, at
 about 0.12 rows/cycle, with the same 288 B of HBM reads per row. Qwen's BF16 rows are plain (no conversion, no scales).
 - Rejected (Y-7): inline rows built by a runtime repack. No spec or plan item owned the pass over about 203 GB, the gather is slower (raw staging), and it saves
   no bytes. Before Y-7 the specs described inline rows while the checkpoint has a separate array: a gather with s1 = 256 then faults `ILLEGAL_FIELD`, and one with

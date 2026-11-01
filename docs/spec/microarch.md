@@ -154,39 +154,87 @@ isa.md §5) a cheap multiply at the ACC input.
   - Shared resources are the tags and granule credits, the pace count, the staging ring (below), the SPM ports and NI
     injection. They are taken per read or write packet, round-robin over the DQs that have a packet ready, and only after the
     head's wait is satisfied.
-  - **Credit-fair turns *(review finding Y-3; rule chosen by the user, 2026-11-01)*.** A read is ready when its own
-    conditions hold: a data read's scales are in the ring, a scale read's ring space can be taken (next bullet). Tags,
-    granule credits and the pace (below) are not part of readiness. The round-robin winner keeps its turn until it has taken
-    8 granule credits (one full request's worth), and while its next request waits for credits or pace it holds the turn:
-    no other DQ's read overtakes it. A request is never shrunk to fit. The turn passes early when the DQ has nothing ready.
-    Tags, credits and pace are freed by responses, which sink unconditionally, so a held turn always ends.
-  - **Ring turns *(review finding Y-3)*.** The turn is never held for ring space, because ring space is freed by data reads
-    that such a hold could block. Instead, ring allocation takes turns: a DQ that cannot start its next entry (it does not
-    fit, or another DQ is waiting) joins a queue, and only the DQ at its head allocates, keeping that turn for 256 B of
-    ring (one data request's NVFP4 scales). Meanwhile every DQ still issues the data reads of its allocated entries, and
-    those need only tags (below), so the ring drains and the head's entry fits.
+  - **Credit-fair turns *(review findings Y-3, X-8, X-11; rule chosen by the user, 2026-11-01)*.** A read is ready when
+    its own conditions hold: a data read's scales are in the ring, a scale read's ring space can be taken (next bullet).
+    Tags, granule credits and the pace (below) are not part of readiness. The round-robin winner keeps its turn until it
+    has taken 8 granule credits (one full request's worth). A request is never shrunk to fit. The turn passes early when
+    the DQ has nothing ready.
+    - **Held for credits.** While the winner's next request waits for credits, no other DQ's request overtakes it.
+    - **Held for the pace against converting DQs only *(X-8)*.** While its next request has its credits and waits only
+      for the pace, a DQ whose next request is plain (a plain read or a write packet) may issue it meanwhile, outside the
+      turn; converting reads of other DQs still wait. Plain reads are limited by tags only (pace, below), and a hold
+      against them would give a plain DQ one request per paced request of the holder.
+    - **Write packets *(X-11)*.** A write packet (at most 256 B, below) takes no credit but counts one toward the 8 of a
+      turn, so a DQ that wins with writes passes the turn after 8 packets (2 KiB). The turn is never held for write burst
+      ids, which acks free. Read literally, "until it has taken 8 credits" let a 1 MiB SPM-to-SPM write (a MoE dispatch,
+      4,096 packets) keep the turn until its last packet, and a weight prefetch in another DQ issued nothing for 4,096
+      cycles (`isa.staging_ring`, `write_turn=False`).
+    - Tags, credits and pace are freed by responses, which sink unconditionally, so a held turn always ends.
+  - **Ring turns *(review findings Y-3, X-7, X-10)*.** The issue turn is never held for ring space, because ring space is
+    freed by data reads that such a hold could block. Instead, ring allocation takes turns:
+    - A DQ that cannot start its next entry (it does not fit, or another DQ is waiting) joins a queue, and only the DQ at
+      its head allocates. It keeps that turn for **8 data granules** of the entries it allocates (one data request, of
+      any format; X-10). A DQ that allocates while no DQ waits takes no turn.
+    - **The turn passes early whenever its holder cannot start an entry for a reason other than ring space, credits, pace
+      or the issue turn *(X-7)*:** its transfers have no entry left and its next instruction or `DMA_LIST` entry is not
+      at the head, waits on a semaphore or is a `SIGNAL` waiting for its release, or its next read is plain or a write.
+      A queued DQ that becomes idle this way leaves the queue. The holder does wait for credits, pace and the issue turn,
+      which responses free or which rotate.
+    - Meanwhile every DQ still issues the data reads of its allocated entries, and those need only tags (below), so the
+      ring drains and the head's entry fits.
+    - Why the pass on idle: without it a DQ that waits on a semaphore inside its turn keeps it, and nothing else
+      allocates. 2 KiB ring, L = 500, DQ0 streams NVFP4 weights, DQ1 gathers 37 KV rows, waits on a flag, then gathers
+      37 more, DQ2 gathers 200 KV rows and sets the flag when they complete: DQ1 takes the turn, allocates 160 B, waits,
+      and the core hangs from cycle 3,649 with the ring empty (the fifth verifier's own model: 3,628). Random four-DQ
+      programs with cross-DQ waits, each deadlock-free by itself (`isa.staging_ring` with semaphores, 400 programs, 2-16
+      KiB rings, L = 50-845, 8-512 credits): 182 deadlock with the turn kept for its quantum, 59 with a pass only at the
+      end of the DQ's stream (the reference before X-7), 0 with the pass on idle; with write transfers added, 169 / 46 /
+      0.
+    - Why granules: 256 B of ring is one NVFP4 entry but two MXFP4 or four MXFP8 entries, each one data request, so a
+      byte quantum split two converting DQs of different formats by their scale bytes (NVFP4 + MXFP8 weights 17 / 66
+      B/cycle). In granules each turn is one data request.
   - Why both: per request or per entry, round-robin hands out shared space in proportion to the request or entry size.
-    Data bytes per cycle at L = 845 with `DMA_PACE` (`isa.staging_ring`, `hbm="server"`, while the streams overlap):
+    Data bytes per cycle at L = 845 with `DMA_PACE` (`isa.staging_ring`, `hbm="server"`, per DQ from the latest DQ's 5%
+    mark to the earliest DQ's 95% mark of its own data):
 
-    | arbitration | KV gather + plain | two KV gathers + plain | NVFP4 weights + KV gather |
-    |---|---|---|---|
-    | ready includes free credits (`arb="greedy"`) | 72 / **6** | 37 / 37 / **3** | 37 / 37 (with ring turns) |
-    | turn held for one request (`"hold"`, the fourth verifier's proposal) | **5** / 81 | **5** / **5** / 76 | 38 / 38 |
-    | shrink to the free credits (`"shrink"`, the model before Y-3) | 28 / 56 | 20 / 20 / 41 | 38 / 38 |
-    | **credit-fair turns + ring turns (the rule, `"fair"`)** | 28 / 56 | 18 / 18 / 39 | 37 / 37 |
-    | the rule without ring turns (`ring_turn=False`) | 28 / 56 | 20 / 20 / 41 | **0** / 77 |
+    | arbitration | KV gather + plain | two KV gathers + plain | NVFP4 weights + KV gather | NVFP4 + MXFP8 weights | NVFP4 + MXFP8 + plain |
+    |---|---|---|---|---|---|
+    | ready includes free credits (`arb="greedy"`) | 73 / **5** | 37 / 37 / **2** | 37 / 37 | 40 / 40 | 28 / 28 / 28 |
+    | turn held for one request (`"hold"`, the fourth verifier's proposal) | **1** / 85 | **5** / **5** / 76 | 38 / 37 | 40 / 40 | 21 / 21 / 42 |
+    | shrink to the free credits (`"shrink"`, the model before Y-3) | 28 / 56 | 20 / 20 / 41 | 37 / 37 | 40 / 40 | 26 / 27 / 30 |
+    | **credit-fair turns + ring turns (the rule, `"fair"`)** | 28 / 56 | 19 / 19 / 40 | 37 / 37 | 40 / 40 | 28 / 28 / 28 |
+    | the rule without ring turns (`ring_turn=False`) | 28 / 56 | 19 / 19 / 41 | **2** / 74 | **2** / 82 | **6** / 39 / 40 |
+    | the rule with a 256 B ring quantum (`ring_q="bytes"`, before X-10) | 28 / 56 | 19 / 19 / 40 | 37 / 37 | **17** / 66 | **9** / 38 / 38 |
 
     - "greedy": a DQ of one-granule requests (a KV gather: a 32 B scale read and a 256 B row) takes each credit as it is
       freed, and a 2 KiB read in another DQ, which needs 8 at once, waits (the fourth verifier's model: 1-4 B/cycle).
     - "hold": round-robin per request gives a 2 KiB read 8 times the bytes of a one-granule read, so it starves the gather.
-    - Without ring turns, the KV gather's 32 B entries take freed ring space before a 256 B weight entry fits.
+    - Without ring turns, the small entries of one DQ (32 B KV entries, 64 B MXFP8 entries) take freed ring space before
+      a 256 B NVFP4 entry fits.
     - Under the rule, credits are shared evenly. The KV gather gets less in bytes (28 B/cycle of data plus 3 of scales),
-      because half its credits carry 32 B scale reads.
+      because half its credits carry 32 B scale reads. At L = 500 the rule gives 28 / 56, 20 / 20 / 42, 39 / 38, 40 / 40
+      and 28 / 28 / 28. NVFP4 weights + plain share 41 / 41.
     - Shrinking gives similar shares, but it splits reads into more, smaller requests, so it was not taken. Cost of the rule:
-      a credit count per turn and a 4-entry allocation queue.
-  - So a DQ whose head waits on a semaphore holds nothing another DQ needs. A started transfer holds its tags until its
-    responses sink, and its ring space until its data has been converted (review finding W-6). Neither waits on another DQ:
-    every ring entry, once allocated, needs only tags to complete (below). d2d_c2c.md L-7 issue rule 2 relies on this.
+      a credit count per turn, a granule count per ring turn and a 4-entry allocation queue.
+    - **When the pace binds *(X-8)*.** `DMA_PACE` 16 KiB at L = 845, data B/cycle: NVFP4 weights + plain 2 KiB reads 10
+      / 76 under the rule, 17 / 17 with the turn held for the pace against every DQ (the text before X-8; the fifth
+      verifier's own model 17 / 17), 9 / 76 under "greedy"; KV gather + plain 11 / 75, 17 / 34 and 11 / 75. At the
+      default `DMA_PACE` the two holds give identical shares. The reference before X-8 showed a weaker coupling (14 / 38)
+      because a plain DQ starting a plain read took the ring turn with 0 bytes and kept the converting DQ from reading
+      scales ahead; plain reads take no ring turn.
+  - So a DQ whose head waits on a semaphore holds nothing another DQ needs (with the ring turn's pass on idle, X-7). A
+    started transfer holds its tags until its responses sink, and its ring space until its data has been converted
+    (review finding W-6). Neither waits on another DQ: every ring entry, once allocated, needs only tags to complete
+    (below). d2d_c2c.md L-7 issue rule 2 relies on this.
+  - **Liveness, as Phase 3 proves it *(X-7)*.** Under an environment that returns every granule within R cycles:
+    - (P1) a ring-turn holder, or the head of the allocation queue, that cannot start an entry for a reason other than
+      ring space, credits, pace or the issue turn releases the turn (or leaves the queue) the next cycle;
+    - (P2) the issue turn is held only while the holder's next request lacks credits or pace, and while it lacks only
+      pace, a ready plain request of another DQ still issues;
+    - (P3) a DQ with a ready read, or a write packet, issues within a bound in R, the turn quantum and the number of DQs.
+    - The argument: a held issue turn waits only for credits or pace, which responses free; a ring-queue head waits only
+      for space, which allocated entries free, since their reads need only credits, pace and issue turns, which rotate;
+      an empty ring takes any entry ≤ the ring (the allocator restarts at 0).
 - **Tags and granule credits *(review finding Y-3; option chosen by the user, 2026-11-01)*.** A read request takes one **tag**
   and one **granule credit** per 256 B granule it touches, which is one per `RD_RSP` it receives (noc.md §2). There are 512
   of each, so the DMA keeps up to 512 granules (128 KiB) in flight, about 2x the core's HBM share (102 B/cycle) times a typical
@@ -200,12 +248,15 @@ isa.md §5) a cheap multiply at the ACC input.
     read one tag and 8 credits.
   - Rejected: consecutive granule tags (a request takes k consecutive tags). Allocation would need k contiguous free tags and
     would fragment like the ring.
-  - **Converting reads are paced *(review findings Z-2, Y-2, Y-6; options chosen by the user, 2026-11-01)*.** At most
+  - **Converting reads are paced *(review findings Z-2, Y-2, Y-6, X-14; options chosen by the user, 2026-11-01)*.** At most
     min(`DMA_PACE`, 4.5 x the `DMA_STAGE` size) **weighted bytes** of converting reads are in flight (CSR `DMA_PACE`, reset
     72 KiB; 4.5 x the 16 KiB default ring is also 72 KiB). Converting reads are the scale and data reads of block-format
     transfers, counted at issue and returned by their responses.
     - NVFP4 reads count their bytes, MXFP4 reads half and MXFP8 reads a quarter: a shift by the transfer's format, so the
       count follows the scale bytes in flight (32, 16 and 8 B per 256 B granule).
+    - **By entry shape *(X-14; taken by the user, 2026-11-01)*:** the reads of an entry whose data is one granule (a row
+      gather: a KV row, an Engram row) count their bytes in full, whatever the format. The DMA knows the shape when it
+      forms the entry, so the shift select has one more term.
     - Hardware: an 18-bit counter (512 granules of NVFP4 reads weigh 2^17 B), a shift-add for the cap, a min and a compare.
     - A converting read may always issue when no converting read is in flight, so any nonzero limit makes progress, also
       one below a single request (review finding Y-6; the literal "at most `DMA_PACE` bytes" hangs at 1 KiB on the first 2
@@ -223,9 +274,14 @@ isa.md §5) a cheap multiply at the ACC input.
     - Why the CSR stays (rejected: the limit derived from `DMA_STAGE` alone, the fourth verifier's proposal): the KV gather
       is bound by its tags (two per row), not by the ring, and its best limit is about 72 KiB at any ring size. A 24 or 32
       KiB ring with a derived 108 or 144 KiB limit drops it from 154 to 123 / 110 at 845 cycles.
-    - Cost of the weighting: a per-row MXFP8 gather with a separate scale array (an 8 B scale read and a 256 B row; the
-      Engram table, hyper_connections.md §4) is tag-bound like the KV gather and gained from the flat limit: 0.22 rows/cycle
-      at 845 cycles, against 0.30. It is hidden (G-1), and still 3x the 0.07 of inline-scaled rows at that round trip.
+    - Why by entry shape: for an entry of many granules the pace bounds the scale bytes in the ring, which the format
+      weight tracks. For a one-granule entry it bounds the HBM queue, and a row gather is tag-bound (two tags per row):
+      a longer queue holds every tag longer. Counted by format, a per-row MXFP4 gather (16 B scale read + 256 B row) ran
+      at 110 elements/cycle at L = 845 against 154 counted in full, and the Engram MXFP8 rows (8 B scale read + 256 B row,
+      hyper_connections.md §4) at 0.22 rows/cycle against 0.30 (the fifth verifier's own model: 110 / 151 and 0.218 /
+      0.291). By entry shape both get the flat rates, the MX weight streams keep 164 / 84 to 1,200 cycles, and NVFP4 and
+      the NVFP4 KV gather are unchanged (`test_staging_ring_pace_hold_and_formats`). No surveyed model has an MX row gather
+      on a critical path (Engram is hidden, G-1); this keeps one from losing about a third.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
   and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
@@ -315,12 +371,22 @@ isa.md §5) a cheap multiply at the ACC input.
       read does not overtake another DQ's data read; per-DQ order is all the read-ahead needs. A scale read takes one tag
       and one credit per granule it touches, as a data read of that size would (above).
     - Reference: `isa.staging_ring`, a cycle model of the rule. Entries can carry HBM byte ranges; their reads are then the
-      granule pieces of the range, cut at entry boundaries and grouped into requests inside one 2 KiB block. Its defaults
-      are the rule: entry sizes checked (`sizing="rate"`), turn-holding (`arb="hold"`), one response and one credit per
-      granule (`rsp="granule"`), and the pace weighted by format with the cap (`pace="format"`, `fmt` per DQ). `test_isa.py`
-      runs mixed split and non-split streams, one DQ or four, with greedy read-ahead, and they always complete; the
-      shared-granule reading deadlocks with four DQs. Phase 3 adds `core/dma` formal properties: every allocated ring entry
-      needs only tags to complete, and no data read waits for the scales of an entry other than its own.
+      granule pieces of the range, cut at entry boundaries and grouped into requests inside one 2 KiB block. A DQ's stream
+      can also hold write transfers, semaphore waits, `SIGNAL`s and front-end gaps (review finding X-7). Its defaults are
+      the rule:
+      - entry sizes checked (`sizing="rate"`);
+      - credit-fair turns (`arb="fair"`; `"hold"` is the rejected turn per request), held for the pace against
+        converting DQs only (`pace_hold="converting"`), with a write packet counted as one credit (`write_turn=True`);
+      - ring turns taken only when a DQ waits (`ring_take="contended"`), counted in data granules (`ring_q="granules"`)
+        and passed on idle (`ring_pass="idle"`);
+      - one response and one credit per granule (`rsp="granule"`);
+      - the pace weighted by format and entry shape, with the cap (`pace="shape"`, `fmt` per DQ or `("fmt", ...)` per
+        transfer).
+      `test_isa.py` runs mixed split and non-split streams, one DQ or four, with greedy read-ahead, and random four-DQ
+      programs with cross-DQ semaphore waits and writes; they always complete. The shared-granule reading deadlocks with
+      four DQs, and the ring turn without its pass on idle deadlocks with a semaphore wait inside a turn. Phase 3 adds
+      `core/dma` formal properties: every allocated ring entry needs only tags to complete, no data read waits for the
+      scales of an entry other than its own, and the arbiter's P1-P3 (above).
     - Rejected: taking the raw slot at the unit's first data read (the text before W-1). Read-ahead fills the ring with
       scales whose data can never get a raw slot: the all-split fold stream below deadlocks at cycle 687 (`test_isa.py`).
     - Rejected: capping read-ahead so that the largest raw slot still fits. In a ring it deadlocks too, because a raw slot
@@ -397,7 +463,8 @@ isa.md §5) a cheap multiply at the ACC input.
       nothing there. A layout that cannot be padded is legal and converts at the ring-limited rate.
     - **Engram rows *(review finding Y-7; layout chosen by the user, 2026-11-01)*.** The table keeps its published separate
       scale array, so a row is one aligned 256 B granule plus an 8 B scale read: not split, one ring entry of 16 B. The
-      gather is tag-bound like the KV gather: about 0.27 rows/cycle per core at 500 cycles and 0.22 at 845. A DeepSeek
+      gather is tag-bound like the KV gather: about 0.33 rows/cycle per core at 500 cycles and 0.30 at 845, with its reads
+      paced in full as one-granule entries (X-14; 0.27 / 0.22 counted by format). A DeepSeek
       batch-256 decode step gathers 12,288 rows (24 per token in each of 2 layers); even if one die's 32 cores gather all
       of them, that takes about 1 µs, issued at the start of the step and hidden (hyper_connections.md G-1). A remote
       row's longer round trip lowers the rate in proportion, still hidden. Rows staged through the sibling arrive with

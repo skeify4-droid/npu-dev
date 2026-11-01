@@ -547,7 +547,7 @@ def test_staging_ring_tag_arbitration():
     - arb="hold" (the turn held for one request, the verifier's proposal): round-robin per request gives a 2 KiB read 8x
       the bytes of a one-granule read, so the KV gather starves instead (about 5 against 81).
     - arb="fair" (the rule): the winner keeps its turn until it has taken 8 credits, holding for credits and pace: credits
-      are shared evenly (KV about 28 + 3 B/cycle of scales, plain 56; two KV DQs and plain about 18 / 18 / 39).
+      are shared evenly (KV about 28 + 3 B/cycle of scales, plain 56; two KV DQs and plain about 19 / 19 / 40).
     - Ring space starves the same way: next to the KV gather's 32 B entries a weight stream's 256 B entries never fit
       (ring_turn=False: about 0). With the ring turn (DQs waiting to allocate take turns of 256 B of ring) both get about
       37."""
@@ -566,6 +566,147 @@ def test_staging_ring_tag_arbitration():
     wk = I.staging_ring([w, kv], **run)["bw_dq"]
     assert min(wk) >= 0.4 * 87, wk
     assert I.staging_ring([kv[:300], pl[:50], w[:60], kv[:300]], rt=300)["done"]           # four DQs, paced
+
+
+def test_staging_ring_pace_hold_and_formats():
+    """X-8: the issue turn is held for pace only against converting DQs. With DMA_PACE 16 KiB at L = 845 the pace binds;
+    held against every DQ (pace_hold="all", the text before X-8) a plain DQ gets one turn per paced request: NVFP4 weights
+    + plain 2 KiB reads about 17 / 17 B/cycle and KV gather + plain 17 / 34 (the fifth verifier's own model: 17 / 17 and
+    17 / 34). Under the rule the plain DQ issues while the holder waits for pace: about 10 / 76 and 11 / 75, as with
+    "greedy" (9 / 77, 11 / 75), and at the default DMA_PACE nothing changes (41 / 41, 28 / 56).
+    X-10: the ring turn is counted in data granules of the allocated entries (8, one data request), not in 256 B of ring,
+    which is one NVFP4 entry but four MXFP8 entries: NVFP4 + MXFP8 weights in two DQs share 17 / 66 under the byte
+    quantum and about 40 / 40 under the rule; with a plain DQ 9 / 38 / 38 against 28 / 28 / 28. KV, plain and NVFP4 mixes
+    are unchanged (test_staging_ring_tag_arbitration).
+    X-14: the reads of an entry whose data is one granule count their bytes in full; longer entries by format. A per-row
+    MXFP4 gather (16 B scale read + 256 B row) runs at about 110 elements/cycle at L = 845 by format and 154 by entry shape,
+    while MX weight streams keep the full rate to 1,200 cycles either way."""
+    pl, w, kv = [(0, 0, 8, 2048, 2048)] * 1500, _nvfp4_bf16(1500), [(32, 0, 1, 256, 512)] * 9000
+    tight = dict(hbm="server", inflight=16384, rt=845)
+    for rd, lo in ((w, 0.1), (kv, 0.1)):
+        held = I.staging_ring([rd, pl], pace_hold="all", **tight)["bw_dq"]
+        assert held[1] < 0.45 * 87, held                                    # plain throttled by the paced stream
+        rule = I.staging_ring([rd, pl], **tight)["bw_dq"]
+        greedy = I.staging_ring([rd, pl], arb="greedy", **tight)["bw_dq"]
+        assert rule[1] >= 0.85 * 87 and rule[0] >= lo * 87 and abs(rule[1] - greedy[1]) < 0.03 * 87, (rule, greedy)
+    run = dict(hbm="server", inflight=I.PACE_DEFAULT, rt=845)
+    for pair in ([w, pl], [kv, pl]):
+        assert I.staging_ring(pair, pace_hold="all", **run)["bw_dq"] == I.staging_ring(pair, **run)["bw_dq"]
+    m8, m4 = [(64, 0, 8, 2048, 2048)] * 1500, [(128, 0, 8, 2048, 4096)] * 1500
+    by_bytes = I.staging_ring([w, m8], fmt=["NVFP4", "MXFP8"], ring_q="bytes", **run)["bw_dq"]
+    assert by_bytes[0] < 0.25 * 87 and by_bytes[1] > 0.7 * 87, by_bytes
+    for pair, f in (([w, m8], ["NVFP4", "MXFP8"]), ([w, m4], ["NVFP4", "MXFP4"])):
+        r = I.staging_ring(pair, fmt=f, **run)["bw_dq"]
+        assert min(r) >= 0.42 * 87 and abs(r[0] - r[1]) < 0.05 * 87, (f, r)
+    three = I.staging_ring([w, m8, pl], fmt=["NVFP4", "MXFP8", None], **run)["bw_dq"]
+    assert min(three) >= 0.3 * 87, three
+    rows = [[(16, 0, 1, 256, 512)] * 9000]                                  # MXFP4 rows: 512 elements, 16 B of scales
+    need = 87 / (0.5 + 1 / 32)
+    fmt_rate = I.staging_ring(rows, fmt=["MXFP4"], pace="format", **run)["rate"]
+    shape_rate = I.staging_ring(rows, fmt=["MXFP4"], **run)["rate"]
+    assert fmt_rate < 0.75 * need and shape_rate > 0.9 * need, (fmt_rate, shape_rate)
+    for st, f, nd in ((m4, "MXFP4", need), (m8, "MXFP8", 87 / (1 + 1 / 32))):
+        assert I.staging_ring([st], fmt=[f], rt=1200, hbm="server", inflight=I.PACE_DEFAULT)["rate"] >= 0.99 * nd
+
+
+def test_staging_ring_writes_in_turns():
+    """X-11: a write packet (at most 256 B, no credit) counts one credit toward the 8-credit turn, and the turn is not
+    held for write burst ids, which acks free. Read literally ("until it has taken 8 granule credits"), a DQ that wins the
+    turn with a write keeps it until its writes run out: a 1 MiB SPM-to-SPM write (4,096 packets, a MoE dispatch) next to
+    a weight prefetch leaves the reader nothing while it runs (no common window) and delays it by about 4,096 cycles.
+    Under the rule the reader keeps about its rate alone (NVFP4 weights 73 of 77 B/cycle of data, plain reads 87) and the
+    writes take the rest of the issue slots."""
+    wr = [("write", 1 << 20)]
+    run = dict(hbm="server", inflight=I.PACE_DEFAULT, rt=845)
+    for rd in (_nvfp4_bf16(600), [(0, 0, 8, 2048, 2048)] * 600):
+        alone = I.staging_ring([rd], **run)
+        old = I.staging_ring([rd, wr], write_turn=False, **run)
+        assert old["bw_dq"] is None and old["cycle"] > alone["cycle"] + 3800, (old, alone["cycle"])
+        new = I.staging_ring([rd, wr], **run)
+        assert new["bw_dq"][0] >= 0.9 * 87 * rd[0][3] / (rd[0][3] + rd[0][0]), new["bw_dq"]
+        assert new["cycle"] < alone["cycle"] + 100 and new["bw_dq"][1] > 0.3 * 256
+    assert I.staging_ring([[(32, 0, 1, 256, 512)] * 2000, wr], **run)["done"]
+
+
+def test_staging_ring_bw_dq_window():
+    """X-15 (b): bw_dq is measured from the latest DQ's 5% mark to the earliest DQ's 95% mark of its own data. A DQ that
+    finishes before another one has started gives no common window (None), not a rate of 0 (the earlier 25-75% fallback
+    reported a plain DQ that ran as 0)."""
+    kv, pl = [(32, 0, 1, 256, 512)] * 9000, [(0, 0, 8, 2048, 2048)] * 60
+    run = dict(hbm="server", inflight=I.PACE_DEFAULT, rt=845)
+    assert I.staging_ring([kv, pl], **run)["bw_dq"] is None
+    both = I.staging_ring([kv[:3000], pl * 10], **run)["bw_dq"]
+    assert both is not None and min(both) > 0.2 * 87, both
+
+
+# Semaphore programs (review X-7): transfers of several DQs with cross-DQ SIGNAL / wait pairs and front-end gaps.
+def _sem_transfer(rng, kind, ring, base):
+    n = rng.randint(3, 16)
+    if kind == "fold":                            # contiguous MXFP4 fold tiles from byte 64: raw slots and scales
+        return [("fmt", "MXFP4")] + _fold_contig(ring, n=n // 4 + 1, base=base)
+    return {"nvfp4": [("fmt", "NVFP4")] + _nvfp4_bf16(n), "mxfp8": [("fmt", "MXFP8")] + [(64, 0, 8, 2048, 2048)] * n,
+            "kv": [("fmt", "NVFP4")] + [(32, 0, 1, 256, 512)] * (4 * n),
+            "engram": [("fmt", "MXFP8")] + [(8, 0, 1, 256, 256)] * (2 * n),
+            "inline": [("fmt", "MXFP8")] + _engram(n), "plain": [(0, 0, 8, 2048, 2048)] * n,
+            "write": [("write", 256 * 4 * n)]}[kind]
+
+
+def _sem_program(rng, ring, ndq=4):
+    """Transfers in one global order, each in a random DQ, each followed by a SIGNAL; a wait names the SIGNAL of an
+    earlier transfer of another DQ, so the program cannot deadlock by itself."""
+    ntr = sum(rng.randint(1, 4) for _ in range(ndq))
+    dq_of = [rng.randrange(ndq) for _ in range(ntr)]
+    streams = [[] for _ in range(ndq)]
+    for k, d in enumerate(dq_of):
+        if rng.random() < 0.15:
+            streams[d].append(("gap", rng.randint(1, 2000)))
+        prev = [j for j in range(k) if dq_of[j] != d]
+        if prev and rng.random() < 0.6:
+            streams[d].append(("wait", rng.choice(prev), 1))
+        kind = rng.choice(("nvfp4", "mxfp8", "kv", "engram", "inline", "fold", "plain", "write"))
+        streams[d] += _sem_transfer(rng, kind, ring, (d << 30) + (k << 24))
+        streams[d].append(("signal", k, 1))
+    return streams
+
+
+def test_staging_ring_ring_turn_passes_when_idle():
+    """X-7: the ring turn passes whenever its holder cannot start an entry for a reason other than ring space, credits,
+    pace or the issue turn: its stream has ended, a semaphore wait, SIGNAL or gap is at its head, or its next read is
+    plain or a write. Under the text before X-7 (the turn kept until its 256 B quantum, ring_pass="quantum") and under the
+    reference's end-of-stream pass ("end") a DQ that waits on a semaphore inside its turn deadlocks the ring: 2 KiB ring,
+    DQ0 streams NVFP4 weights, DQ1 gathers 37 KV rows, waits on F, then gathers 37 more, DQ2 gathers 200 KV rows and sets F
+    once they complete. DQ1 takes the turn, allocates 160 B and waits; DQ0 and DQ2 queue behind it. Nothing moves after
+    cycle 3,649 at L = 500 (the fifth verifier's own model: 3,628), at 300 / 500 / 845 with 2 and 4 KiB rings. The turn is
+    taken only when a DQ waits for the ring (ring_take="contended"), so at 16 KiB nothing queues and the end-of-stream pass
+    completes; the quantum rule still hangs there once the weight stream ends inside a turn. Random four-DQ programs with
+    cross-DQ waits (each deadlock-free by itself) deadlock under both old rules and never under the rule."""
+    kv1 = (32, 0, 1, 256, 512)
+    prog = [_nvfp4_bf16(400), [kv1] * 37 + [("wait", "F", 1)] + [kv1] * 37, [kv1] * 200 + [("signal", "F", 1)]]
+    srv = dict(hbm="server", inflight=I.PACE_DEFAULT)
+    r = I.staging_ring(prog, ring=2048, rt=500, ring_pass="end", **srv)
+    assert not r["done"] and abs(r["deadlock"] - 3628) < 0.02 * 3628, r
+    for ring in (2048, 4096):
+        for rt in (300, 500, 845):
+            for rp in ("quantum", "end"):
+                assert not I.staging_ring(prog, ring=ring, rt=rt, ring_pass=rp, **srv)["done"], (ring, rt, rp)
+            ok = I.staging_ring(prog, ring=ring, rt=rt, **srv)
+            assert ok["done"] and ok["sems"]["F"] == 1, (ring, rt)
+    assert I.staging_ring(prog, ring=16384, rt=500, ring_pass="end", **srv)["done"]
+    assert not I.staging_ring(prog, ring=16384, rt=500, ring_pass="quantum", **srv)["done"]
+    ends = [_nvfp4_bf16(400), [kv1] * 5]          # no semaphore: the KV DQ queues, takes the turn and its stream ends at 160 B
+    assert not I.staging_ring(ends, ring=2048, ring_pass="quantum")["done"]
+    assert I.staging_ring(ends, ring=2048, ring_pass="end")["done"] and I.staging_ring(ends, ring=2048)["done"]
+    rng = random.Random(7)
+    hangs = {"quantum": 0, "end": 0, "idle": 0}
+    for _ in range(24):
+        ring = rng.choice((2048, 4096, 8192, 16384))
+        kw = dict(ring=ring, rt=rng.choice((50, 300, 845)), tags=rng.choice((8, 16, 512)), sizing="quarter")
+        if rng.random() < 0.5:
+            kw.update(hbm="server", inflight=rng.choice((None, 1024, I.PACE_DEFAULT)))
+        prog = _sem_program(rng, ring)
+        for rp in hangs:
+            hangs[rp] += not I.staging_ring(prog, ring_pass=rp, **kw)["done"]
+    assert hangs["idle"] == 0 and hangs["end"] > 0 and hangs["quantum"] > hangs["end"], hangs
 
 
 def test_staging_ring_pace_below_one_request():
@@ -743,8 +884,8 @@ def test_engram_separate_array_gather(isa):
     is: 256 B rows and a separate scale array of 8 B rows (s1 = 256, aux0 = 8), so no load-time repack. A gather row is one
     aligned granule plus an 8 B scale read (one 32 B burst): 288 B of HBM per row, 13.8 KB per token for 48 rows (two
     layers x 24), the same bytes as 264 B inline rows at 8 B-aligned offsets (9 bursts). The rows are not split, so they
-    are not staged raw, and the gather runs at more than twice the inline rate (about 0.27 against 0.12 rows/cycle at L =
-    500)."""
+    are not staged raw, and the gather runs at more than twice the inline rate (about 0.33 against 0.12 rows/cycle at L =
+    500; its one-granule entries are paced in full, X-14)."""
     td = _td(isa, dtype="MXFP8", space="GLOBAL", n0=256, n1=1, s1=256, aux0=8, row_bytes=256)
     table, scales = 0x40_0000_0000, 0x50_0000_0000
     for idx in (0, 1, 12345, (1 << 20) + 3):
