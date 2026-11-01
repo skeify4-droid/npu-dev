@@ -361,3 +361,166 @@ def test_paged_scale_uses_whole_in_row_offset(isa):
         I.paged_addr(isa, bad, ptr, frames, 0, 0, 1)
     with pytest.raises(I.IsaError):                                                         # dims leave the 256 B row
         I.paged_addr(isa, dict(td, n2=5), ptr, frames, 0, 0, 4)
+
+
+# ---------------------------------------------------------------- DMA staging ring (microarch.md section 2.5, review W-1)
+# Entries for isa.staging_ring: (scale bytes, raw bytes, data responses, data bytes, elements).
+def _nvfp4_bf16(n):           # 2 KiB NVFP4 data reads, 256 B of scales each, every granule converted from its response
+    return [(256, 0, 8, 2048, 4096)] * n
+
+
+def _fold_split(n, tiles=16):  # MXFP4 -> E4M3 fold with every 128 B tile across a granule: 8 B scales + 128 B raw per tile
+    return [(8 * tiles, 128 * tiles, tiles // 2 + 1, 128 * tiles, 256 * tiles)] * n
+
+
+def _engram(n):               # MXFP8 rows with inline scales (264 B): no scale read, two granules, staged raw
+    return [(0, 264, 2, 264, 256)] * n
+
+
+def _mixed(n):
+    return [e for a, b in zip(_nvfp4_bf16(n), _fold_split(n)) for e in (a, b)]
+
+
+RING_STREAMS = {
+    "fold_split": [_fold_split(150)],
+    "mixed_one_dq": [_mixed(150)],
+    "mixed_four_dqs": [_nvfp4_bf16(200), _fold_split(80), _mixed(60), _engram(300)],
+}
+
+
+@pytest.mark.parametrize("name", sorted(RING_STREAMS))
+def test_staging_ring_atomic_rule_never_deadlocks(name):
+    """W-1: with a unit's scales and raw slot taken together at scale-read issue, greedy scale read-ahead over a mixed
+    split / non-split stream always completes, at several ring sizes and round trips, in one DQ or shared by four."""
+    for ring in (4096, 16384):
+        for rt in (100, 500, 1000):
+            r = I.staging_ring(RING_STREAMS[name], ring=ring, rt=rt)
+            assert r["done"] and r["deadlock"] is None and r["peak"] <= ring, (ring, rt, r)
+    with pytest.raises(ValueError):                                          # an entry the ring can never hold
+        I.staging_ring([_fold_split(2, tiles=32)], ring=4096)
+
+
+def test_staging_ring_atomic_rule_random_streams():
+    """W-1: random mixes of entry kinds and sizes (each fits the ring), 1-4 DQs, 4-16 KiB rings: never a deadlock."""
+    rng = random.Random(11)
+    for _ in range(25):
+        streams = []
+        for _ in range(rng.randint(1, 4)):
+            s = []
+            for _ in range(rng.randint(5, 60)):
+                tiles = rng.choice((1, 2, 4, 8, 16))
+                s.append(rng.choice((_nvfp4_bf16(1)[0], _fold_split(1, tiles)[0], _engram(1)[0], (32, 0, 1, 256, 512))))
+            streams.append(s)
+        ring = rng.choice((4096, 8192, 16384))
+        r = I.staging_ring(streams, ring=ring, rt=rng.choice((50, 300, 800)))
+        assert r["done"], r
+
+
+@pytest.mark.parametrize("rule", ["split", "capped"])
+@pytest.mark.parametrize("name", ["fold_split", "mixed_one_dq", "mixed_four_dqs"])
+def test_staging_ring_rejected_rules_deadlock(rule, name):
+    """W-1: the text before the fix ('split': raw slot taken at data-read issue) fills the ring with scales whose data can
+    never be issued (the verifier's probe: deadlock at cycle 687 for the all-split fold). Capping the read-ahead so that
+    the largest raw slot still fits ('capped') also deadlocks in a ring, because a freed raw slot behind newer scale
+    entries is reclaimed only in allocation order."""
+    r = I.staging_ring(RING_STREAMS[name], rule=rule)
+    assert not r["done"] and r["deadlock"] is not None
+    if rule == "split" and name == "fold_split":
+        assert r["deadlock"] == 687
+
+
+def test_staging_ring_sizing():
+    """W-1: 16 KiB is sized for scales. NVFP4 -> BF16 runs at the HBM share's rate (87 B/cycle: 87 / (1/2 + 1/16) =
+    155 elements/cycle) up to a round trip of about 845 cycles; 8 KiB does not. When every fold tile is split the ring,
+    not HBM, sets the rate (about 28 elements/cycle), which is why the compiler keeps fold tiles inside a granule."""
+    share_rate = 87 / (0.5 + 1 / 16)
+    for rt in (500, 845):
+        assert I.staging_ring([_nvfp4_bf16(1200)], rt=rt)["rate"] >= 0.98 * share_rate
+    assert I.staging_ring([_nvfp4_bf16(1200)], ring=8192, rt=845)["rate"] < 0.6 * share_rate
+    split = I.staging_ring([_fold_split(150)])["rate"]
+    assert 20 < split < 40
+    eng = I.staging_ring([_engram(1500)])["rate"] / 256                        # Engram rows per cycle
+    assert 0.10 < eng < 0.15
+
+
+# ---------------------------------------------------------------- non-paged block operands (memmap.md section 6, review W-5)
+def test_block_addr_requires_block_aligned_base(isa):
+    """W-5: an NVFP4 weight slice that starts at element 16 of a row (block 1) gets block 1's scales for every element,
+    from scale_reg = the scale of the base element's block. A slice that starts at element 8 faults ILLEGAL_FIELD: before,
+    its element 8 (row element 16, block 1) was converted with block 0's scale."""
+    K = 4096                                    # elements per row: 2,048 B of data, 256 B of scales
+    td = _td(isa, dtype="NVFP4", space="GLOBAL", n0=256, n1=4, s1=K // 2, aux0=K // 16)
+    w, sc = 0x2000_0000, 0x3000_0000            # the tensor's data and its scale array
+    for first in (16, 512):                     # slice start, in elements
+        for i1 in range(4):
+            for i0 in range(256):
+                d, s = I.block_addr(isa, td, w + first // 2, sc + first // 16, i0, i1)
+                e = first + i0                  # element index in the full row
+                assert d == w + i1 * K // 2 + e // 2
+                assert s == sc + i1 * K // 16 + e // 16
+    with pytest.raises(I.IsaError):
+        I.block_addr(isa, td, w + 8 // 2, sc, 0, 0)                            # element 8: inside block 0
+    with pytest.raises(I.IsaError):
+        I.block_addr(isa, dict(td, s1=K // 2 + 4), w, sc, 0, 1)                # a row pitch that is not whole blocks
+    bf = _td(isa, dtype="BF16", space="GLOBAL", n0=8, n1=1, s1=6)
+    assert I.block_addr(isa, bf, 0x100 + 2, 0, 3, 0) == (0x100 + 2 + 6, None)  # no block format, no rule
+
+
+# ---------------------------------------------------------------- batched append and page bounds (memmap.md section 6, W-4)
+def test_paged_scatter_append(isa):
+    """W-4 (b): a batch-decode append of the DeepSeek MXFP4 index key is one DMA_SCATTER per TD. The data scatter has one
+    index per sequence (64 B rows). The scale scatter needs 32 / aux0 = 8 consecutive indices per sequence, from the
+    block's first row, so each sequence's block is one aligned 32 B packet; one index per sequence gives 4 B packets
+    (HBM_ALIGN)."""
+    a = APPENDS["deepseek_index_key"]
+    common = dict(space="GLOBAL", s1=a["s1"], aux0=a["aux0"], page_shift=a["page_shift"], sc_off=a["sc_off"])
+    td_data = _td(isa, dtype="UINT8", flags=("PAGED",), n0=64, n1=1, row_bytes=64, **common)
+    td_sc = _td(isa, dtype="UINT8", flags=("PAGED", "SCALE_REGION"), n0=4, n1=1, row_bytes=4, **common)
+    ptr = I.unpack(isa, "paged_ptr", I.pack(isa, "paged_ptr", node=0x7F, row=0, byte=0))
+    rows = 1 << a["page_shift"]
+    # four sequences, each with its own pages (logical rows seq * 64K + t), token positions anywhere in a block
+    seqs = [(0, 6027), (1, 300), (2, 1023), (3, 8)]
+    frames = {}
+    for s, t in seqs:
+        frames[((s << 16) + t) >> a["page_shift"]] = 0x100000 + 17 * s
+    logical = [(s << 16) + t for s, t in seqs]
+
+    def scatter(td, idx):
+        runs = [(I.paged_addr(isa, td, ptr, frames, r, i0)[0], 1) for r in idx for i0 in range(td["n0"])]
+        return I.write_packets(runs)
+
+    data = scatter(td_data, logical)
+    assert len(data) == 4 and all(x % 32 == 0 and n == 64 for x, n in data)
+    per_blk = 32 // a["aux0"]
+    blocks = [r - r % per_blk + j for r in logical for j in range(per_blk)]
+    sc = scatter(td_sc, blocks)
+    assert len(sc) == 4 and all(x % 32 == 0 and n == 32 for x, n in sc)
+    for (s, t), (x, _) in zip(seqs, sc):
+        q = t & (rows - 1)
+        assert x == (0x100000 + 17 * s) * 4096 + a["sc_off"] * 256 + (q - q % per_blk) * a["aux0"]
+    one = scatter(td_sc, logical)                                            # one index per sequence: the W-4 failure
+    assert all(n == 4 for _, n in one)
+
+
+def test_paged_scale_rows_tile_whole_blocks(isa):
+    """W-4 (c): a page's scale rows must tile whole aligned 32 B blocks (aux0 divides 32 or is a multiple of it, and
+    rows per page >= 32 / aux0), else ILLEGAL_FIELD. With page_shift 2 and 4 B rows every block would span two pages
+    and be two 16 B writes."""
+    ptr = I.unpack(isa, "paged_ptr", I.pack(isa, "paged_ptr", node=0, row=0, byte=0))
+    frames = {i: 0x200 + i for i in range(64)}
+    base = dict(space="GLOBAL", s1=64, n0=4, n1=1, sc_off=1)
+    for aux0, ps, ok in ((4, 3, True), (4, 2, False), (8, 2, True), (8, 1, False), (32, 0, True), (64, 0, True),
+                         (12, 4, False), (0, 4, False)):
+        td = _td(isa, dtype="UINT8", flags=("PAGED", "SCALE_REGION"), aux0=aux0, page_shift=ps, **base)
+        if ok:
+            I.paged_addr(isa, td, ptr, frames, 1)
+        else:
+            with pytest.raises(I.IsaError):
+                I.paged_addr(isa, td, ptr, frames, 1)
+    # the same bound for a block-format read of the page, and its row pitch in whole blocks (W-5)
+    td = _td(isa, dtype="MXFP4", flags=("PAGED",), aux0=4, page_shift=2, **dict(base, n0=128))
+    with pytest.raises(I.IsaError):
+        I.paged_addr(isa, td, ptr, frames, 1)
+    td = _td(isa, dtype="MXFP4", flags=("PAGED",), aux0=4, page_shift=3, **dict(base, n0=128, s1=72))
+    with pytest.raises(I.IsaError):
+        I.paged_addr(isa, td, ptr, frames, 1)

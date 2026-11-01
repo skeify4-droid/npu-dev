@@ -153,8 +153,9 @@ isa.md §5) a cheap multiply at the ACC input.
     address-generator state of its started transfers.
   - Shared resources are the tag table, the staging ring (below), the SPM ports and NI injection. They are taken per read or
     write packet, round-robin over the DQs that have a packet ready, and only after the head's wait is satisfied.
-  - So a DQ whose head waits on a semaphore holds nothing another DQ needs. A started transfer holds its tags and ring slots
-    only until its responses sink, which never waits on another DQ. d2d_c2c.md L-7 issue rule 2 relies on this.
+  - So a DQ whose head waits on a semaphore holds nothing another DQ needs. A started transfer holds its tags until its
+    responses sink, and its ring space until its data has been converted (review finding W-6). Neither waits on another DQ:
+    every ring entry, once allocated, needs only tags to complete (below). d2d_c2c.md L-7 issue rule 2 relies on this.
 - It keeps up to 512 read granules (256 B) in flight, 128 KiB. That is about 2x the core's HBM share (102 B/cycle) times a typical
   500-cycle loaded round trip.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
@@ -174,16 +175,51 @@ isa.md §5) a cheap multiply at the ACC input.
   - **Scales first.** Out-of-line block scales (the `scale_reg` array, or the page's scale region) are read into the staging ring
     before the data that uses them. A data read is issued only after the scales of all its granules are in the ring. Scale
     responses are plain SPM writes. The DMA reads scales a round trip ahead, so the rate is unchanged; the first data of a
-    transfer starts one round trip later.
-  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a staging slot when its
-    reads are issued: an inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row), or a fold tile that is not inside one 256 B
-    granule (a 4-bit weight row whose length is not a multiple of 128 B). Its responses are written there raw, and the converter
-    takes the unit from SPM once it is complete. These units are rare, and their raw bytes add to the DMA's SPM write and read
-    traffic.
+    transfer starts one round trip later (the second verifier's estimate: about 0.33 µs per dependent converting transfer,
+    at most about 2% of a batch-1 DeepSeek or MiniMax decode step).
+  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: an
+    inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row), or a fold tile that is not inside one 256 B granule (a fold
+    weight row that is not a whole number of 256-element tiles, or a K slice that does not start on one). Its responses are
+    written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add to the DMA's SPM write
+    and read traffic.
   - **Staging ring:** an SPM region given by CSR `DMA_STAGE` (base and size), reserved by the runtime and shared by the four DQs.
-    Space is allocated when a read is issued and freed when its data has been converted. 16 KiB holds 1,000 cycles of scales at the
-    converter's NVFP4 rate (16 B/cycle), two loaded round trips. A smaller ring only lowers the rate. Size 0 makes block-format
-    conversion fault (`ILLEGAL_FIELD`).
+    Size 0 makes block-format conversion fault (`ILLEGAL_FIELD`).
+  - **Ring allocation *(review finding W-1)*.** The ring is allocated in **entries**. An entry is one scale read and the data
+    reads its scales cover; the DMA sizes a scale read on unit boundaries, so every split unit lies in one entry.
+    - **An entry's scales and the raw slots of all its split units are one allocation, taken when its scale read is issued**
+      (when its first data read is issued if it has no scale read, as for an inline-scaled row). Its data reads then need only
+      tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the oldest one
+      frees its space, and the ring always drains.
+    - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
+      beginning), at most a quarter of the ring (the DMA shortens the scale read), and freed when all its data has been
+      converted. Space comes back in allocation order.
+    - Scale reads run ahead as far as the ring allows, and go before data reads when their space can be taken. That is
+      what keeps a converting stream at the HBM rate.
+    - Reference: `isa.staging_ring`, a cycle model of the rule. `test_isa.py` runs mixed split and non-split streams, one DQ
+      or four, with greedy read-ahead, and they always complete. Phase 3 adds a `core/dma` formal property: every allocated
+      ring entry needs only tags to complete.
+    - Rejected: taking the raw slot at the unit's first data read (the text before W-1). Read-ahead fills the ring with
+      scales whose data can never get a raw slot: the all-split fold stream below deadlocks at cycle 687 (`test_isa.py`).
+    - Rejected: capping read-ahead so that the largest raw slot still fits. In a ring it deadlocks too, because a raw slot
+      freed behind newer scale entries is reclaimed only in allocation order. It works only with a free-list allocator, and
+      even then it carries 16.5 elements/cycle on the all-split fold stream against 27.6 for the atomic rule (one probe,
+      not committed).
+  - **What 16 KiB is sized for: scales.** A non-split unit's scales live from their read to the data's conversion, about two
+    round trips. 16 KiB holds 1,024 cycles of NVFP4 scales at the converter's rate (16 B/cycle). At the HBM share (87 B/cycle,
+    155 elements/cycle of NVFP4 → BF16) it keeps the full rate up to a round trip of about 845 cycles (`isa.staging_ring`:
+    154.7 at 500, 152.9 at 845, 127 at 1,000), and 8 KiB does not (76 at 845). A smaller ring only lowers the rate.
+    - Split units hold about 17 times more space per element (a 128 B MXFP4 tile and its 8 B of scales). If every fold tile
+      of a stream were split, the ring would carry about 28 elements/cycle, against a need of about 164.
+    - **So the compiler never splits fold tiles:** it pads the HBM row pitch of fold-converted weights to a whole number of
+      256-element tiles (128 B at 4 bits, 256 B for MXFP8), places them on a 256 B boundary, and cuts K slices on tile
+      boundaries. Padding is in the pitch only; the TD's n0 still covers the real K, and the last tile of a row is short but
+      inside one granule. Every surveyed model already has K a multiple of 256 (expert K 2,048-6,144 and 2,304), so it costs
+      nothing there. A layout that cannot be padded is legal and converts at the ring-limited rate.
+    - Inline-scaled rows stay split, because a 264 B Engram row always spans two granules. The ring carries about 62 of them
+      per round trip, 0.12 rows/cycle per core at 500 cycles. A DeepSeek batch-256 decode step gathers 12,288 rows (24 per
+      token in each of 2 layers); even if one die's 32 cores gather all of them, that takes about 2 µs, issued at the start
+      of the step and hidden (hyper_connections.md G-1). A remote row's longer round trip lowers the rate in proportion,
+      still hidden. Rows staged through the sibling arrive unconverted and convert SPM to SPM, with a short round trip.
   - Ready therefore depends only on the converter and the local SPM ports, which drain at a fixed rate without waiting for the
     network. A response is still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.
   - Not taken: choosing the fold's power of two from the block scales alone. That would make every granule convertible on its

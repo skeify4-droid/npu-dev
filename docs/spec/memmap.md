@@ -161,13 +161,25 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     groups of a row converted every group with group 0's scales.
     - `block_bytes` is a block's size in the row: 8 B (NVFP4), 16 B (MXFP4), 32 B (MXFP8). Every scale is one byte (`isa.yaml`
       `dtype_info`).
-    - `byte`, `s2` and `s3` must be multiples of `block_bytes` (`ILLEGAL_FIELD` otherwise), so every dim-0 run starts on a block.
+    - `byte`, `s1`, `s2` and `s3` must be multiples of `block_bytes` (`ILLEGAL_FIELD` otherwise), so every dim-0 run starts on a
+      block (`s1` added by review finding W-5).
+    - **The scale rows of a page tile whole aligned 32 B blocks** *(review finding W-4 c)*: `aux0` divides 32 or is a multiple
+      of it, and a page has at least 32 / `aux0` rows (`page_shift` ≥ log2(32 / `aux0`)). Otherwise `ILLEGAL_FIELD`, for every
+      PAGED TD of a block format or with `SCALE_REGION`. A tail block (§8) therefore never spans two pages: with
+      `page_shift` 2 and 4 B rows, every block would be two 16 B writes and fault `HBM_ALIGN`.
   - A TD with `SCALE_REGION` addresses the scale rows themselves: `frame * 4 KiB + sc_off * 256 + q * aux0 + byte + i0 + i2 * s2 +
     i3 * s3`, inside `aux0`. Its dtype is `UINT8`. The KV write path uses it: the data rows and the scale rows of a new token are
     two transfers, and `cvt = NONE` never moves scales on its own.
   - Non-paged block-format operands (weights) keep the published separate scale array `[rows, K / block]`, row stride `aux0`.
     `R[scale_reg]` points at the scale of the base element's block. The scale of element (i0, i1, i2, i3) is at
     `R[scale_reg] + i1 * aux0 + floor(o / block_bytes)`, with `o = i0 * esize + i2 * s2 + i3 * s3`.
+    - **The base element starts a block** *(review finding W-5)*: the base address, `s1`, `s2` and `s3` are multiples of
+      `block_bytes` (`ILLEGAL_FIELD` otherwise). `o` has no in-block part, so without the rule an NVFP4 slice that starts at
+      element 8 of a row would convert its element 8 (row element 16, block 1) with block 0's scale, silently. A weight
+      slice therefore starts on a block, and a fold-converted slice on a 256-element tile (microarch.md §2.5).
+    - Rejected: adding the base's in-block offset to `o`. It would make the formula general, but a dim-0 run that starts
+      inside a block can also split a conversion unit across granules, and no layout needs it.
+    - Reference: `isa.block_addr`, tested in `test_isa.py` (`test_block_addr_requires_block_aligned_base`).
 - **Writing scale rows *(review finding V-5)*.** A DMA write packet holds contiguous destination bytes. Adjacent runs merge,
   including consecutive rows of one page, up to a 256 B granule boundary, and `HBM_ALIGN` is checked per packet (microarch.md
   §2.5). So a `SCALE_REGION` TD with n1 = 32 / `aux0` rows, starting at a row that is a multiple of that count, writes one aligned
@@ -202,6 +214,15 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
   `aux_reg` and `ts_reg` are R0, because `cvt = NONE` moves no scales.
 - Completion: S9 reaches its base + 2 once both writes are acknowledged. A reader on another core waits for a `SIGNAL` sent after
   them (L-6).
+- **Batched append *(review finding W-4 b)*.** A batch-decode step appends one token to each of B sequences, as one `DMA_SCATTER`
+  per TD. The index list holds logical rows (each sequence's rows are a range of the layer's page table).
+  - The data scatter has one index per sequence (a 64 B or 256 B row each).
+  - The scale scatter has **32 / `aux0` consecutive indices per sequence**, from the first row of the sequence's current block,
+    and its SPM source is the B block copies, 32 B each. Each block is then one aligned 32 B packet (merged rows of one page).
+    One index per sequence would give B packets of `aux0` bytes, which fault `HBM_ALIGN`. With `aux0` = 32 (MiniMax KV) the
+    two forms are the same.
+  - DeepSeek index key, B = 4 (`test_isa.py` `test_paged_scatter_append`): four 64 B data packets, and four 32 B scale packets
+    from 32 indices.
 - The DeepSeek block's later rows are written as their tokens arrive (tail-block rewrite, §8). Each rewrite merges with any queued
   write to the same granule (hbm.md H-2). MiniMax's own NVFP4 index key (64 B + 8 B per token) is the same case with 4 rows per
   block.

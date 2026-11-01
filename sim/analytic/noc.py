@@ -233,7 +233,7 @@ def endpoints(packages=2, dies=2):
 
 
 def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, multicast=True, hbm_forwards=False,
-              dma_forwards=False, link_vn=True, scales_after_data=False):
+              dma_forwards=False, link_vn=True, scales_after_data=False, scales_first=True):
     """Channel dependency graph of the whole system: REQ and RSP routes for every allowed endpoint pair,
     protocol edges (a request is consumed only by emitting its response), and XY-tree multicasts.
 
@@ -245,7 +245,12 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
     arrival order, so a blocked REQ holds the RSP behind it.
     scales_after_data=True is the converter rule before review finding V-1: a block-format data response cannot be
     converted (so cannot eject) until its scale response arrives, and the scale is another response that may be anywhere
-    on a response route into the same core, also behind the data in the same channel."""
+    on a response route into the same core, also behind the data in the same channel.
+    scales_first=True (the rule, review findings V-1, W-1) adds the DMA's own wait: a core's data read is issued only after
+    its scale response has sunk into the staging ring. As a channel edge that is every request channel out of the core
+    waiting on every response channel into it, an over-approximation (the waiting read is still inside the DMA). It must
+    stay acyclic: responses never wait on requests. The ring allocation itself (W-1) is below channel level; its
+    reference is isa.staging_ring."""
     g = defaultdict(set)
     eps = endpoints(packages)
     cores = [e for e in eps if not is_leaf(e[2])]
@@ -275,6 +280,10 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
                 g[r[-1]].update(r)
             rsp_in[s].add(r[-1])
             req_out[s].add(q[0])
+    if scales_first:                      # V-1 / W-1: a data read waits for its scales to sink in the same core
+        for s in cores:
+            for a in req_out[s]:
+                g[a].update(rsp_in[s])
     if dma_forwards:                      # rejected (I-1): read data leaves the core again as a write before it can sink
         for s in cores:
             for a in rsp_in[s]:
@@ -381,7 +390,7 @@ if __name__ == "__main__":
     for k, (u, link) in scenarios().items():
         print(f"{k:24s} max link utilization {u:5.2f}  at {link}")
     print(f"D2D max {d2d_max_bpc():.0f} B/cycle = {d2d_max_bpc() * CLOCK / 1e12:.2f} TB/s per direction")
-    for kw in [dict(), dict(packages=4), dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
+    for kw in [dict(), dict(packages=4), dict(scales_first=False), dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
                dict(hbm_forwards=True), dict(dma_forwards=True), dict(link_vn=False), dict(scales_after_data=True)]:
         g = build_cdg(**kw)
         c = find_cycle(g)

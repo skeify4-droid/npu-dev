@@ -90,3 +90,14 @@ def test_ack_coalescing_without_trigger_hangs():
     arr, totals = _bursts(random.Random(3), n_src=2, bursts_per_src=2, spread=500)
     acks, left = N.ack_coalescer(arr, table=8, flush=None, use_blen=False)
     assert not acks and set(left) == set(totals)
+
+
+def test_scales_first_edge_stays_acyclic():
+    """Review W-1: the DMA's own scales-first wait (a core's data read waits for its scale response to sink) is in the
+    baseline as request-out -> response-in edges of every core. It adds edges and stays acyclic, because no response
+    waits on a request (the rejected I-1 forward is the case where one does)."""
+    g0 = N.build_cdg(scales_first=False)
+    g1 = N.build_cdg()
+    assert sum(map(len, g1.values())) > sum(map(len, g0.values()))
+    assert N.find_cycle(g1) is None
+    assert any(a[3] == "REQ" and b[3] == "RSP" for a, bs in g1.items() for b in bs if b not in g0.get(a, ()))

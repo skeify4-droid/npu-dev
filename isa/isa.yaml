@@ -181,7 +181,7 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
-    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1): [21:0] base, [53:32] bytes (both 64 B aligned); 0 bytes: block-format conversion faults ILLEGAL_FIELD
+    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1): [21:0] base, [53:32] bytes (both 64 B aligned); 0 bytes: block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its scale read (isa.staging_ring)
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
@@ -249,7 +249,7 @@ td:
     aux0:  [207, 176]   # block formats: scale row stride in bytes; VSOFTMAX softcap: c (FP32)
     row_bytes: [231, 208]   # gather/scatter: row size in bytes (any size, no alignment needed)
     sc_off: [243, 232]  # PAGED block formats: offset of the page's scale region, in 256 B units (memmap.md section 6)
-    page_shift: [248, 244]  # PAGED: log2(rows per page)
+    page_shift: [248, 244]  # PAGED: log2(rows per page); block formats and SCALE_REGION: >= log2(32 / aux0), aux0 divides 32 or is a multiple of it (ILLEGAL_FIELD, review W-4)
     rsv:   [255, 249]
 
 # DMA_LIST entry, 32 B in SPM (isa.md section 5). `op` selects the layout. Addresses are absolute (GPA, or an SPM offset for an
@@ -470,11 +470,12 @@ instructions:
       Block formats: scales of a non-paged operand are at R[scale_reg] (the scale of the base element's block) with row
       stride TD aux0; a PAGED operand's scales are in the scale region of the same page. Either way the scale of an
       element is found from its row (dim 1) and its whole in-row offset (dims 0, 2, 3 and the paged pointer's byte;
-      byte, s2 and s3 must be multiples of the block's bytes, else ILLEGAL_FIELD; memmap.md section 6). cvt = NONE
+      the non-paged base or the byte, s1, s2 and s3 must be multiples of the block's bytes, else ILLEGAL_FIELD;
+      memmap.md section 6, isa.block_addr and isa.paged_addr). cvt = NONE
       moves only the bytes the TDs address, never the scales; a SCALE_REGION TD addresses the scale rows.
       Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, and a conversion
-      unit split over several responses is staged raw there, so every response sinks without waiting for another
-      (microarch.md section 2.5). ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
+      unit split over several responses is staged raw there, its slot taken with its scales at the scale read, so
+      every response sinks without waiting for another and every ring entry completes (microarch.md section 2.5). ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
       Write packets hold contiguous destination bytes: adjacent runs, also consecutive paged rows of one page, are
       merged up to a 256 B granule boundary, and HBM_ALIGN is checked per packet.
       FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
@@ -497,7 +498,8 @@ instructions:
     queue: DQ
     desc: >-
       Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into
-      SRAM). Operand spaces as DMA_COPY; PAGED dst as DMA_GATHER's src.
+      SRAM). Operand spaces as DMA_COPY; PAGED dst as DMA_GATHER's src. Write packets merge as for DMA_COPY, so a
+      batched append of scale rows lists 32 / aux0 consecutive indices per sequence (memmap.md section 6).
   DMA_MCAST:
     op: 0x43
     fmt: T_DMAMC
