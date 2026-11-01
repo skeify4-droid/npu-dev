@@ -177,7 +177,14 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     - **The base element starts a block** *(review finding W-5)*: the base address, `s1`, `s2` and `s3` are multiples of
       `block_bytes` (`ILLEGAL_FIELD` otherwise). `o` has no in-block part, so without the rule an NVFP4 slice that starts at
       element 8 of a row would convert its element 8 (row element 16, block 1) with block 0's scale, silently. A weight
-      slice therefore starts on a block, and a fold-converted slice on a 256-element tile (microarch.md §2.5).
+      slice therefore starts on a block.
+    - **A fold-converted operand starts on a tile** *(review finding U-1; the user's choice, 2026-11-02)*. Under `cvt`
+      `MXFP4_E4M3`, `NVFP4_E4M3` or `MXFP8_E4M3`, paged or not, the base (or the paged pointer's `byte`), `s1`, `s2` and
+      `s3` are multiples of a 256-element tile's bytes (128 B at 4 bits, 256 B for MXFP8), and n0 is a multiple of 256 when
+      n2 or n3 > 1 (`ILLEGAL_FIELD` otherwise). So every fold tile, a row's short last tile included, lies in one 256 B
+      granule, and a K slice starts on a tile. v1 has no raw slots for a tile split across granules (microarch.md §2.5);
+      before U-1 this sentence read as a rule here while microarch.md listed such slices as legal. Reference:
+      `isa.cvt_source_check`.
     - Rejected: adding the base's in-block offset to `o`. It would make the formula general, but a dim-0 run that starts
       inside a block can also split a conversion unit across granules, and no layout needs it.
     - Reference: `isa.block_addr`, tested in `test_isa.py` (`test_block_addr_requires_block_aligned_base`).

@@ -379,6 +379,45 @@ def block_addr(isa, td, base, scale, i0=0, i1=0, i2=0, i3=0, gather=False, v1=Tr
     return addr, scale + i1 * td["aux0"] + o_bits // blk_bits
 
 
+FOLD_CVTS = ("MXFP4_E4M3", "NVFP4_E4M3", "MXFP8_E4M3")
+STAGE_MAX = 32768       # largest DMA_STAGE size: the tag table's ring offset is 11 bits of 16 B units (review N-4)
+
+
+def cvt_source_check(isa, td, cvt, base, gather=False, stage=None):
+    """Reference for the v1 conversion-unit rules on a converting TD's source (review findings U-1, U-2): no conversion
+    unit is ever split across two 256 B granules, so the v1 DMA has no raw slots and every response converts whole.
+    td is the source TD, cvt the cvt name, base the non-paged base address (R[src_reg]) or, for a PAGED TD, the paged
+    pointer's byte (the frame is 4 KiB aligned). gather=True for DMA_GATHER, whose rows start at base + index x s1.
+      Fold (cvt *_E4M3, U-1): a unit is a row's 256-element K tile, T = 128 B at 4 bits or 256 B for MXFP8, and the
+        row's last tile may be short. base, s1, s2 and s3 must be multiples of T, and n0 a multiple of 256 when n2 or n3
+        > 1 (a tile never spans two dim-0 runs). Every tile then starts on a T boundary and has at most T bytes, so it
+        lies in one granule, and a K slice starts on a tile. This is slightly stricter than "no tile crosses a granule"
+        (n0 = 128 MXFP4 elements from byte 64 would fit), as the W-5 block rule is, so the check is a few low-bit ORs.
+      2 or 4 B source elements (BF16_FP32, FP32_BF16, U-2): base, s1, s2, s3 and a gather's row_bytes must be multiples
+        of the element size, so no element spans two granules.
+      stage (the DMA_STAGE size, optional): a block-format conversion needs 2 KiB <= stage <= STAGE_MAX (Z-3, N-4).
+    Raises IsaError("ILLEGAL_FIELD: ...") otherwise. Other conversions have elements of at most 1 B (4-bit pairs in one
+    byte) with their scales in the ring, so they never split; their block rule is block_addr / paged_addr (W-5)."""
+    if cvt == "NONE":
+        return
+    info = isa["dtype_info"][{v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]]
+    if "block" in info and stage is not None and not 2048 <= stage <= STAGE_MAX:
+        raise IsaError("ILLEGAL_FIELD: DMA_STAGE must hold 2 KiB to 32 KiB for a block-format conversion (Z-3, N-4)")
+    strides = (base, td["s1"], td["s2"], td["s3"])
+    if cvt in FOLD_CVTS:
+        tile = 256 * info["bits"] // 8
+        if any(v % tile for v in strides):
+            raise IsaError("ILLEGAL_FIELD: a fold-converted source starts every dim-0 run on a 256-element tile "
+                           "(base or byte, s1, s2, s3 multiples of the tile's bytes; review U-1)")
+        if (max(td["n2"], 1) > 1 or max(td["n3"], 1) > 1) and td["n0"] % 256:
+            raise IsaError("ILLEGAL_FIELD: with n2 or n3 > 1 a fold-converted source has n0 a multiple of 256 (U-1)")
+    elif "block" not in info and info["bits"] in (16, 32):
+        esize = info["bits"] // 8
+        if any(v % esize for v in strides) or (gather and td["row_bytes"] % esize):
+            raise IsaError("ILLEGAL_FIELD: a converting 2 or 4 B source has base, s1, s2, s3 (and a gather's row_bytes) "
+                           "as multiples of the element size (review U-2)")
+
+
 def inline_row_bytes(isa, td):
     """Bytes of one SCALE_INLINE row (memmap.md section 6, review Z-4): n0 elements, then their n0 / block scales."""
     info = isa["dtype_info"][{v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]]
@@ -426,13 +465,16 @@ def rd_rsp_layout(addr, nbytes, dst, granule=256, burst=32, unit=None, half=128)
       spm       SPM destination of payload byte lo: dst is the destination of the request's first byte (addr), and the
                 request's bytes go to one contiguous SPM run (read_requests);
       bursts    the 32 B bursts of that granule the target reads (only those the range touches).
-    unit (X-12): (u0, size, raw) = the HBM address of the first conversion unit of the request's ring entry, the unit's
+    unit (X-12; a later version with raw slots: v1 has no split units, review U-1, so a v1 response converts whole):
+    (u0, size, raw) = the HBM address of the first conversion unit of the request's ring entry, the unit's
     bytes and the ring offset of the entry's raw slots (16 B aligned, one slot per split unit, in unit order). Each
     response then also has `pieces`, its valid range cut at unit boundaries: dict(unit, lo, hi, off, raw), with unit the
     index in the entry, off the offset of lo in the unit, and raw None for a unit inside one granule (it converts from
     this response) or the ring offset of lo in the unit's raw slot (raw + slot x the slot pitch + off; slot = the number
-    of split units of the entry before it). So the placement needs the entry's u0, size and raw base, not a raw offset per
-    tag: a granule of fold tiles from byte 64 feeds two raw slots and the converter."""
+    of split units of the entry before it, counted from u0, not from the request's first byte, review N-3). So the
+    placement needs the entry's u0, size and raw base, not a raw offset per tag: a granule of fold tiles from byte 64
+    feeds two raw slots and the converter. One size per entry: a fold row that is not whole tiles (its short last tile)
+    is not covered (U-1); a later version that allows it has to cut requests where the unit size changes."""
     if not 0 < nbytes <= 2048 or addr // 2048 != (addr + nbytes - 1) // 2048:
         raise IsaError("RD_REQ: 1..2048 bytes inside one 2 KiB block")
     g0 = addr // granule

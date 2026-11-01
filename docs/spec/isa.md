@@ -273,12 +273,19 @@ Rules:
   start an entry for a reason other than ring space, credits, pace or the issue turn: no entry left, a semaphore wait or
   `SIGNAL` at its head, or a plain read or write next (X-7). So a DQ that waits on a semaphore holds no turn (Y-3).
 - **Scales before data** (review findings V-1, W-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the
-  data that uses them, and a conversion unit that spans several responses is staged raw there. A unit's raw slot is taken
-  with its scales, when the scale read is issued, so a started entry never waits for ring space. Every data read and every
-  unit belongs to exactly one ring entry: a granule shared by two entries is two partial reads (review finding Z-1). So a
-  read response never waits for another one, and the ring cannot fill with entries that can never complete (noc.md §4 rule
-  2, microarch.md §2.5). `DMA_STAGE` holds at least 2 KiB, else a block-format conversion faults `ILLEGAL_FIELD` (Z-3). An
-  entry without raw slots covers at most one data request, which is what keeps the rate at long round trips (Y-1).
+  data that uses them, and an entry's ring space is taken when its scale read is issued, so a started entry never waits for
+  ring space. Every data read and every unit belongs to exactly one ring entry: a granule shared by two entries is two
+  partial reads (review finding Z-1). So a read response never waits for another one, and the ring cannot fill with
+  entries that can never complete (noc.md §4 rule 2, microarch.md §2.5). `DMA_STAGE` holds 2 KiB to 32 KiB, else a
+  block-format conversion faults `ILLEGAL_FIELD` (Z-3; the upper bound is the tag table's 11-bit ring offset, N-4). An
+  entry covers at most one data request, which is what keeps the rate at long round trips (Y-1).
+- **No conversion unit spans two granules in v1** (review findings U-1, U-2; the user's choice for the fold): a
+  fold-converted source (`*_E4M3`) has its base (or paged `byte`), `s1`, `s2` and `s3` as multiples of a 256-element
+  tile's bytes (128 B at 4 bits, 256 B for MXFP8) and n0 a multiple of 256 when n2 or n3 > 1; a converting source of 2
+  or 4 B elements (`BF16_FP32`, `FP32_BF16`) has its base, `s1`-`s3` and a gather's `row_bytes` as multiples of the
+  element size. Otherwise `ILLEGAL_FIELD` (`isa.cvt_source_check`). So the v1 DMA has no raw slots: every response
+  converts from its own bytes. A later version may stage split units raw in the ring (a fold row that is not whole
+  tiles, inline rows), with the slot taken with the entry's scales (W-1).
 - **Scale location and write packets** (review findings V-4, V-5, W-5): an element's block scale is found from its row and its
   whole in-row offset (dims 0, 2, 3). Every dim-0 run starts on a block: the base (or the paged pointer's `byte`), `s1`, `s2` and
   `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` is reserved in v1 (`ILLEGAL_FIELD`, review finding X-16); in a later version its rows (a repacked table; the

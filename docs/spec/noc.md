@@ -73,8 +73,8 @@ and may start or end inside a granule (the DMA cuts a granule that two ring entr
   request where its destination run ends, as it cuts write packets, and at the 2 KiB block. Two adjacent 512 B HBM rows
   read into SPM rows padded to 576 B are two requests; merged, the second row would land 64 B early, silently.
 - `isa.rd_rsp_layout` is the reference (valid range, flits, SPM destination and bursts of each response, and with a ring
-  entry's units the pieces of a converting response, microarch.md §2.5), with `isa.read_requests` for the cut at
-  destination runs. Tested in `test_isa.py` (`test_rd_rsp_layout`, `test_rd_rsp_pieces_and_destination_runs`): a granule
+  entry's units the pieces of a converting response for a later version with raw slots, microarch.md §2.5; in v1 no
+  conversion unit spans two granules, review finding U-1), with `isa.read_requests` for the cut at destination runs. Tested in `test_isa.py` (`test_rd_rsp_layout`, `test_rd_rsp_pieces_and_destination_runs`): a granule
   cut at byte 128 into two requests, a 264 B row from byte 8, contiguous 264 B rows that share a burst, random requests
   reassembled in SPM from 1- and 2-flit responses, fold tiles from byte 64 (each granule: a raw-slot tail, a whole tile,
   a raw-slot head), random entries of 128, 256 and 264 B units in any response order, and padded SPM rows.

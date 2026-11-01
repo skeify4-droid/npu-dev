@@ -181,7 +181,7 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
-    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request; the DQs allocate in turns of 8 data granules when one waits for the ring, and a turn passes as soon as its holder has no entry it could start but for ring space, credits, pace or the issue turn (review Y-3, X-7, X-10; isa.staging_ring)
+    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) or above 32 KiB (the tag table's 11-bit ring offset in 16 B units, review N-4) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request; the DQs allocate in turns of 8 data granules when one waits for the ring, and a turn passes as soon as its holder has no entry it could start but for ring space, credits, pace or the issue turn (review Y-3, X-7, X-10; isa.staging_ring)
     DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2, Y-2, Y-6): [17:0] the most weighted bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; NVFP4 counts its bytes, MXFP4 half, MXFP8 a quarter, and the reads of an entry whose data is one granule (a row gather) count in full (review X-14); the limit is min(this, 4.5 x the DMA_STAGE size); a converting read may always issue when none is in flight; 18-bit counter; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
     NI_EPOCH: 0x023      # [0] epoch put in every request header (noc_header epoch); the CP toggles it on every core of a step while the step is stopped, before a restart; a response, ack or LINK ERR whose epoch differs is dropped without a fault (d2d_c2c.md L-4 (f), review Y-10, X-13)
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
@@ -249,7 +249,7 @@ td:
     s2:    [143, 112]
     s3:    [175, 144]
     aux0:  [207, 176]   # block formats: scale row stride in bytes; VSOFTMAX softcap: c (FP32)
-    row_bytes: [231, 208]   # gather/scatter: row size in bytes (any size, no alignment needed)
+    row_bytes: [231, 208]   # gather/scatter: row size in bytes (any size, no alignment needed; a converting 2 or 4 B source: a multiple of the element size, review U-2)
     sc_off: [243, 232]  # PAGED block formats: offset of the page's scale region, in 256 B units (memmap.md section 6)
     page_shift: [248, 244]  # PAGED: log2(rows per page); block formats and SCALE_REGION: >= log2(32 / aux0), aux0 divides 32 or is a multiple of it (ILLEGAL_FIELD, review W-4)
     rsv:   [255, 249]
@@ -478,10 +478,15 @@ instructions:
       X-16); in a later version a SCALE_INLINE operand (non-paged) keeps each row's
       scales after its n0 elements, so its base and s1 need no alignment (isa.inline_addr, review Z-4). cvt = NONE
       moves only the bytes the TDs address, never the scales; a SCALE_REGION TD addresses the scale rows.
-      Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, and a conversion
-      unit split over several responses is staged raw there, its slot taken with its scales at the scale read, so
-      every response sinks without waiting for another and every ring entry completes (microarch.md section 2.5); every
-      data read belongs to one entry, so a granule two entries share is two partial reads (review Z-1).
+      Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, an entry's space
+      taken at its scale read, so every response sinks without waiting for another and every ring entry completes
+      (microarch.md section 2.5); every data read belongs to one entry, so a granule two entries share is two partial
+      reads (review Z-1). No conversion unit spans two granules in v1 (review U-1, U-2; isa.cvt_source_check), else
+      ILLEGAL_FIELD: under a fold cvt (MXFP4_E4M3, NVFP4_E4M3, MXFP8_E4M3) the source base (PAGED: the pointer's
+      byte), s1, s2 and s3 are multiples of a 256-element tile's bytes (128 B at 4 bits, 256 B for MXFP8) and n0 is a
+      multiple of 256 when n2 or n3 > 1, so every tile, a row's short last tile included, lies in one granule and a K
+      slice starts on a tile; under BF16_FP32 or FP32_BF16 the source base, s1, s2, s3 and a gather's row_bytes are
+      multiples of the element size.
       ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
       Write packets hold contiguous destination bytes: adjacent runs, also consecutive paged rows of one page, are
       merged up to a 256 B granule boundary, and HBM_ALIGN is checked per packet.
@@ -497,7 +502,8 @@ instructions:
       IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination =
       source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a
       logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page.
-      Operand spaces, conversions and scale operands as DMA_COPY. Engram rows as published (review Y-7): MXFP8, s1 =
+      Operand spaces, conversions and scale operands as DMA_COPY, including the v1 conversion-unit rules (rows at
+      base + index x s1, so base and s1 carry them; review U-1, U-2). Engram rows as published (review Y-7): MXFP8, s1 =
       row_bytes = 256, scales at scale_reg with aux0 = 8. In a later version (SCALE_INLINE is reserved in v1, review
       X-16), MXFP8 rows with SCALE_INLINE (a repacked table): row_bytes =
       n0 elements + n0 / 32 scales (264 B; 0 is ILLEGAL_FIELD), s1 any pitch of at least that; each row is staged raw and

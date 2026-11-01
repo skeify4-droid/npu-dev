@@ -290,24 +290,43 @@ isa.md §5) a cheap multiply at the ACC input.
   - **One destination run per request *(review finding X-12)*.** The DMA cuts a read request where its SPM destination run
     ends (for a converting read, the run of converted output), as it cuts write packets, and at the 2 KiB block: two
     adjacent 512 B HBM rows read into SPM rows padded to 576 B are two requests (`isa.read_requests`).
-  - **Tag-table entry *(review findings Y-5, X-12)*:** the SPM destination of the request's first byte, the byte offset of
-    that byte in its granule, `len`, the granules still outstanding (an 8-bit mask), the DQ, the epoch, and for a
-    converting read its format and entry shape (pace weight), its ring entry (the ring offsets of its scales and of its
-    raw slots), the unit size, the offset of its first byte in its conversion unit (the element offset) and the raw-slot
-    index of that unit. Byte 128 of an NVFP4 granule is element 256, so the second half of a cut granule converts from
-    element 256 into its own entry. About 95 bits, 6 KiB for 512 tags.
+  - **Tag-table entry *(review findings Y-5, X-12, U-1, N-4)*:** the SPM destination of the request's first byte, the byte
+    offset of that byte in its granule, `len`, the granules still outstanding (an 8-bit mask), the DQ, the epoch, and for a
+    converting read its format and entry shape (pace weight) and the ring offset of its first unit's scales. Byte 128 of an
+    NVFP4 granule is element 256, so the second half of a cut granule converts from element 256 into its own entry. In v1
+    no conversion unit is split (below, U-1 and U-2), so a converting read starts on a unit of its own entry and needs no
+    unit size, unit offset or raw-slot index. About 70 bits (22-bit SPM destination, 8-bit granule offset, 11-bit `len`,
+    8-bit mask, 2-bit DQ, the epoch, 5 bits of format and shape, an 11-bit ring offset), 4.5 KiB for 512 tags.
+    - **Largest ring *(N-4)*.** The ring offset counts 16 B units in 11 bits, so `DMA_STAGE` holds at most 32 KiB, and a
+      block-format conversion with a larger `DMA_STAGE` faults `ILLEGAL_FIELD`, as one below 2 KiB does. That covers the
+      24 and 32 KiB rings Phase 7 costs (below). `DMA_STAGE`'s size field ([53:32]) is wider; the bound is the tag table's.
+    - A later version with raw slots (split units, inline rows) adds the X-12 fields: the ring offset of the entry's raw
+      slots, the unit size, the first byte's offset in its unit and that unit's raw-slot index (about 95-100 bits).
   - Response `gidx` g lands at the destination + (g x 256 - the first byte's offset), except g = 0, which lands at the
     destination. Its valid bytes are the request's range within the granule (noc.md §2, partial granules;
     `isa.rd_rsp_layout`).
-  - **Pieces of a converting response *(X-12)*.** The NI cuts the valid range at conversion-unit boundaries. A unit that
-    lies inside the granule converts from this response, at its element offset. A piece of a split unit is written to the
-    unit's raw slot, at the raw-slot base + slot x the slot pitch (the unit size in 16 B units) + its offset in the unit;
-    slot counts the entry's split units before it, so it is the first unit's raw-slot index plus the split units between.
-    For power-of-two units of at most 256 B, every granule boundary falls at the same offset in a unit, so either every
-    boundary inside the request splits a unit or none does, and the count is the number of boundaries crossed. A granule
-    of contiguous MXFP4 fold tiles from byte 64 therefore feeds two raw slots and the converter: the 64 B tail of one split
+  - **A converting response in v1 *(review findings U-1, U-2)*.** No v1 conversion unit spans two granules, so every
+    response converts from its own valid range. The units of a fold read are its rows' 256-element tiles, T bytes each
+    from the request's first byte (T = 128 B at 4 bits, 256 B for MXFP8); only the last may be short, and it ends at the
+    request's end. That holds because a fold-converted source starts every dim-0 run on a tile (below), so a request
+    that spans rows has whole tiles only (s1 = the row's bytes), and a row with a short last tile has a gap after it, so
+    its request ends there. Other conversions have elements of at most 1 B.
+  - **Pieces of a converting response *(X-12; a later version with raw slots, not in the v1 `core/ni`)*.** The NI cuts
+    the valid range at conversion-unit boundaries. A unit that lies inside the granule converts from this response, at
+    its element offset. A piece of a split unit is written to the unit's raw slot, at the raw-slot base + slot x the
+    slot pitch (the unit size in 16 B units) + its offset in the unit; slot is the number of the entry's split units
+    before it. It is the request's first unit's raw-slot index (the entry's split units before that unit, whether the
+    first unit is split or not) plus the split units from there to the piece's unit. For power-of-two units of at most
+    256 B, every granule boundary falls at the same offset in a unit, so either every boundary inside the request splits a
+    unit or none does, and the split units from the first unit to the piece's unit are the granule boundaries from the
+    first unit's start (the request's first byte minus its offset in its unit) up to the piece's unit start (review N-3;
+    the boundaries the piece itself has crossed is a different count, wrong on every tail of a split unit). A granule of
+    contiguous MXFP4 fold tiles from byte 64 therefore feeds two raw slots and the converter: the 64 B tail of one split
     tile (its raw slot), a whole tile, and the 64 B head of the next split tile (the next raw slot). One ring offset per
-    tag, as the text before X-12 had it, could place only one of them. `isa.rd_rsp_layout(..., unit=)`, `test_rd_rsp_pieces_and_destination_runs`.
+    tag, as the text before X-12 had it, could place only one of them. `isa.rd_rsp_layout(..., unit=)`,
+    `test_rd_rsp_pieces_and_destination_runs`. A fold row that is not whole tiles gives a request units of two sizes,
+    which one unit size per tag cannot describe (U-1); a version that allows it cuts a converting request where the
+    unit size changes, raw slots at the full tile pitch.
 - **Read data always sinks in local SPM** (or DTAB / IMEM). A DMA never forwards read data as a write, so one of its two operands is
   local (`TD_SPACE` otherwise; review finding I-1). Global-to-global moves are two transfers through an SPM buffer.
 - **Inbound rate *(review findings I-3, V-1)*:** the converter produces 256 elements per cycle and the SPM write port takes
@@ -324,17 +343,33 @@ isa.md §5) a cheap multiply at the ACC input.
     responses are plain SPM writes. The DMA reads scales a round trip ahead, so the rate is unchanged; the first data of a
     transfer starts one round trip later (the second verifier's estimate: about 0.33 µs per dependent converting transfer,
     at most about 2% of a batch-1 DeepSeek or MiniMax decode step).
-  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: a
-    fold tile that is not inside one 256 B granule (a fold weight row that is not a whole number of 256-element tiles, or a
-    K slice that does not start on one), or, in a later version, an inline-scaled row (`SCALE_INLINE`, reserved in v1,
-    review finding X-16; a 264 B MXFP8 row of a repacked table: 256 B of elements, then their 8 B of scales; memmap.md §6).
-    Its responses are written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add
-    to the DMA's SPM write and read traffic.
+  - **No split units in v1 *(review findings U-1, U-2; (b) chosen by the user, 2026-11-02)*.** A conversion unit whose
+    bytes would arrive in more than one response is illegal:
+    - **Fold tiles.** A fold-converted source (`cvt` `MXFP4_E4M3`, `NVFP4_E4M3`, `MXFP8_E4M3`) has its base (a PAGED
+      operand: the paged pointer's `byte`), `s1`, `s2` and `s3` as multiples of a tile's bytes T (128 B at 4 bits, 256 B
+      for MXFP8), and n0 a multiple of 256 when n2 or n3 > 1, else `ILLEGAL_FIELD`. A gather's rows start at the base +
+      index x `s1`, so the same fields cover them. Every 256-element tile, the row's short last tile included, then
+      starts on a T boundary and has at most T bytes, so it lies in one granule, and a K slice starts on a tile. The rule
+      is slightly stricter than "no tile crosses a granule" (128 MXFP4 elements from byte 64 would fit), as the W-5 block
+      rule is, so the check is a few low-bit ORs. Before U-1 a row that is not whole tiles (K = 384, `s1` = 192) or a K
+      slice off a tile was legal and split tiles; the response path of such a request had units of two sizes and no
+      defined placement.
+    - **2 and 4 B elements.** A converting source of 2 or 4 B elements (`BF16_FP32`, `FP32_BF16`) has its base, `s1`-`s3`
+      and a gather's `row_bytes` as multiples of the element size, else `ILLEGAL_FIELD`. Without it a `BF16_FP32` copy
+      from 0x…0FF has element 0 in two responses, and with no scale read there is no ring entry to stage it.
+    - Other conversions have elements of at most 1 B (two 4-bit elements share a byte) and never split.
+    - Reference: `isa.cvt_source_check`, tested in `test_isa.py` (`test_cvt_source_check_no_split_units`).
+    - So the v1 `core/dma` has no raw slots and the v1 `core/ni` no response pieces. A later version may stage split
+      units raw: a fold tile across a granule, or an inline-scaled row (`SCALE_INLINE`, reserved in v1, review finding
+      X-16; a 264 B MXFP8 row of a repacked table: 256 B of elements, then their 8 B of scales; memmap.md §6). Its
+      responses are written to a raw slot, and the converter takes the unit from SPM once it is complete; its raw bytes add
+      to the DMA's SPM write and read traffic. The rules below for raw slots are that version's, and `isa.staging_ring`
+      keeps them.
   - **Staging ring:** an SPM region given by CSR `DMA_STAGE` (base and size), reserved by the runtime and shared by the four DQs.
     Size 0 makes block-format conversion fault (`ILLEGAL_FIELD`).
   - **Ring allocation *(review findings W-1, Z-1)*.** The ring is allocated in **entries**. An entry is a run of whole
-    conversion units: the scale reads of their out-of-line scales, the raw slots of its split units, and the data reads of
-    those units. **An entry without raw slots covers the units of at most one data request** (at most 2 KiB inside one 2 KiB
+    conversion units: the scale reads of their out-of-line scales, the raw slots of its split units (a later version; v1 has
+    none, U-1), and the data reads of those units. **An entry without raw slots covers the units of at most one data request** (at most 2 KiB inside one 2 KiB
     block; review finding Y-1, below). It has one scale read, or two when its scales cross a 2 KiB block of the scale array
     (a fold tile's 8 or 16 B of scales at an offset that is not a multiple of their size, as with K not a multiple of 256).
     - **Every data read and every conversion unit belongs to exactly one entry *(review finding Z-1)*.** An entry boundary is
@@ -350,10 +385,11 @@ isa.md §5) a cheap multiply at the ACC input.
         next entry is the ring's next allocation.
       - Cost: one more request per entry boundary inside a granule, and at most one 32 B HBM burst read twice. The DMA ends
         an entry on a granule boundary when a unit boundary falls on one, so aligned streams have no cut. With Y-1 a
-        contiguous non-split stream ends its entries on 2 KiB blocks, so cuts come from entries with raw slots (fold tiles
-        from byte 64, contiguous inline rows) and from rows that share a granule.
+        contiguous non-split stream ends its entries on 2 KiB blocks, so in v1 cuts come from rows that share a granule
+        (index-key rows, the second half of a cut NVFP4 granule); a later version's raw-slot entries (fold tiles from byte
+        64, contiguous inline rows) add more. The fold-tile deadlock above is that version's case.
     - **An entry's scales and the raw slots of all its split units are one allocation, taken when its first scale read is
-      issued**. In v1 every entry that uses the ring has a scale read (`SCALE_INLINE` is reserved, X-16; a later version's
+      issued** (in v1 an entry has no raw slots, U-1). In v1 every entry that uses the ring has a scale read (`SCALE_INLINE` is reserved, X-16; a later version's
       inline entries are allocated at their first data read). Its data reads then
       need only tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the
       oldest one frees its space, and the ring always drains.
@@ -363,8 +399,8 @@ isa.md §5) a cheap multiply at the ACC input.
       entry. Its raw slot holds the rows, 272 B per row in 16 B units.
     - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
       beginning) and is freed when all its data has been converted. Space comes back in allocation order.
-    - **Ring and entry size *(review findings Z-3, Y-1)*.** `DMA_STAGE` must hold at least 2 KiB, or a block-format
-      conversion faults `ILLEGAL_FIELD` (size 0 included). Liveness needs only entry ≤ ring; the two size rules are rate
+    - **Ring and entry size *(review findings Z-3, Y-1, N-4)*.** `DMA_STAGE` must hold at least 2 KiB and at most 32 KiB
+      (the tag table's ring offset, above), or a block-format conversion faults `ILLEGAL_FIELD` (size 0 included). Liveness needs only entry ≤ ring; the two size rules are rate
       rules, and the DMA meets them by shortening the run of units.
       - **An entry without raw slots covers at most one data request** (256 B of NVFP4 scales for 2 KiB of data, 128 B of
         MXFP4, 64 B of MXFP8). A non-split entry's scales stay in the ring from its scale read until its last element is
@@ -374,11 +410,13 @@ isa.md §5) a cheap multiply at the ACC input.
         153 / 151 elements/cycle; 16 granules 151 / 149; 64 granules (one 2 KiB scale read) 141 / 137; a quarter of the
         ring (4 KiB of scales, 32 KiB of data) 124 / 123, as the formula predicts (124). The cost is one scale request per
         data request, about one per 27 cycles at the share.
-      - **An entry with raw slots is at most a quarter of the ring.** Split units and inline rows hold their data in the
-        ring, so those streams are ring-bound anyway (below); the quarter keeps one entry from taking the ring.
-      - No single unit's entry is larger than 272 B (a split MXFP8 fold tile is 256 + 8 B, as is a later version's 264 B inline row; a split 4-bit
-        tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, and a non-split unit lies inside one granule, so
-        inside one request. The DMA can therefore always meet both rules. A ring below the 16 KiB default lowers the rate
+      - **An entry with raw slots is at most a quarter of the ring** (a later version). Split units and inline rows hold
+        their data in the ring, so those streams are ring-bound anyway (below); the quarter keeps one entry from taking the
+        ring.
+      - In v1 a unit lies inside one granule, so inside one request, and its entry needs at most one data request's scales
+        (256 B). In a later version no single unit's entry is larger than 272 B (a split MXFP8 fold tile is 256 + 8 B, as
+        is a 264 B inline row; a split 4-bit tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum. The DMA can
+        therefore always meet both rules. A ring below the 16 KiB default lowers the rate
         (below), never liveness.
       - Replaced (Z-3): "the quarter is a rate target: four entries in flight let scales run a round trip ahead". For
         entries without raw slots it is wrong at 845 cycles (124 against 153 above).
@@ -399,7 +437,8 @@ isa.md §5) a cheap multiply at the ACC input.
       - one response and one credit per granule (`rsp="granule"`);
       - the pace weighted by format and entry shape, with the cap (`pace="shape"`, `fmt` per DQ or `("fmt", ...)` per
         transfer).
-      `test_isa.py` runs mixed split and non-split streams, one DQ or four, with greedy read-ahead, and random four-DQ
+      `test_isa.py` runs mixed split and non-split streams (the split ones for a later version; the v1 RTL is compared on
+      non-split streams, U-1), one DQ or four, with greedy read-ahead, and random four-DQ
       programs with cross-DQ semaphore waits and writes; they always complete. The shared-granule reading deadlocks with
       four DQs, and the ring turn without its pass on idle deadlocks with a semaphore wait inside a turn. Phase 3 adds
       `core/dma` formal properties: every allocated ring entry needs only tags to complete, no data read waits for the
@@ -475,11 +514,14 @@ isa.md §5) a cheap multiply at the ACC input.
       - The weights hold within about 3-5% of the table, and the mixed-traffic loss does not depend on `DMA_PACE`.
     - Split units hold about 17 times more space per element (a 128 B MXFP4 tile and its 8 B of scales). If every fold tile
       of a stream were split, the ring would carry about 28 elements/cycle, against a need of about 164.
-    - **So the compiler never splits fold tiles:** it pads the HBM row pitch of fold-converted weights to a whole number of
-      256-element tiles (128 B at 4 bits, 256 B for MXFP8), places them on a 256 B boundary, and cuts K slices on tile
-      boundaries. Padding is in the pitch only; the TD's n0 still covers the real K, and the last tile of a row is short but
-      inside one granule. Every surveyed model already has K a multiple of 256 (expert K 2,048-6,144 and 2,304), so it costs
-      nothing there. A layout that cannot be padded is legal and converts at the ring-limited rate.
+    - **So the compiler never splits fold tiles, and in v1 a split one faults *(U-1 (b))*:** the compiler pads the HBM
+      row pitch of fold-converted weights to a whole number of 256-element tiles (128 B at 4 bits, 256 B for MXFP8),
+      places them on a 256 B boundary, and cuts K slices on tile boundaries. Padding is in the pitch only; the TD's n0
+      still covers the real K, and the last tile of a row is short but inside one granule (its request ends with it, since
+      the padding is a gap). Every surveyed model already has K a multiple of 256 (expert K 2,048-6,144 and 2,304), so it
+      costs nothing there. A layout that is not padded faults `ILLEGAL_FIELD` under a fold `cvt` (the rule above). It can
+      be repacked, or converted with the exact `*_BF16` path, which has no tiles and accepts it (2 B per element in SPM
+      and the BF16 MXU rate). A later version with raw slots could convert it at the ring-limited rate.
     - **Engram rows *(review finding Y-7; layout chosen by the user, 2026-11-01)*.** The table keeps its published separate
       scale array, so a row is one aligned 256 B granule plus an 8 B scale read: not split, one ring entry of 16 B. The
       gather is tag-bound like the KV gather: about 0.33 rows/cycle per core at 500 cycles and 0.30 at 845, with its reads
@@ -600,7 +642,7 @@ Conventions:
 |---|---|---|---|---|
 | q_pop[4] | in | instruction + operands | valid/ready | DQ0-DQ3; one sequencer per DQ, so a head waiting on a semaphore holds no shared resource (§2.5, review finding V-3) |
 | dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant (review finding V-9) | tile descriptors when an instruction starts |
-| spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales and raw units in the staging ring (CSR `DMA_STAGE`) |
+| spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales in the staging ring (CSR `DMA_STAGE`; raw units in a later version, U-1) |
 | ni_req | out | flit_t | valid/ready | read requests, write packets |
 | ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and the SPM ports, because scales are staged before their data (§2.5, review finding V-1) | read data, scales, acks |
 | sem_inc | out | 6 + 4 | pulse | completion signals |

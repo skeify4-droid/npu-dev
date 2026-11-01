@@ -917,6 +917,83 @@ def test_block_addr_requires_block_aligned_base(isa):
     assert I.block_addr(isa, bf, 0x100 + 2, 0, 3, 0) == (0x100 + 2 + 6, None)  # no block format, no rule
 
 
+def _fold_tile_ranges(K, bits, s1, rows, base=0):
+    """(start, bytes) of every 256-element fold tile of `rows` rows of K elements at pitch s1 (the last tile short)."""
+    T, rb = 32 * bits, K * bits // 8
+    return [(base + r * s1 + t * T, min(T, rb - t * T)) for r in range(rows) for t in range(-(-K // 256))]
+
+
+def test_cvt_source_check_no_split_units(isa):
+    """U-1 (b, the user's choice): a fold-converted TD whose tiles can cross a 256 B granule faults ILLEGAL_FIELD, so v1
+    has no split units. MXFP4 -> E4M3, K = 384, s1 = 192, output rows contiguous: read_requests forms one 2 KiB request
+    over rows 0-10 whose units are 128 B tiles and 64 B short tiles; the granule boundaries at 256, 1,024 and 1,792 split a
+    tile and those at 512, 768, 1,280, 1,536 do not, so one unit size per tag (rd_rsp_layout(unit=)) places 16 pieces
+    against the true 24 and is wrong from byte 128. At the compiler's padded pitch (s1 = 256) every request is one row,
+    every tile lies in one granule and the row's short last tile ends at the request's end. U-2: a converting 2 or 4 B
+    source element must not span two granules. N-4: DMA_STAGE holds 2 KiB to 32 KiB for a block-format conversion."""
+    td = _td(isa, dtype="MXFP4", space="GLOBAL", n0=384, n1=16, s1=192, aux0=12)
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, td, "MXFP4_E4M3", 0x1000_0000)
+    I.cvt_source_check(isa, td, "MXFP4_BF16", 0x1000_0000)        # the exact BF16 path takes the unpadded layout
+    reqs = I.read_requests([(192 * r, 192 * r, 192) for r in range(16)])   # destination in input bytes: output contiguous
+    assert reqs[0] == (0, 2048, 0)
+    tiles = [u for u in _fold_tile_ranges(384, 4, 192, 16) if u[0] < 2048]
+    assert sorted({n for _, n in tiles}) == [64, 128]
+    cut = [b for b in range(256, 2048, 256) if any(a < b < a + n for a, n in tiles)]
+    assert cut == [256, 1024, 1792]
+    true = sum(1 for g in range(8) for a, n in tiles if max(a, 256 * g) < min(a + n, 256 * g + 256))
+    one = sum(len(r["pieces"]) for r in I.rd_rsp_layout(0, 2048, 0, unit=(0, 128, 0x400)))
+    assert (true, one) == (24, 16)
+    padded = dict(td, s1=256)                                      # the compiler's layout: whole tiles per pitch
+    I.cvt_source_check(isa, padded, "MXFP4_E4M3", 0x1000_0000)
+    reqs = I.read_requests([(256 * r, 192 * r, 192) for r in range(16)])
+    assert reqs == [(256 * r, 192, 192 * r) for r in range(16)]
+    for (a, n, _), t in zip(reqs, [_fold_tile_ranges(384, 4, 256, 16)[2 * r:2 * r + 2] for r in range(16)]):
+        assert all(x // 256 == (x + m - 1) // 256 for x, m in t) and t[-1][0] + t[-1][1] == a + n
+    with pytest.raises(I.IsaError):                                # a K slice from element 128 (byte 64)
+        I.cvt_source_check(isa, padded, "MXFP4_E4M3", 0x1000_0000 + 64)
+    I.cvt_source_check(isa, padded, "NVFP4_E4M3", 0x1000_0000 + 128)          # from element 256: on a tile
+    mx8 = _td(isa, dtype="MXFP8", space="GLOBAL", n0=384, n1=4, s1=384, aux0=12)
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, mx8, "MXFP8_E4M3", 0)
+    I.cvt_source_check(isa, dict(mx8, s1=512), "MXFP8_E4M3", 0)
+    with pytest.raises(I.IsaError):                                # a 256-element tile across two dim-0 runs
+        I.cvt_source_check(isa, dict(padded, n0=128, n2=2, s2=256), "MXFP4_E4M3", 0)
+    I.cvt_source_check(isa, dict(padded, n0=256, n2=2, s2=256), "MXFP4_E4M3", 0)
+    with pytest.raises(I.IsaError):                                # PAGED: the pointer's byte
+        I.cvt_source_check(isa, dict(padded, flags=1 << isa["enums"]["td_flags"]["PAGED"]), "MXFP4_E4M3", 64)
+    rng = random.Random(6)
+    for _ in range(300):                                           # legal fold TDs never split a tile
+        bits = rng.choice((4, 8))
+        T = 32 * bits
+        K = rng.randrange(32, 2048, 32)
+        s1 = T * (-(-K * bits // 8 // T) + rng.randrange(3))
+        base = T * rng.randrange(64)
+        t = _td(isa, dtype="MXFP4" if bits == 4 else "MXFP8", space="GLOBAL", n0=K, n1=4, s1=s1, aux0=K // 32)
+        I.cvt_source_check(isa, t, "MXFP4_E4M3" if bits == 4 else "MXFP8_E4M3", base)
+        assert all(a // 256 == (a + n - 1) // 256 for a, n in _fold_tile_ranges(K, bits, s1, 4, base))
+    # U-2: BF16 -> FP32 from an odd base: element 0 is bytes 0xFF-0x100, in two granules
+    bf = _td(isa, dtype="BF16", space="GLOBAL", n0=1024, n1=2, s1=2048)
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, bf, "BF16_FP32", 0x2000_00FF)
+    I.cvt_source_check(isa, bf, "BF16_FP32", 0x2000_0100)
+    I.cvt_source_check(isa, bf, "NONE", 0x2000_00FF)               # cvt = NONE moves bytes: no rule
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, dict(bf, s1=2047), "BF16_FP32", 0x2000_0100)
+    f32 = _td(isa, dtype="FP32", space="GLOBAL", n0=64, n1=1, s1=256, row_bytes=256)
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, f32, "FP32_BF16", 0x2000_0002)     # an FP32 element at 2 mod 4
+    with pytest.raises(I.IsaError):
+        I.cvt_source_check(isa, dict(f32, row_bytes=258), "FP32_BF16", 0, gather=True)
+    I.cvt_source_check(isa, f32, "FP32_BF16", 0, gather=True)
+    for size, ok in ((0, False), (1024, False), (2048, True), (16384, True), (32768, True), (65536, False)):
+        if ok:
+            I.cvt_source_check(isa, padded, "MXFP4_E4M3", 0, stage=size)
+        else:
+            with pytest.raises(I.IsaError):
+                I.cvt_source_check(isa, padded, "MXFP4_E4M3", 0, stage=size)
+
+
 def test_engram_inline_gather(isa):
     """X-16: SCALE_INLINE is reserved in v1, so a TD with it faults ILLEGAL_FIELD; the definition below is kept for a
     later version (block_addr with v1=False).
