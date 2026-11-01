@@ -838,3 +838,216 @@ d015351, one commit per group, `make pytest` green before each.
 4. **Inline rows.** Check the `SCALE_INLINE` conditions against the Engram table layout as published (hyper_connections.md §4 still mentions "the separate scale array" in its bytes-per-token note), and Qwen's BF16 n-gram rows (no inline scales).
 5. **Drain wait (Z-5).** Walk an index moved from a credit semaphore to a buffer semaphore and back. Is the drain target always computable from the call-site map and the base table?
 6. **Restart (Z-7).** Is 10 µs above the worst RSP transit from a bridge to a core while faulted cores are still sinking converter-paced responses? Should `T_DRAIN` be a hardware bound instead (an `ERR` age counter at the bridge)?
+
+
+# Verification 4 (2026-11-01)
+
+**Who:** a fourth verification session (Opus 5.5). It is not the author, the reviewer, any of the fix sessions or the earlier
+verifiers. No spec, model or test was changed; this section is the only edit (branch `spec-verification4` from c0b635e).
+
+**Method.** I read CLAUDE.md, Verification 3, the resolutions of the verification 3 fixes and the four commits (8f6cf62, 4c0cb8b,
+27184c4, c0b635e), and every spec the rows cite: microarch.md §2.5, isa.md §3, §5 and §8, memmap.md §3 and §6, noc.md §2-4 and §7,
+d2d_c2c.md L-4, L-6, L-9 and L-11, `isa.yaml` (`DMA_STAGE`, `DMA_PACE`, `SCALE_INLINE`, `STATUS`, `noc_header`), hyper_connections.md
+§4 and PLAN Phases 3, 4 and 7. For each Z-n I asked two questions: does the new text close the verifier's failure scenario, and does
+it open a new one? I walked the six check-first items, then re-checked W-1, W-3, W-5, V-1, V-3, X-6 rule 2 and D1.
+
+Before I read `isa.staging_ring` I wrote my own cycle model from microarch.md §2.5 alone (scratch, not committed; no code in common).
+- Entries carry HBM byte ranges. Data reads are the granule pieces of the range, grouped into requests of up to 2 KiB inside one
+  2 KiB block, and cut at entry boundaries (`cut`) or shared (`shared`: one read, issued once both entries' scales are in the ring).
+- Ring: 16 B units, contiguous with wrap-skip, one allocation per entry at its first scale read (at its first data read if inline),
+  and in-order reclaim.
+- Issue: greedy read-ahead (a DQ's next scale read before its own data reads when the space can be taken), round-robin over DQs,
+  one request per cycle, 512 tags counted per granule piece, and `DMA_PACE` counted at issue and returned per response.
+- HBM, three modes:
+  - `paced`: an issue budget at the share, every response exactly L after issue;
+  - `server`: one FIFO at 87 B/cycle, L/2 out, per piece with 32 B burst rounding;
+  - `pc`: 32 per-PC FIFOs at 21.75 B/cycle each (a stack's 0.85 x 820 B/cycle), shared by 8 cores, PC from the memmap.md §3 hash.
+- `ni_rsp` is one FIFO per core. A piece takes max(bytes, elements) / 256 cycles, and its tag and pace bytes are freed when it sinks.
+- Rates are elements/cycle between 25% and 75% of a stream (or over the window where two streams overlap), at an 87 B/cycle share.
+  The need is 154.7 for NVFP4 → BF16 and the KV gather, 163.8 for MXFP4 and 84.4 for MXFP8.
+
+Executable checks:
+- `make pytest`: 218 passed (rc 0, 22.0 s, 70 MB peak, `scripts/memrun`).
+- `make isa`: the generators rewrote identical files, `git status` was clean afterwards, and `verilator --lint-only -Wall` on
+  `isa_pkg.sv` passed.
+- `make numerics`, `make hbm` and `make links` were not rerun. The four commits change no model input: `numerics.py`, `hbm.py`,
+  `links.py`, `noc.py`, `opgraph.py` and `ingest.py` are untouched (`git diff --stat d015351 c0b635e`).
+
+Probes (scratch, not committed):
+- **Rates, own model and `isa.staging_ring` against microarch.md §2.5** (16 KiB ring; weights in entries of 8 granules, i.e.
+  256 B of scales and one 2 KiB data read, as in `test_isa.py` `_nvfp4_bf16`; KV gather one entry per row):
+
+  | L = 500 / 700 / 845 / 1,000 | own model | `isa.staging_ring` | §2.5 table |
+  |---|---|---|---|
+  | weights, paced | 154.7 / 154.7 / 153.8 / 129.5 | 154.7 / 154.7 / 153.3 / 128.6 | 155 / 155 / 153 / 129 |
+  | weights, queue, tags only | 130.4 / 118.6 / 111.3 / 104.4 | 141.7 / 127.5 / 118.9 / 110.9 | 142 / 128 / 119 / 111 |
+  | weights, queue, `DMA_PACE` 72 KiB | 154.7 / 154.7 / 150.6 / 127.8 | 154.7 / 154.7 / 150.2 / 127.1 | 155 / 155 / 150 / 127 |
+  | KV gather, paced | 154.7 / 154.7 / 154.7 / 130.3 | 154.7 / 154.7 / 154.7 / 130.5 | 155 / 155 / 155 / 130 |
+  | KV gather, queue, tags only | 139.7 / 117.8 / 110.4 / 103.5 | 136.0 / 117.9 / 110.6 / 103.6 | 136 / 118 / 111 / 104 |
+  | KV gather, queue, `DMA_PACE` 72 KiB | 154.7 / 154.7 / 154.1 / 130.5 | 154.7 / 154.7 / 154.2 / 130.0 | 155 / 155 / 154 / 130 |
+
+  The paced and paced-queue rows agree within 1%. My tags-only weights are 8-11 below the reference, which serves a request as one
+  unit and frees tags on arrival; with 2 KiB requests mine reproduces the third verifier's 129.6 / 110.3 / 103.4. So the fix
+  session's explanation of that gap (per-granule requests) is one way to get it, not the only one. Every model agrees that tags
+  alone fall well short.
+- **`DMA_PACE` sensitivity**, own model, queue (the reference in brackets):
+
+  | limit | weights, L = 300 / 500 / 700 / 845 / 1,000 | KV gather, same L |
+  |---|---|---|
+  | 56 KiB | 154.7 / 154.7 / 140.4 / 116.6 / 98.7 | 154.7 / 154.7 / 144.3 / 119.3 / 100.7 |
+  | 64 KiB | 154.7 / 154.7 / 154.7 / 133.9 (137.6) / 113.7 | 154.7 / 154.7 / 154.7 / 136.7 (136.8) / 115.8 |
+  | 72 KiB | 154.7 / 154.7 / 154.7 / 150.6 (150.2) / 127.8 | 154.7 / 154.7 / 154.7 / 154.1 (154.2) / 130.5 |
+  | 80 KiB | 154.7 / 154.7 / 154.7 / 145.6 (144.0) / 128.6 | 154.5 / 154.5 / 154.5 / 146.3 (146.2) / 130.2 |
+  | 96 KiB | 154.7 / 154.7 / 142.4 / 132.0 / 122.5 | 154.4 / 154.4 / 142.6 / 132.0 / 122.2 |
+
+  Why it is sharp: with the limit on, the core's queue fills to it at any L below about limit / share. At 72 KiB the mean round
+  trip is 830-838 cycles at L = 300-700, not L. The effective round trip is max(L, limit / share). The ring covers NVFP4 up to
+  about 845 cycles, so the best limit is share x 845 = 4.5 x `DMA_STAGE`, whatever the share. A smaller limit binds at L = 845
+  itself, a larger one pushes the effective round trip past what the ring covers. That answers check-first item 2: the limit
+  belongs to the ring size and the format, not to the round trip (Y-2).
+- **Entry size** (weights, entries of 8 / 16 / 32 / 64 / 128 granules, i.e. 256 B to 4 KiB of scales; own model):
+
+  | entry | paced, L = 500 / 700 / 845 / 1,000 | queue + 72 KiB, same L |
+  |---|---|---|
+  | 8 granules (the reference's tests) | 154.7 / 154.7 / 153.8 / 129.5 | 154.7 / 154.7 / 150.6 / 127.8 |
+  | 16 | 154.7 / 154.7 / 152.3 / 129.1 | 154.7 / 154.7 / 148.6 / 126.4 |
+  | 32 | 154.7 / 154.7 / 149.4 / 126.4 | 154.7 / 154.7 / 144.8 / 123.6 |
+  | 64 (2 KiB of scales: one scale read) | 154.7 / 154.7 / 141.5 / 120.9 | 154.7 / 150.9 / 137.6 / 118.3 |
+  | 128 (4 KiB: a quarter of the ring) | 154.7 / 142.5 / 123.1 / 107.3 | 151.9 / 136.1 / 123.8 / 108.0 |
+
+  `isa.staging_ring` agrees: with 2 KiB of scales per entry it gives 141.7 at 845 cycles (paced) and 136.2 (72 KiB). With
+  quarter-size entries it gives 126.7 (paced) and 108.1 (72 KiB), and 128.1 even at L = 500, because one 36 KiB entry is half of
+  the limit. A scale must stay in the ring for two round trips plus the time its entry's data takes to stream. So the ring needs
+  scale rate x (2 L + T_entry), and four quarter-size entries do not "let scales run a round trip ahead" at 845 cycles (Y-1).
+- **MXFP4 and MXFP8** (non-split, 16 B / 8 B of scales per granule, entries of 8 granules), L = 500 / 700 / 845 / 1,000 / 1,200:
+  - tags only: the full rate (163.8 / 84.4) at every L, in both models;
+  - with 72 KiB: MXFP4 163.8 / 163.8 / 159.2 / 134.7 / 112.3, and MXFP8 84.4 / 84.4 / 82.0 / 69.0 / 57.3 (own model).
+    `isa.staging_ring` gives 163.3 / 138.0 and 84.1 / 70.9 at 845 / 1,000, and 80 KiB gives 153.4 / 78.9 at 1,000;
+  - with the count weighted by format (NVFP4 bytes in full, MXFP4 at 1/2, MXFP8 at 1/4, same 72 KiB): NVFP4 unchanged
+    (154.7 / 150.6 / 127.8 / 107.0 at 500 / 845 / 1,000 / 1,200), MXFP4 163.8 and MXFP8 84.4 at every L. With NVFP4 and MXFP4 in
+    two DQs at L = 1,000: 72.5 → 81.6 and 96.9 → 115.7.
+- **A plain stream in another DQ** (own model, queue, one core, 2 KiB plain reads limited by tags only, over the window where
+  both run):
+
+  | converting stream | `DMA_PACE` | L = 500: converting / plain, B/cycle | L = 845 |
+  |---|---|---|---|
+  | NVFP4 weights | off or 72 KiB | 43.3 / 43.7 | 43.3 / 43.8 |
+  | MXFP4 weights | off or 72 KiB | 42.2 / 44.9 | 42.2 / 44.9 |
+  | NVFP4 KV gather | off | 86.4 / **0.8** | 73.0 / **1.3** (total 74.2) |
+  | NVFP4 KV gather | 72 KiB | 83.6 / **3.5** | 83.1 / **3.6** |
+
+  The plain stream does push the paced stream's round trip up (1,446 cycles), but the weight stream does not collapse: the two
+  split the share and the total stays at 87 B/cycle. The KV gather instead starves the plain stream. Its requests take one tag,
+  and an 8-tag request rarely finds 8 free (Y-3). `isa.staging_ring` cannot show this: it shrinks a data request to the free
+  tags (`k < min(max_req, free_tags)`), which the text does not say.
+- **Per-PC queues, 8 cores of one stack** (32 PC FIFOs; mean / slowest core; L = 500 / 845):
+
+  | case | 16 KiB, 72 KiB | tags only | FIFO model, 72 KiB |
+  |---|---|---|---|
+  | 8 cores, weights | 154.7 (154.1) / 146.1 (145.0) | 152.7 / 127.9 | 154.7 / 150.6 |
+  | 8 cores, KV gather | **144.3 (142.9) / 132.4 (131.3)** | 126.2 / 107.1 | 154.7 / 154.1 |
+  | 8 cores, KV gather, 24 KiB ring | 151.8 / 141.1 | | |
+  | 8 cores, KV gather, 32 KiB ring | 152.4 / 141.1 | | |
+  | 8 cores, KV gather, out-of-order data issue | 144.3 / 134.5 | | |
+  | 1 converting + 7 plain cores, weights | 90.4 / 91.1 (≈ 51 B/cycle; plain cores 92 B/cycle each) | 92.5 / 91.7 | |
+  | 4 + 4, weights | 110.0 / 110.0 (≈ 62 B/cycle; plain 112) | 111.6 / 110.9 | |
+  | 1 + 7, KV gather | 78.8 / 78.5 (≈ 44 B/cycle; plain 93) | 77.8 / 79.0 | |
+
+  Instrumented at L = 500, the paced KV core's ring holds 16.2 KiB of 16 KiB (about 507 entries) while it uses 365 tags and
+  52.7 KB of the limit. Per-PC latency varies (hbm.md H4 has a 133 ns mean and a 367 ns p99 queue wait at 85% load), and
+  in-order reclaim turns the tail into ring occupancy. The single FIFO has no variance, so it hides this (Y-4). The FIFO is
+  pessimistic for tags-only streams and close for paced weights.
+- **Z-1 boundaries**, own model, four DQs of DeepSeek index-key rows (64 B, 4 B of scales) from row 2 of a page, entries of 256 rows
+  (4 KiB ring) or 512 rows (16 KiB):
+  - cut: always completes (72,779 / 97,433 cycles paced, 76,521 / 97,038 queue + 72 KiB);
+  - shared: deadlocks, last progress at about cycle 2,340 / 13,790 paced and 550 at 4 KiB with queue + 72 KiB. At 16 KiB with
+    queue + 72 KiB it completed, so the deadlock depends on timing, and the rule (cut) is what removes it;
+  - one DQ: completes in every mode.
+- **Addresses** against `isa.block_addr` / `isa.inline_addr`:
+  - An Engram row from a separate scale array (MXFP8, s1 = 256, `aux0` 8; index 12345, i0 = 33) gives data `0x4000303921` and
+    scale `0x50000181c9`, so that layout is legal today.
+  - A Qwen BF16 n-gram row (320 B, base + 8) has no block rule, and `SCALE_INLINE` on it faults `ILLEGAL_FIELD` (needs a block
+    format).
+  - `inline_addr` accepts `row_bytes` = 0, while memmap.md §6 says a gather's `row_bytes` is the row's size (Y-7).
+
+Verdicts: **resolved**; **resolved, gap** (closed, but a residual or new case is listed below as Y-n); **not resolved**.
+
+| # | Verdict | Notes |
+|---|---|---|
+| Z-1 | resolved, gap | The rule ("every data read and every unit in exactly one entry; cut inside a granule") closes the scenario. In my model the shared reading deadlocks with four DQs and cut never does. **Check-first item 3 (cut reads end to end):** they work, but only by reading between the lines. `RD_REQ` has `len` in bytes, so a request can start and end mid-granule. `RD_RSP` carries `tag` and `gidx` but no `len` (`noc_header`: `len` is not an `RD_RSP` field) and is always 2 flits. The valid bytes of a half must come from the tag table's address and length, the payload must be granule-aligned, and `gidx` must count HBM granules from the request's first one. None of that is written. The HBM burst at the cut is read twice only when the cut falls inside a 32 B burst. Index-key (64 B) and fold (128 B) boundaries never do; a contiguous `SCALE_INLINE` copy (264 B rows) does. Each half has its own request, so its own tag-table entry and SPM destination; the converter needs the half's element offset (byte 128 of an NVFP4 granule is element 256) and its entry's ring pointer from that entry (Y-5). |
+| Z-2 | resolved, gap | **Check-first item 1:** the §2.5 table reproduces in my model within 1% (above) for the reference's streams. Four gaps. Y-1: the rates need entries of about 8-16 granules, which §2.5 does not say, and quarter-size entries give 123-127 (paced) and 108-124 (72 KiB) at 845, own model and reference. Y-2: the 72 KiB limit costs MXFP4 and MXFP8 16-18% at L = 1,000, where tags alone keep the full rate. Y-4: with per-PC queues the KV gather gets 132, not 154, at 845, and neighbours' greedy traffic halves a converting core's share whether it is paced or not. Y-6: a limit below one request. **"Does a plain stream push a paced stream back into the queueing regime?"** Its round trip, yes (1,446 cycles). Its rate, no: weights and plain split the share and deliver 87 B/cycle together. The real exposure is tag starvation in the other direction (Y-3). |
+| Z-3 | resolved, gap | The 2 KiB minimum, the 272 B largest unit and the inline entry hold. The fault is on the conversion, and the entry bounds are as stated. In the tests every entry is within a quarter. But "the quarter is a rate target: four entries in flight let scales run a round trip ahead" is wrong for scale-only entries (Y-1). |
+| Z-4 | resolved, gap | The exemption and the five `ILLEGAL_FIELD` conditions match `isa.inline_addr`, the Engram test, `isa.yaml` and memmap.md §6, and the separate-array W-5 fault is kept. **Check-first item 4:** the Qwen BF16 rows are plain (no block rule, `SCALE_INLINE` faults, not paced, not staged). The Engram table "as published" is FP8 with a scale per 32 (model_features.md row 7, `ingest.py` notes). Nothing in the repo shows the scales inline, hyper_connections.md §4 still speaks of "the separate scale array" and G-3 of an "optional scale-array base", and no spec says who repacks 197 G elements into 264 B rows. A separate-array gather is legal today and non-split (Y-7). The bytes note does not add up (Y-7). |
+| Z-5 | resolved, gap | The S30 scenario is closed: the drain wait covers the parity's last n credits, the final credit orders Y's first add, and Y's base is the drain target. **Check-first item 5, walked:** S on P is X's parity-0 credit semaphore (8 consumers, U uses of that parity), then Y's parity-0 buffer semaphore (4 producers, `rsem`), then Z's credit semaphore again. (1) X → Y: P's drain target is base + 8U, 8 more than its last credit wait. After it, P sends one final credit to each of the 4 producers, Y's base is base + 8U, and the producers' first Y write waits for that credit. That credit is one more count on each producer's own credit semaphore for Y's parity 0, which its later credit targets must include. (2) Y → Z: the drain wait is Y's last buffer wait (bytes, from the base table when data-dependent). Z's adds are consumer credits caused by P's own Z writes, issued after the drain in the same DQ or behind a local semaphore. Nothing reaches the old use. **Is the target computable from the map and the base table alone?** For buffer semaphores, yes. For credit semaphores only if n is fixed per call site. With a data-dependent consumer set per use (n_u), the base table as defined ("the previous use's final wait target") does not hold the last use's n, and an idle last use (no later write waits for its credits) invites a compiler to drop that credit, after which the drain wait hangs (Y-8). |
+| Z-6 | resolved, gap | One credit semaphore per parity is right: a credit for u needs the write of u, which waited for u - 2. The multi-adder flag rule closes the 8-die ready flag. **Is the single-adder exception safe with more than one DQ?** Yes. The exception requires the adds to come from one DQ, so adds from two DQs are not exempt, and the check reports them (an add for s + 1 from DQ 1 can overtake an add for s from DQ 0, because a `SIGNAL` releases only its own queue). It is conservative: two-DQ adds that are each causally after the owner's wait are legal but flagged. The ordering argument holds for `SIGNAL`s only (a `SEM` packet is acked like a `WR`), not for `rsem` adds, whose transfers overlap in a queue. Flags are `SIGNAL`-only by isa.md §3, so this is wording (Y-9). |
+| Z-7 | resolved, gap | Conditions 1-3 close the scenario: after `err_done` no new `ERR` is injected, and none can be created, since no core of the step sends. **Check-first item 6, is 10 µs above the worst transit?** By estimate, yes, about 16x. Faulted and stopped cores drop responses at line rate (isa.md §8), so they are not converter-paced. The slowest live sink is a converting core at about 2 cycles per 256 B. With 6-flit RSP VCs, cut-through, 3 cycles per hop and round-robin over at most 6 ports x 2 RSP VCs, a hop waits at most about 6 x 2 x 3 packets x 2 cycles = 72 cycles, and about 12 hops make about 900 cycles against 15,000. It is a bound only if no sink stalls for long; SPM port arbitration against the DMA is not bounded in the spec, and Phase 5 has "bounded liveness per router". **A hardware bound?** An `ERR` age counter at the bridge sees injection, not delivery, so it adds nothing to the CP's timer. An epoch bit would make the transit irrelevant (Y-10). **"No recovery budget in the spec" is sound:** no hardware size or default depends on it, and L-11 assigns it to the runtime with the availability target. |
+| Z-8 | resolved, gap | Per-DQ order, per-packet round-robin across DQs and ceil(bytes / 256) tags per scale read now match text and model. But round-robin over DQs "that have a packet ready" lets single-tag requests starve multi-tag ones in other DQs. The text counts tags per granule while the header has one 9-bit tag per request with a 3-bit `gidx`, so what a tag is remains undefined (Y-3). |
+
+**Earlier verdicts, re-checked after these changes:**
+- W-1 (liveness): holds. Pacing adds a wait that responses release unconditionally, so an allocated entry still needs only tags and
+  pace. That holds only if a converting read can always issue when none is in flight, which the reference does and the text
+  does not say (Y-6).
+- W-3: holds; Z-5 completes it, with Y-8 as a clarification.
+- W-5: holds. The separate-array rule still faults the element-8 slice and an `s1` that is not whole blocks (`test_isa.py`).
+  `SCALE_INLINE` is exempt by an explicit flag, so the exemption cannot widen silently.
+- V-1 (sink): holds. In my model no non-split response arrived before its entry's scales, in any mode.
+- V-3 and X-6 rule 2: hold for deadlock. Tags and pace are freed by responses, which sink unconditionally, and `DMA_LIST` forwards
+  are plain (no pace, no ring). They do not hold for rate: a tag-hungry DQ can starve another DQ's multi-tag reads (Y-3).
+- D1: not reopened. The 1.60x margin is converter and SPM port capacity for NVFP4 → BF16, which `DMA_PACE` does not change. Y-2
+  is about the delivered rate of MXFP4 / MXFP8 streams, a separate question.
+
+## Verification 4 findings
+
+| # | Sev | From | Finding | Failure scenario | Suggested resolution |
+|---|---|---|---|---|---|
+| Y-1 | M | Z-2, Z-3 | **The §2.5 rates need small entries, and the spec does not size them.** The text says only that entries are at most a quarter of the ring and "usually" have one scale read, and it calls the quarter a rate target ("four entries in flight let scales run a round trip ahead"). A non-split entry's scales stay in the ring for two round trips plus the time its own data takes to stream, so the ring must hold scale rate x (2 L + T_entry). The reference's tests use 8-granule entries (256 B of scales), which is why they reach the table. | An RTL that forms the largest entries the text allows (4 KiB of scales, 32 KiB of data, the fewest scale requests) runs NVFP4 → BF16 at 123 / 124 elements/cycle at 845 cycles (own model, paced / 72 KiB; `isa.staging_ring` 127 / 108, and 128 with the limit even at L = 500). Entries of one 2 KiB scale read give 141 / 138 (own model). It still passes a Phase 3 comparison against `isa.staging_ring` if the test feeds it the RTL's own entry sizes. | State the entry size for scale-only entries: at most one data request (8 granules, 256 B of NVFP4 scales; 16 granules costs about 2 elements/cycle at 845). Keep the quarter as the bound for entries with raw slots, and replace the "four entries in flight" sentence with the 2 L + T_entry rule. Add a reference test with quarter-size scale-only entries that shows the loss, and a Phase 3 check that the RTL's entry size is the specified one. |
+| Y-2 | M | Z-2 | **`DMA_PACE` at 72 KiB throttles MXFP4 and MXFP8 streams that the ring does not limit.** 72 KiB is NVFP4's ring coverage (4.5 x `DMA_STAGE`: 32 B of scales per 256 B granule). MXFP4 carries 16 B per granule and MXFP8 8 B, so the ring covers them far beyond 845 cycles, and the limit becomes the only bound: rate ≤ limit / L. DeepSeek V4.1's experts are FP4 with a scale per 32 (MXFP4), its largest decode weight stream, and remote (D2D / C2C) round trips are longer than local ones. The §2.5 table, the tests and the Phase 7 check cover NVFP4 only. | MXFP4 weights at L = 1,000 / 1,200: 134.7 / 112.3 elements/cycle with the default limit against 163.8 with tags only (`isa.staging_ring`: 138.0 at 1,000); MXFP8 69.0 / 57.3 against 84.4. A runtime that raises the limit for MX streams pushes the next NVFP4 kernel past the ring's coverage (96 KiB: 132 at 845). | Weight the count by format, NVFP4 bytes in full, MXFP4 at 1/2, MXFP8 at 1/4 (a shift). In my model that keeps NVFP4 unchanged and MXFP4 / MXFP8 at the full rate to 1,200 cycles. Better still, derive the limit from `DMA_STAGE` in hardware (4.5 x the ring size, so the runtime cannot detune it), keeping the CSR as an override. Add MXFP4 and MXFP8 rows to the §2.5 table, the delivery-limited test and the Phase 7 check. |
+| Y-3 | M | Z-8, V-3 | **Tags are undefined per request or per granule, and multi-tag requests starve.** §2.5 and the reference count 512 tags in granules (a 2 KiB read takes 8). The `noc_header` has one 9-bit tag per request plus a 3-bit `gidx`, so either a request takes 8 consecutive tags (and allocation fragments) or a tag is per request and the 512 granules are a separate credit count. Nothing says which. Arbitration is round-robin "over the DQs that have a packet ready". If ready means its tags are free, a DQ of single-tag requests takes every freed tag. The reference hides this by shrinking a data request to the tags that are free, which the text does not say. | A decode attention step runs a long paged NVFP4 KV gather (32 B scale reads and 256 B rows, one tag each) in DQ1 and fetches the next layer's activations (2 KiB plain reads) in DQ2. DQ2 gets 0.8-3.6 B/cycle for the whole gather (own model, L = 500 / 845, pace off or on). It is not a deadlock, since tags are freed unconditionally, but "four queues served independently" fails as a rate claim, and the stall lands on the critical path. | Define the resource: one tag per request (a table of request entries) plus a count of 512 granules in flight, or consecutive granule tags with the allocation rule. Choose the round-robin winner among DQs with a packet ready regardless of tags, and let it hold its turn until its granules are free (no younger request overtakes it). Never hold the turn for ring space, which is freed by the data reads it would block. Or state the reference's shrinking. Add a Phase 3 test: a KV gather plus a plain stream in two DQs, with the plain stream getting a fair part of the share. |
+| Y-4 | M | Z-2 | **The FIFO share overstates the KV gather, and other cores' traffic is outside the rule.** With 32 per-PC queues shared by 8 cores, the paced KV gather is ring-bound, not tag-bound. Per-PC latency variance, through in-order reclaim, fills the 16 KiB ring with 32 B entries while tags and pace have room. Separately, a per-PC FIFO shares bandwidth in proportion to bytes queued. A converting core's queued bytes are capped by its ring (or pace), and a plain core's only by its 128 KiB of tags. hbm.md's scheduler is FR-FCFS and oldest-first, with no fairness per initiator, and noc.md §7 has no QoS in v1. | 8 cores of one stack on the paged KV gather, 72 KiB: 144 / 132 elements/cycle at L = 500 / 845 (own per-PC model) against the table's 155 / 154. A 24 KiB ring gives 152 / 141, and out-of-order data issue does not help. One converting core among 7 cores streaming plain reads gets about 51 B/cycle (weights) or 44 B/cycle (KV) while each plain core gets 92-93, paced or not. The weights hold within 3% (155 / 146). | Mark the KV rows of the §2.5 table as single-FIFO results. Add to the Phase 7 check the 8-core per-PC case and a mixed-traffic case (one converting core, seven plain). Give the runtime two options to cost there: a 24 KiB ring for KV-heavy kernels, and per-initiator fairness in the HBM scheduler. My per-PC model has no bank timing, no FR-FCFS and no mesh, so Phase 7 decides. |
+| Y-5 | L | Z-1 | **Partial-granule responses are not specified.** A cut read is a request that starts or ends mid-granule. `RD_RSP` has no `len`, so the valid bytes, the payload alignment and the meaning of `gidx` for a request that starts mid-granule are implied, not stated. | An NI that packs the payload from the request's first byte, rather than from the granule's, writes the second half of a cut granule shifted by its offset, silently. Or an HBM controller that reads whole granules for partial requests doubles the bursts of a cut. | One paragraph in noc.md §2 and microarch.md §2.5. An `RD_RSP` payload is granule-aligned, its valid bytes are the request's range within that granule (from the tag table), `gidx` counts granules from the one holding the first byte, and the controller reads only the 32 B bursts that the range touches. The tag-table entry holds the SPM destination, the element offset and the entry's ring pointer. Phase 3 test: one granule cut at byte 128 into two entries, checking both halves' data, `gidx` and SPM destinations. |
+| Y-6 | L | Z-2, W-1 | **A `DMA_PACE` below one request never issues, and the counter is a bit short.** The text says "at most `DMA_PACE` bytes in flight". The CSR takes any multiple of 64 B, so a nonzero limit below 2 KiB (or below the largest scale read) blocks every request of that size. The reference avoids this by letting a converting read issue when none is in flight (`room()`: `infl == 0`). Separately, the counter is 17 bits, while converting reads can hold all 512 granules, 2^17 B, which needs 18 bits (the CSR field is 18). | The runtime writes `DMA_PACE` = 1 KiB to throttle a stream; the first 2 KiB converting read waits forever and the core hangs with no fault. Or, with the limit set at 128 KiB or above, a 17-bit counter wraps when all 512 granules are converting reads, and the next request passes a limit it should not. | State the reference's rule (a converting read may always issue when none is in flight), or fault `ILLEGAL_FIELD` for a nonzero limit below 2 KiB. Make the counter 18 bits. |
+| Y-7 | L | Z-4 | **The Engram layout and its bytes are not settled.** The checkpoint has FP8 with a scale per 32, and nothing shows the scales inline. hyper_connections.md §4 keeps "the separate scale array" in the bytes note and G-3's "optional scale-array base", and no spec says who builds 264 B rows. A separate-array gather is legal now (s1 = 256, `aux0` 8) and non-split: one aligned granule plus a 32 B scale read, like the KV gather, so not staged raw (inline: 0.12 rows/cycle). The note's "about 18 KB" fits neither layout: 48 rows of 264 B are 12.7 KB, inline rows touch 9-10 32 B bursts (about 14.9 KB), the separate array 288 B per row (13.8 KB); only 6 x 64 B per row gives 18 KB. `inline_addr` accepts `row_bytes` = 0 for a gather. | The runtime loads the published table as is (256 B rows, scales in their own array), and the compiler emits the inline gather the specs describe. With s1 = 256 it faults `ILLEGAL_FIELD`. With s1 = 264, every row after row 0 is read from the wrong bytes, silently. Or a 197 GB repacking pass appears that no plan item lists. | Say in hyper_connections.md §4 and memmap.md §6 which layout the runtime stores and that it repacks at load, or choose the separate array (no raw staging, about 2.5x the ring rate, two requests per row). Correct the bytes note and G-3. Make `row_bytes` = 0 an `ILLEGAL_FIELD` for an inline gather, or say it means the row size. |
+| Y-8 | L | Z-5 | **A credit semaphore's drain target needs the credits expected, not the last wait target.** The base table holds "the previous use's final wait target". A credit semaphore's last wait covers the use before the last, so the drain target is that plus the last use's n. With a data-dependent consumer set (n_u, for example only the destinations that received data), the map does not give it. A last use whose credits no later write waits for is also the one a compiler would drop, and the final credit adds one to each new adder's credit count. | An all-to-all whose consumer set varies per use moves its credit semaphore: P drains to base + (n of the last wait's use) + (a static n), passes early or hangs. Or the consumers' last credit is optimized away, and P's drain wait hangs: a program deadlock that only the X-6 detector catches. | Define the base-table entry of a credit semaphore as credits expected so far, updated when the producer writes a use (+ n_u), so the drain target is the entry. Say that every use is credited, including the last. Say that a final credit counts as the credit of use -2 of that parity of Y. Add a moved data-dependent credit semaphore to the PLAN test programs. |
+| Y-9 | L | Z-6 | **The single-adder exception should name `SIGNAL`s.** Its ordering argument (each `SIGNAL` waits for the earlier ones' acks) holds for `SIGNAL` adds from one DQ, not for `rsem` byte adds, whose transfers overlap within a queue. The check flags single-adder adds from two DQs even when each is causally after the owner's wait. | A compiler that implements the exception as "single adder, one DQ" accepts a one-producer `rsem`-counted flag that runs ahead, and two overlapping transfers interleave their counts. | Write "a flag with one adder whose `SIGNAL`s all come from one DQ". Adds from several DQs fall back to the general causal rule instead of being a violation. |
+| Y-10 | L | Z-7 | **`T_DRAIN` is a time constant where an epoch bit would be a guarantee.** 10 µs is about 16x the estimated worst transit, but the estimate assumes every sink keeps draining. The header has 6 reserved bits (`rsv` [127:122]), and the bridge already holds the request head it answers. | A long SPM-port stall on a live converting core (unbounded in the spec) holds a stale `ERR` on the mesh past `T_DRAIN`. The restarted step faults `LINK` and recovery runs again. The CP sees a second link-down event that is not one. | Optional: the core puts an epoch bit (a CSR the CP toggles at each restart) in every request header, the bridge copies it into its `ERR`, and the core drops a `LINK` `ERR` of the other epoch. One bit suffices, because (d) already waits a timeout between restarts. Then `err_done` and `T_DRAIN` become belt and braces. Decide before `core/ni` RTL, since it changes the header. Otherwise keep the rule and let Phase 4 measure the worst transit under SPM-port load. |
+
+## Before Phase 3, after verification 4
+
+| Block | Still open |
+|---|---|
+| `core/dma` | Y-1 (entry size), Y-2 (pace weighted by format and derived from `DMA_STAGE`), Y-3 (what a tag is; arbitration that does not starve multi-tag requests), Y-6 (a limit below one request, an 18-bit counter); text: Y-5. All are spec decisions the RTL would freeze. |
+| `core/ni` | Y-5 (`RD_RSP` for partial granules); Y-10 if the epoch bit is taken (header change) |
+| `core/seq` | none. Y-8 and Y-9 are compiler rules; the semaphore hardware is unchanged |
+| `hbm` | none; X-2 (a), (c)-(e) stay on the H-9 checklist. Per-initiator fairness is a Phase 7 question (Y-4) |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | Y-10 (epoch bit, or the `T_DRAIN` measurement under SPM-port load); W-2 and Z-7 tests as listed in PLAN |
+| compiler / runtime | as after the verification 3 fixes, plus Y-7 (the Engram layout and who builds it), Y-8 (credit base table, credit every use, the final credit's count), Y-9 (wording) |
+| Phase 7 | Z-2 / Y-4: per-PC queues with 8 cores, mixed converting and plain cores, and MXFP4 / MXFP8 rows (Y-2), at the default `DMA_PACE` and with it off |
+
+**Can `core/dma` start Phase 3 RTL?** Partly. The address generators (paged, block, inline, gather and scatter), the conversion
+datapath, write packets and ack counting can start now: nothing found here touches them. The request-issue side (ring entry
+sizing, the pace counter, the tag table and the DQ arbitration) should wait for Y-1, Y-2, Y-3 and Y-6. Each is a few lines of
+spec and a reference test, not a redesign, but the RTL would otherwise freeze the choices that cost 16-28% at an 845-1,000-cycle
+round trip or starve a DQ. `core/ni` should settle Y-5 (and Y-10, if taken) before its response path is written.
+
+Where an executable check is needed beyond these probes:
+- Y-1, Y-2 and Y-3, now, before `core/dma` RTL: `isa.staging_ring` with quarter-size scale-only entries, MXFP4 / MXFP8 streams under
+  the limit (flat and weighted), and a plain DQ next to a KV gather without request shrinking (or a test of the stated shrinking).
+- Y-5: the Phase 3 `core/dma` / `core/ni` test with a cut granule.
+- Y-4 and Y-2: the Phase 7 performance simulator with real per-PC queues and bank timing, 8 cores per stack, mixed traffic.
+- Y-8 and Y-9: the Phase 3 golden-model semaphore check, with a moved credit semaphore whose consumer set varies per use.
+- Y-10: the Phase 4 late-`ERR` test, with an SPM-port stall on a live core during the drain.
+
+**Not checked:**
+- the JESD238 items (still unavailable);
+- the generated SV and C++ beyond the lint in `make isa`;
+- my per-PC model's fidelity: FIFO per PC, no bank or row timing, no FR-FCFS, no refresh, no mesh, 8 symmetric cores, my own
+  address placement;
+- the SPM port load of staged scales and raw split units, and SPM arbitration against the DMA write (it bounds Z-7's estimate);
+- the RSP flit cost of 32 B scale responses and partial granules (`RD_RSP` is always 2 flits);
+- the Z-7 transit bound, estimated rather than modelled;
+- whether a step can share a die with another step (L-4 (e) restarts "every core of the step", and a core of another step whose
+  transfer used the link also faults);
+- the published Engram checkpoint itself (no network; repo notes only);
+- the golden-model checks, which do not exist yet (Z-5, Z-6, Y-8 and Y-9 were argued, not run);
+- `make numerics`, `make hbm`, `make links`: not rerun, since their inputs did not change.
