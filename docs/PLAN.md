@@ -257,7 +257,12 @@ session checks the fixes next.
   - REQ blocked at the receiving leaf while RSP keeps draining through the same link (per-VN queues, I-7);
   - `PKG_TINY` link down under load: every core with a transfer through the link faults, with `LINK` (requests still on its
     side, including those in the replay buffer) or `TIMEOUT` (requests the far side had accepted), the mesh drains, faulted cores
-    keep sinking responses and serving target requests, and the CP still reaches every core (X-5, V-7).
+    keep sinking responses and serving target requests, and the CP still reaches every core (X-5, V-7);
+  - the same with only the reverse path failed (W-2): cores whose transfers completed may also fault with `LINK` (a stale
+    replay-buffer `ERR`, possibly for a reused tag), no core faults with any other cause, a response for a tag that is not
+    outstanding is dropped, a `LINK` `ERR` frees no tag, `STATUS` stays busy until every tag is freed by its response or
+    timeout, and after the CP restarts the step no response of the old step is accepted (a delayed duplicate response for a
+    reused tag is injected).
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.

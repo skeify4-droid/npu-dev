@@ -173,7 +173,7 @@ enums:
     NODE_ID: 0x001
     CYCLE: 0x002
     PC: 0x003
-    STATUS: 0x004    # queue busy bits, fault bit
+    STATUS: 0x004    # queue busy bits, fault bit; the DMA stays busy while tags or write bursts are outstanding, also after a fault (review W-2)
     FAULT_CAUSE: 0x005
     FAULT_ADDR: 0x006
     FP_STATUS: 0x007   # sticky FP flags, write 1 to clear: [0] INVALID [1] OVERFLOW [2] SATURATE [3] NAN_IN (numerics.md N-5)
@@ -195,7 +195,7 @@ enums:
     HBM_ALIGN: 9       # HBM write not 32 B aligned in address and size (hbm.md H-2)
     SEM_BUSY: 10       # SSET on a semaphore that queued instructions reference
     PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
-    LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4)
+    LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4); may be stale (W-2): always faults, frees no tag, FAULT_ADDR advisory
     ERR_RSP: 13        # a target returned ERR for another reason
     TIMEOUT: 14        # a DMA request got no response within the timeout (CSR); a link going down reports LINK instead
   list_op:             # DMA_LIST entry kinds (dma_list_entry.op)

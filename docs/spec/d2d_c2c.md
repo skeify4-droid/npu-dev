@@ -114,6 +114,23 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     side of the link (arriving, or in the replay buffer), and with `TIMEOUT` if the far side had already accepted it and its
     response was lost. Bridges keep no table of outstanding requests, so the second case cannot get an `ERR`. The CP treats a
     `TIMEOUT` during a link-down event as part of it.
+  - **A replay-buffer `ERR` can be stale *(review finding W-2)*.** When only the reverse path fails, the far side has accepted
+    every flit in the replay buffer, and link down is declared only after more than 8 timeout-driven replays (about 576
+    cycles). The far side's response may already have come back over another sub-link (noc.md §6), and the tag may have been
+    reused, possibly by a request that never used the link. So:
+    - **(a)** an `ERR` (`LINK`) always faults the core, whether or not its tag or burst id is outstanding, and it **frees
+      nothing**: it may name a tag that a newer request now holds. Other `ERR` causes come from the target itself and free
+      their tag;
+    - **(b)** a response or write ack for a tag or burst id that is not outstanding is dropped (after a fault every response
+      is dropped, isa.md §8);
+    - **(c)** during a link-down event `FAULT_ADDR` is advisory. The CP restarts every core of the step, whichever cores
+      faulted and with whatever address;
+    - **(d)** a faulted core's tags and burst ids are freed only by their responses or acks (dropped) or by the per-request
+      timeout. `STATUS` shows the DMA busy until all are free, and the CP restarts a core only after that: at most one timeout
+      (100 µs by default) after the fault, added to a recovery that already includes a link retrain. So no late response of
+      the old step matches a tag of the new one.
+    - The data outcome is unchanged: the step restarts, and the CP zeroes the network-facing semaphores at the quiescent
+      restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive.
   - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface
     (isa.md §8).
   - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
@@ -325,4 +342,5 @@ with TP > 2:
   credit lost or double-counted, X-4); credit counters wrapping past 2^12; REQ blocked at the receiver while RSP keeps draining
   (I-7); link down under load on `PKG_TINY`: every core with a transfer through the link faults, with `LINK` (requests still on
   its side, including the replay buffer) or `TIMEOUT` (requests the far side had accepted), and the CP still reaches every core
-  (X-5, V-7).
+  (X-5, V-7); with only the reverse path failed, cores whose transfers completed may also fault with `LINK`, and no late
+  response of the old step is accepted after the restart (W-2).

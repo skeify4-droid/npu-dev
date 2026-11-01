@@ -296,7 +296,9 @@ S4 as well and the wait is `S4 >= 2`. The compiler's scheduler does this countin
 A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP.
 - "Stops" means the front end and the engines (review finding V-7). The network interface keeps working: responses to the core's
   outstanding requests are still accepted and dropped (their tags freed), and its SPM, GSRAM and CORECTL targets keep serving
-  requests. So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  requests. A response for a tag that is not outstanding is dropped, faulted or not. A tag is freed by its response, by an
+  `ERR` other than `LINK`, or by its timeout, and `STATUS` shows the DMA busy until every tag and burst id is free; the CP
+  restarts the core only then (d2d_c2c.md L-4, review finding W-2). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
   recovery accesses rely on.
 
 Causes:
@@ -307,7 +309,9 @@ Causes:
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
 - an invalid page-table entry in paged DMA;
 - a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4). A request the
-  far side had already accepted gets no `ERR` and faults with `TIMEOUT` instead;
+  far side had already accepted gets no `ERR` and faults with `TIMEOUT` instead. A replay-buffer `ERR` can be stale and name a
+  tag that is free or reused (review finding W-2): an `ERR` (`LINK`) always faults the core, frees no tag, and makes
+  `FAULT_ADDR` advisory; the CP restarts every core of the step;
 - a DMA request with no response within the timeout CSR (`TIMEOUT`; review finding I-15, which separates it from `LINK`);
 - an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);
 - a `DMA_MCAST` without `rsem` (`ILLEGAL_FIELD`).

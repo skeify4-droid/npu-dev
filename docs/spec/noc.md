@@ -211,7 +211,8 @@ across both planes (`noc.scenarios()`).
   Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down keeps sinking: its bridge answers
   requests with `ERR` (`LINK`), including the requests in its replay buffer, and drops everything else, so the mesh drains and
   the cores with transfers through it fault, with `LINK` or, for requests the far side had accepted, `TIMEOUT` (review findings
-  X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8).
+  X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8). A replay-buffer `ERR` can be stale, so
+  it may also fault a core whose transfer completed; it frees no tag, and the CP restarts the whole step (W-2).
 
 ## 8. Open items
 
