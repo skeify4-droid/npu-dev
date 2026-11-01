@@ -234,7 +234,7 @@ session checks the fixes next.
 | `core/acc` | accumulator SRAM (2048 x 64 FP32), MXU read-modify-write port, VPU port, conflict stall | directed + random vs NumPy |
 | `core/vpu`, `sfu` | lanes, reductions, exp/recip/rsqrt (LUT + polynomial), top-k unit | ULP-error bounds vs NumPy |
 | `core/dma` | strided, gather/scatter, paged (row pages with in-page scales), MXFP4 / NVFP4 / MXFP8 conversion to E4M3 + column scales or BF16 (256 elements/cycle), scales staged before their data (`DMA_STAGE` ring), write packets merged across adjacent rows, four DQs served independently, outstanding-request tracking, ack counting | cocotb + formal on address generator; the memmap.md §6 appends (DeepSeek index key, MiniMax KV) and the n2 = 4 group read against `isa.paged_addr`; a converting gather whose scale responses are delayed behind its data (`ni_rsp` must keep sinking); a DQ blocked on a semaphore while another DQ streams |
-| `core/seq` | ISA fetch/decode, queues with captured operands, semaphores (serial-number compare); no scoreboard (isa.md §10) | directed + random programs |
+| `core/seq` | ISA fetch/decode, queues with captured operands, semaphores (serial-number compare); no scoreboard (isa.md §10); no kernel barrier: a core starts its next kernel when it halts (isa.md §3) | directed + random programs |
 | `core/ni` | network interface: initiator for the DMA, SPM / GSRAM / CORECTL target, write-add ALU, ack coalescing (noc.md §2) | cocotb vs `noc.ack_coalescer` |
 | `core/spm` | banked scratchpad, bank-conflict arbitration | formal (no lost/duplicated requests) |
 - Exit: every block has lint-clean code under Verilator `-Wall`, green unit tests and green formal. `TINY` core runs a GEMM program from the assembler.
@@ -297,7 +297,8 @@ session checks the fixes next.
 - **Program-level deadlock detector** (independent spec review X-6): report a deadlock when every engine and front end of every core
   is blocked on a semaphore wait (or a full queue behind one) and no transfer is in flight, with the wait chain. The golden
   instruction-level model (`sw/compiler`, Phase 3) gets the same check next to its SPM race checker; the compiler's issue-order
-  rule (d2d_c2c.md L-7) is what it guards.
+  rule (d2d_c2c.md L-7) is what it guards. It also checks the kernel-boundary rule (isa.md §3, review finding V-2): every add to a
+  network-facing semaphore follows the consumer's credit for that buffer parity's previous use, also across kernels.
 
 **Data handling within 16 GB**
 - Binary trace records (about 24 B each), zstd streamed to the SSD. Rough size: one decode layer on one die is about

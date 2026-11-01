@@ -55,11 +55,27 @@ Rules:
     running**, because adds from other cores may be in flight and nothing orders them against `SSET`. The CP zeroes these only at a
     quiescent point (boot, or a restart after a fault, with every core stopped and the links drained). Using `SSET` or `SIGNAL`
     mode 1 on one in a kernel is a program error; the golden model flags it.
-- **Kernel boundaries.** A kernel's wait targets on a network-facing semaphore are `base + count`, where `base` is the value after
-  every add of the previous kernel has landed: the previous kernel's final wait target, which the program or the runtime carries
-  forward (the CP writes it into SPM with the launch arguments). Reading the live value would not do, because adds of the next kernel
-  from a faster producer may already have arrived. Totals per kernel are fixed at compile time, so the carried base is exact.
-  - Rejected: a kernel-boundary barrier before `SSET`, which would need a system-wide quiescence point every kernel.
+- **Kernel boundaries** *(review findings I-4, V-2; rule chosen by the user, 2026-11-01)*. There is no barrier between kernels: a
+  core starts its next kernel when it halts, so adds of kernel k + 1 from a faster producer may arrive while a consumer is still in
+  kernel k. Two rules keep the kernels apart:
+  - **Credit before reuse.** Every network-facing semaphore belongs to a receive buffer under the d2d_c2c.md L-6 discipline: two
+    buffers per call site used alternately, one semaphore per buffer parity, and a credit `SIGNAL` from the consumer once it has
+    consumed a buffer. A producer writes a parity's buffer, and adds to its semaphore, only after the credit for that parity's
+    previous use. Parities and credit counts carry across kernel boundaries, so a kernel boundary is only another call. This holds
+    for collectives, pipeline hand-offs and HBM buffers that complete by `SIGNAL`.
+  - **Carried base.** A wait target is `base + count`, where `base` is the previous use's final wait target, carried forward by
+    the program or the runtime (the CP writes it into SPM with the launch arguments). Totals per use are fixed at compile time, so
+    the carried base is exact, and it needs no read of the live value.
+  - Example (V-2): 32 contributors write-add into an owner's buffer with `rsem`. Contributor A halts kernel k and starts k + 1. Its
+    adds go to the other parity's semaphore. Its next adds to kernel k's semaphore (kernel k + 2) wait for the owner's credit, which
+    the owner sends only after its kernel-k wait. So the owner's kernel-k count holds kernel-k bytes only.
+  - The golden model checks that every add to a network-facing semaphore follows the credit of that parity's previous use.
+  - Rejected:
+    - A barrier per kernel (start kernel k + 1 only after every core that shares a network-facing semaphore has halted k). It puts
+      a system-wide sync on the critical path of every kernel: about 0.6-4.5 µs across 8 dies, 0.4-2.7% of a DeepSeek decode step
+      at one kernel per layer.
+    - Semaphore sets alternating by kernel parity. They double the network-facing semaphores, and kernel k + 2 would still need
+      the credit or a lagged barrier.
 - The register value in a wait condition is captured at issue, so loop counters work directly.
 - **Same queue:**
   - MQ and VQ instructions see the memory effects of earlier instructions in the same queue.
@@ -82,8 +98,9 @@ Rules:
   - The data is ordered at each destination only by its `rsem`, which is therefore required (`ILLEGAL_FIELD` if S0). A `SIGNAL`
     after a multicast is not a release of the multicast data.
   - Each destination program waits for the full byte count of every multicast it is sent before it halts. Then all multicast data of
-    a kernel has landed when every core of the kernel has halted, which is what the CP waits for before it reads results or loads the
-    next kernel.
+    a kernel has landed when every core of the kernel has halted, which is what the CP waits for before it reads the kernel's
+    results. It does not wait for this before starting a core's next kernel: kernels are kept apart by the credit rule above
+    (review finding V-2).
   - Rejected: per-destination acks. A full-die rectangle returns 32 ack flits per 16-flit burst to the source, so acks would halve the
     multicast rate at the source's ejection port.
 

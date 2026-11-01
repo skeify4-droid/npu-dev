@@ -150,6 +150,9 @@ Collectives use only the following, all existing in ISA v0.1.
   - The consumer `SIGNAL`s the producer's credit semaphore once a buffer is consumed. Monotonic semaphores mean no reset and no
     handshake per call (isa.md §3: network-facing semaphores are never reset).
   - The producer's credit wait is normally already satisfied, so it is off the critical path.
+  - **Across kernels** *(review finding V-2)*: parities, credit counts and semaphore bases carry over, and there is no barrier
+    between kernels. Every network-facing semaphore follows this discipline, including pipeline hand-offs and HBM buffers that
+    complete by `SIGNAL` (isa.md §3).
 - **SRAM destinations only for `rsem`** *(review finding I-6 b)*. An HBM write has no owning core, so `rsem` with an HBM destination
   is `ILLEGAL_FIELD`. A transfer into an HBM buffer ends with a `SIGNAL` (release after the acks) that adds its byte count to the
   consumer's semaphore. Prefill all-to-all buffers are this case.
