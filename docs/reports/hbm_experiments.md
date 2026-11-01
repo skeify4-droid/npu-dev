@@ -17,12 +17,12 @@ Patterns (addresses through the memmap.md hash, `isa.hbm_fields`):
 
 | pattern | adaptive | open | close | ACT per 1k bursts (adaptive) |
 |---|---|---|---|---|
-| seq_read | 0.991 | 0.976 | 0.939 | 35 |
-| seq_read_5pct_kv_write | 0.954 | 0.938 | 0.916 | 44 |
-| seq_read_write_3to1 | 0.905 | 0.860 | 0.720 | 40 |
-| rand_256B_read | 0.967 | 0.944 | 0.967 | 125 |
-| rand_64B_read | 0.424 | 0.423 | 0.424 | 500 |
-| engram_264B_rows | 0.894 | 0.833 | 0.894 | 223 |
+| seq_read | 0.990 | 0.977 | 0.935 | 35 |
+| seq_read_5pct_kv_write | 0.956 | 0.935 | 0.910 | 44 |
+| seq_read_write_3to1 | 0.904 | 0.853 | 0.708 | 41 |
+| rand_256B_read | 0.966 | 0.944 | 0.966 | 125 |
+| rand_64B_read | 0.405 | 0.403 | 0.405 | 500 |
+| engram_264B_rows | 0.896 | 0.818 | 0.896 | 223 |
 
 `engram_264B_rows`: 0.917 of the transferred bytes are row bytes (whole 32 B bursts), so useful bandwidth is that times the utilization.
 
@@ -32,7 +32,7 @@ Patterns (addresses through the memmap.md hash, `isa.hbm_fields`):
 
 | refresh | temperature | seq_read | rand_256B_read | refresh commands per PC per run |
 |---|---|---|---|---|
-| per bank (REFpb) | <= 85 C | 0.991 | 0.967 | 410 |
+| per bank (REFpb) | <= 85 C | 0.990 | 0.966 | 410 |
 | per bank (REFpb) | > 85 C (tREFI / 2) | 0.988 | 0.961 | 820 |
 | all bank (REFab) | <= 85 C | 0.868 | 0.845 | 8 |
 | all bank (REFab) | > 85 C (tREFI / 2) | 0.755 | 0.728 | 17 |
@@ -43,16 +43,16 @@ All-bank refresh blocks the PC for tRFCab = 492 cycles every tREFI = 4680 cycles
 
 | read queue | seq_read | rand_256B_read | max read granules in transfer at once |
 |---|---|---|---|
-| 8 | 0.713 | 0.669 | 7 |
-| 16 | 0.904 | 0.856 | 9 |
-| 32 | 0.991 | 0.967 | 11 |
-| 64 | 0.997 | 0.993 | 14 |
+| 8 | 0.712 | 0.667 | 7 |
+| 16 | 0.911 | 0.856 | 9 |
+| 32 | 0.990 | 0.966 | 10 |
+| 64 | 0.998 | 0.993 | 14 |
 
 | write queue (read queue 32) | seq_read_5pct_kv_write | seq_read_write_3to1 |
 |---|---|---|
-| 8 | 0.928 | 0.785 |
-| 16 | 0.954 | 0.905 |
-| 32 | 0.969 | 0.954 |
+| 8 | 0.927 | 0.784 |
+| 16 | 0.956 | 0.904 |
+| 32 | 0.970 | 0.952 |
 
 ## H4. Latency under load (open loop, `seq_read`)
 
@@ -60,19 +60,40 @@ Poisson arrivals at the given fraction of the PC's peak. Latency: granule enters
 
 | offered load | utilization | mean (ns) | p99 (ns) |
 |---|---|---|---|
-| 0.50 | 0.496 | 87 | 261 |
-| 0.70 | 0.697 | 103 | 275 |
-| 0.85 | 0.838 | 133 | 370 |
-| 0.95 | 0.943 | 192 | 531 |
+| 0.50 | 0.496 | 88 | 262 |
+| 0.70 | 0.697 | 103 | 278 |
+| 0.85 | 0.838 | 133 | 367 |
+| 0.95 | 0.943 | 195 | 538 |
 
 ## H5. Sensitivity to tCCD_L (assumed 2.5 ns)
 
 | tCCD_L (ns) | cycles | seq_read | rand_256B_read | ceiling 4 bank groups / tCCD_L |
 |---|---|---|---|---|
-| 1.60 | 2 | 0.997 | 0.987 | 1.00 |
-| 2.50 | 3 | 0.991 | 0.967 | 1.00 |
-| 3.30 | 4 | 0.960 | 0.857 | 1.00 |
-| 4.10 | 5 | 0.788 | 0.765 | 0.80 |
+| 1.60 | 2 | 0.997 | 0.986 | 1.00 |
+| 2.50 | 3 | 0.990 | 0.966 | 1.00 |
+| 3.30 | 4 | 0.958 | 0.860 | 1.00 |
+| 4.10 | 5 | 0.788 | 0.766 | 0.80 |
+
+## H6. Reduced configurations (review finding I-10)
+
+`seq_read` on PC 0 of a reduced stack. The memmap.md PC index is folded onto the PCs present (`fold_pc`): the R-11 fold moves the unused PC bits into the row only, the I-10 fold also XORs them into the bank group and bank.
+
+| config | PCs | leaves | DFI row bits | R-11 fold (row only) | I-10 fold (row + bank XOR) |
+|---|---|---|---|---|---|
+| FULL | 32 | 4 | 15 | 0.990 | 0.990 |
+| MID | 8 | 4 | 17 | 0.681 | 0.993 |
+| MID | 8 | 2 | 17 | 0.720 | 0.990 |
+| TINY | 4 | 2 | 18 | 0.552 | 0.984 |
+
+## H7. Shared channel command bus (review finding X-2(b))
+
+Two PCs of one channel with independent traffic, scheduled together (`simulate_channel`): PC p drives CK phase p, and an ACT that occupies ACT_CK = 2 CK holds the other PC's next slot. ACT_CK = 1 is the independent-PC assumption. Mean utilization of the two PCs.
+
+| pattern | ACT_CK = 1 | ACT_CK = 2 | ACT per 1k bursts |
+|---|---|---|---|
+| seq_read | 0.990 | 0.990 | 34 |
+| rand_256B_read | 0.964 | 0.965 | 125 |
+| rand_64B_read | 0.405 | 0.404 | 500 |
 
 ## Timing table used (controller cycles at 1.2 GHz)
 
@@ -93,6 +114,7 @@ Poisson arrivals at the given fraction of the PC's peak. Latency: granule enters
 | tWTRL | 6.25 | 8 |
 | tCCDL | 2.5 | 3 |
 | tRREFD | 8 | 10 |
+| tRREFDA | 8 | 10 |
 | tRFCPB | 220 | 264 |
 | tRFCAB | 410 | 492 |
 | tREFI | 3900 | 4680 |
@@ -105,3 +127,4 @@ Poisson arrivals at the given fraction of the PC's peak. Latency: granule enters
 | WTR_S (derived or fixed) | 12.50 | 15 |
 | WTR_L (derived or fixed) | 14.17 | 17 |
 | WRP (derived or fixed) | 28.33 | 34 |
+| ACT_CK (fixed, CK slots on the channel row bus) | 0.83 | 2 CK |

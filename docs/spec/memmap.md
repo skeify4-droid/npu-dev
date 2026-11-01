@@ -89,8 +89,8 @@ Properties (all tested):
 
 Per stack: 32 PCs x 16 banks (4 bank groups x 4) x 3 SIDs x 24,576 rows x 1 KiB = 36 GiB.
 The timing table, scheduler and refresh are in [hbm.md](hbm.md) (H-3, H-4). Reduced configurations (`TINY` 4 PCs, `MID` 8) fold the
-PC index into the PCs present and move the unused PC bits into the row, so the map stays one-to-one and 2 KiB blocks stay on one
-leaf (hbm.md H-1).
+PC index into the PCs present, move the unused PC bits into the row and XOR them into the bank, so the map stays one-to-one, 2 KiB
+blocks stay on one leaf and streams stay at full rate (hbm.md H-1, review finding I-10).
 
 ## 4. On-chip SRAM
 

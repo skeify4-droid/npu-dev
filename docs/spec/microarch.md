@@ -298,7 +298,7 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | noc[4] | in/out | flit_t | credit per VC | one per leaf (8 PCs each) |
-| dfi[32] | out/in | per PC: 1 row + 1 column command per `clk_mc` cycle, 256-bit write and read data | DFI-like, fixed read latency | to the behavioral PHY + DRAM model ([hbm.md](hbm.md) H-5) |
+| dfi[32] | out/in | per PC: 1 row + 1 column command per `clk_mc` cycle, 256-bit write and read data; the two PCs of a channel share its command buses (arbiter in hbm.md H-3) | DFI-like, fixed read latency | to the behavioral PHY + DRAM model ([hbm.md](hbm.md) H-5) |
 | csr | in/out | 64 | valid/ready | timing table, policy, refresh rate, per-PC counters (hbm.md H-7) |
 | clk_mc | in | 1 | | controller clock, 1.2 GHz (`MC_SYNC = 1`: same as `clk`) |
 

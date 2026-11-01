@@ -3,8 +3,10 @@
 Two parts:
 - `Dram`: the bank-state and timing-rule checker of one pseudo-channel (PC). `earliest()` answers when a command becomes
   legal, `issue()` raises `Violation` for any illegal command. It is the reference for the Phase 4 RTL timing checker.
+- `Channel`: the two PCs of a channel and their shared row and column command buses (review finding X-2(b)).
 - `simulate()`: the controller's per-PC scheduler (FR-FCFS with an age cap, read/write drain with watermarks,
   adaptive page policy, per-bank refresh) issuing into a `Dram`, cycle by cycle, at the controller clock.
+  `simulate_channel()` runs two of them on one `Channel`.
 
 Time unit: one controller cycle = 1 / 1.2 GHz = 0.833 ns = one BL8 burst (32 B) on one PC (HBM3e at 9.6 Gb/s, CK = 2.4 GHz,
 DFI-like interface at CK / 2, one row and one column command per PC per cycle).
@@ -27,11 +29,16 @@ T_NS = {
     "RRDS": 2.5, "RRDL": 3.125, "FAW": 15.0, "WTRS": 4.375, "WTRL": 6.25,
     "CCDL": 2.5,        # (A) 4 nCK at 6.4 Gb/s, kept in ns
     "RREFD": 8.0,       # (A) REFpb to REFpb, any bank
+    "RREFDA": 8.0,      # (A) REFpb to ACT of any other bank; assumed = tRREFD (review I-9 b; JESD238 checklist, hbm.md H-9)
     "RFCPB": 220.0,     # (A) 24 Gb die
     "RFCAB": 410.0,     # (A) 24 Gb die (DDR5 24 Gb class)
     "REFI": 3900.0,     # tREFI at <= 85 C; halved above
 }
-CYC_FIXED = {"BL": 1, "CCDS": 1, "CCDR": 2, "PHY_RD": 10}     # cycles; CCDR: column to column across SIDs (A); PHY_RD (A)
+CYC_FIXED = {"BL": 1, "CCDS": 1, "CCDR": 2, "PHY_RD": 10,     # cycles; CCDR: column to column across SIDs (A); PHY_RD (A)
+             "ACT_CK": 2}      # (A) CK slots an ACT occupies on the channel's row bus (HBM2 class; X-2(b)); other commands 1
+ROW_CMDS = ("ACT", "PRE", "PREA", "REFPB", "REFAB")
+COL_CMDS = ("RD", "WR")
+CMDS = ROW_CMDS + COL_CMDS
 
 
 def cycles(t_ns=None, hot=False):
@@ -50,20 +57,27 @@ def cycles(t_ns=None, hot=False):
 
 
 def rules(c):
-    """(previous command, next command, scope, minimum gap in cycles). Scopes: bank, bg (same SID and bank group),
-    sid, xsid (same PC, other SID), pc. RD/WR with auto-precharge are RD/WR plus an implied PRE (see Dram.issue)."""
+    """(previous command, next command, scope, minimum gap). Scopes: bank, bg (same SID and bank group), sid, xsid (same
+    PC, other SID), pc, and chan (the channel's shared command bus, gap in CK slots: PC p issues in slot 2t + p of
+    controller cycle t). RD/WR with auto-precharge are RD/WR plus an implied PRE; PREA is a PRE of every bank (see
+    Dram.issue), so the PRE -> x rules cover it."""
     R = [("ACT", "ACT", "bank", c["RC"]), ("ACT", "ACT", "bg", c["RRDL"]), ("ACT", "ACT", "pc", c["RRDS"]),
          ("ACT", "RD", "bank", c["RCDRD"]), ("ACT", "WR", "bank", c["RCDWR"]), ("ACT", "PRE", "bank", c["RAS"]),
          ("PRE", "ACT", "bank", c["RP"]), ("PRE", "REFPB", "bank", c["RP"]), ("PRE", "REFAB", "bank", c["RP"]),
          ("RD", "PRE", "bank", c["RTP"]), ("WR", "PRE", "bank", c["WRP"]),
+         ("ACT", "PREA", "bank", c["RAS"]), ("RD", "PREA", "bank", c["RTP"]), ("WR", "PREA", "bank", c["WRP"]),
          ("RD", "WR", "pc", c["RTW"]), ("WR", "RD", "bg", c["WTR_L"]), ("WR", "RD", "pc", c["WTR_S"]),
-         ("REFPB", "ACT", "bank", c["RFCPB"]), ("REFPB", "REFPB", "pc", c["RREFD"]),
-         ("REFPB", "ACT", "bg", c["RRDL"]), ("ACT", "REFPB", "bg", c["RRDL"]), ("ACT", "REFPB", "pc", c["RRDS"]),
-         ("REFAB", "ACT", "pc", c["RFCAB"]), ("REFAB", "REFPB", "pc", c["RFCAB"]), ("REFPB", "REFAB", "pc", c["RFCPB"])]
+         ("REFPB", "ACT", "bank", c["RFCPB"]), ("REFPB", "REFPB", "bank", c["RFCPB"]), ("REFPB", "REFPB", "pc", c["RREFD"]),
+         ("REFPB", "ACT", "bg", c["RRDL"]), ("REFPB", "ACT", "pc", c["RREFDA"]),
+         ("ACT", "REFPB", "bg", c["RRDL"]), ("ACT", "REFPB", "pc", c["RRDS"]),
+         ("REFAB", "ACT", "pc", c["RFCAB"]), ("REFAB", "REFPB", "pc", c["RFCAB"]), ("REFAB", "REFAB", "pc", c["RFCAB"]),
+         ("REFPB", "REFAB", "pc", c["RFCPB"])]
     for a in ("RD", "WR"):
         for b in ("RD", "WR"):
             if a == b:
                 R += [(a, b, "bg", c["CCDL"]), (a, b, "sid", c["CCDS"]), (a, b, "xsid", c["CCDR"])]
+    if c["ACT_CK"] > 1:                       # a multi-CK ACT holds the channel's row bus into the next slot
+        R += [("ACT", n, "chan", c["ACT_CK"]) for n in ROW_CMDS]
     return R
 
 
@@ -80,14 +94,17 @@ def _key(b, scope):
 
 
 class Dram:
-    """Bank state + timing checker of one pseudo-channel. Commands: ACT(b, row), PRE(b), RD/WR(b, row, ap), REFPB(b), REFAB."""
+    """Bank state + timing checker of one pseudo-channel. Commands: ACT(b, row), PRE(b), PREA, RD/WR(b, row, ap), REFPB(b),
+    REFAB; anything else is rejected. `rules_` replaces the rule table (the rule-removal test uses it). Channel-scope
+    rules are left to `Channel`."""
 
-    def __init__(self, c, refresh="pb"):
+    def __init__(self, c, refresh="pb", rules_=None):
         self.c, self.refresh = c, refresh
-        self.rules = rules(c)
+        self.rules = rules(c) if rules_ is None else rules_
         self.by_next = {}
         for p, n, s, g in self.rules:
-            self.by_next.setdefault(n, []).append((p, s, g))
+            if s != "chan":
+                self.by_next.setdefault(n, []).append((p, s, g))
         self.last = {}                      # (cmd, scope, key) -> time
         self.open = [-1] * BANKS            # open row per bank, -1 = closed
         self.act_time = [-10 ** 9] * BANKS
@@ -106,7 +123,7 @@ class Dram:
 
     def earliest(self, cmd, b=0):
         t = -10 ** 9
-        if cmd == "REFAB":
+        if cmd in ("REFAB", "PREA"):                       # all-bank commands: every bank's rules apply
             for bb in range(BANKS):
                 for p, s, g in self.by_next.get(cmd, ()):
                     t = max(t, self._last(p, s, bb) + g)
@@ -123,7 +140,9 @@ class Dram:
             self.last[k] = max(self.last.get(k, -10 ** 9), t)
 
     def issue(self, t, cmd, b=0, row=None, ap=False):
-        bus = "col" if cmd in ("RD", "WR") else "row"
+        if cmd not in CMDS:
+            raise Violation(f"unknown command {cmd}")
+        bus = "col" if cmd in COL_CMDS else "row"
         if bus == "col":
             if t <= self.t_col:
                 raise Violation(f"two column commands in cycle {t}")
@@ -147,6 +166,10 @@ class Dram:
                 raise Violation(f"{cmd} bank {b} row {row}, open row {self.open[b]}")
         elif cmd == "PRE":
             self.open[b] = -1
+        elif cmd == "PREA":                                 # precharge all: every bank closes, RP applies to each
+            for bb in range(BANKS):
+                self.open[bb] = -1
+                self._rec("PRE", bb, t)
         elif cmd == "REFPB":
             if self.open[b] >= 0:
                 raise Violation(f"REFPB to open bank {b}")
@@ -175,16 +198,56 @@ class Dram:
             raise Violation(f"refresh behind: {self.ref_count} issued, {due} due at {t}")
 
 
-def fold_pc(pc, row, pcs=PCS, leaves=4):
+class Channel:
+    """The two PCs of an HBM channel (hbm.md H-1, H-3; review X-2(b)). They share the channel's row and column command
+    buses: PC p drives CK slot 2t + p of controller cycle t, and a command occupying more than one CK (an ACT, ACT_CK)
+    holds the bus into the next slot. Channel-scope rules (scope "chan", gaps in CK slots) are checked here, everything
+    else by each PC's `Dram`. Commands must be presented in slot order, as a bus monitor sees them."""
+
+    def __init__(self, c, refresh="pb", rules_=None):
+        R = rules(c) if rules_ is None else rules_
+        self.pc = [Dram(c, refresh, R), Dram(c, refresh, R)]
+        self.chan = [(p, n, g) for p, n, s, g in R if s == "chan"]
+        self.last = {}                      # command -> CK slot of its last issue on this channel
+        self.slot = -1
+
+    def ok(self, p, t, cmd):
+        s = 2 * t + p
+        return all(s >= self.last.get(a, -10 ** 9) + g for a, n, g in self.chan if n == cmd)
+
+    def issue(self, p, t, cmd, b=0, row=None, ap=False):
+        s = 2 * t + p
+        if s < self.slot:
+            raise Violation(f"channel commands out of slot order at slot {s}")
+        if not self.ok(p, t, cmd):
+            raise Violation(f"{cmd} on PC {p} at cycle {t}: channel command bus busy")
+        self.pc[p].issue(t, cmd, b, row, ap)
+        self.slot = s
+        self.last[cmd] = s
+
+
+def fold_pc(pc, row, pcs=PCS, leaves=4, bg=0, ba=0, xor=True):
     """Reduced configurations (hbm.md H-1): map the 5-bit memmap PC index onto `pcs` PCs behind `leaves` leaves.
-    Returns (leaf, physical PC, extended row). The identity for the full 32-PC, 4-leaf stack."""
+    The unused PC bits become the low bits of an extended row and (xor, review finding I-10) are also XORed into the
+    bank group and bank, so the granules of a 2 KiB block that share a physical PC fall in different banks instead of
+    being row conflicts in one. Returns (leaf, physical PC, extended row, bg, ba). The identity for 32 PCs, 4 leaves."""
     lb = leaves.bit_length() - 1
     ppl = pcs // leaves                              # PCs per leaf, a power of two <= 8
     pb = ppl.bit_length() - 1
+    k = (3 - pb) + (2 - lb)                          # folded bits
+    assert k <= 4, "at least 2 PCs"
     leaf = (pc >> 3) & (leaves - 1)
     within = (pc & 7) & (ppl - 1)
     extra = (((pc & 7) >> pb) << (2 - lb)) | ((pc >> 3) >> lb)
-    return leaf, leaf * ppl + within, (row << ((3 - pb) + (2 - lb))) | extra
+    if xor:
+        bb = (bg | ba << 2) ^ extra                  # bank group first: consecutive granules also avoid tCCD_L
+        bg, ba = bb & 3, bb >> 2
+    return leaf, leaf * ppl + within, (row << k) | extra, bg, ba
+
+
+def row_bits(pcs=PCS):
+    """Width of the DFI row address (hbm.md H-5): 15 bits plus the folded PC bits of a reduced configuration."""
+    return 15 + (PCS // pcs).bit_length() - 1
 
 
 # ---------------------------------------------------------------- traffic
@@ -206,11 +269,19 @@ def _hbm_fields():
     return lambda off: I.hbm_fields(spec, off)
 
 
-def gen_seq(rng, streams=8, pc=0, write_frac=0.0, wr_rand=False):
+def gen_seq(rng, streams=8, pc=0, write_frac=0.0, wr_rand=False, pcs=PCS, leaves=4, xor=True):
     """Granules of PC `pc` in stack 0 from `streams` cores each reading a contiguous region in 2 KiB requests, interleaved
     request by request (the order they reach the controller). write_frac: that fraction of granules are writes,
-    sequential in their own region, or random granules (wr_rand: KV appends)."""
-    hf = _hbm_fields()
+    sequential in their own region, or random granules (wr_rand: KV appends). pcs, leaves: a reduced configuration,
+    with the memmap fields folded by `fold_pc` (xor as there)."""
+    hf0 = _hbm_fields()
+    if pcs == PCS and leaves == 4:
+        hf = hf0
+    else:
+        def hf(off):
+            f = dict(hf0(off))
+            _, f["pc"], f["row"], f["bg"], f["ba"] = fold_pc(f["pc"], f["row"], pcs, leaves, f["bg"], f["ba"], xor)
+            return f
     stack = 36 << 30
     bases = [rng.randrange(0, stack // 2 - (64 << 20)) & ~0x7FFF for _ in range(streams)]
     wbase = rng.randrange(stack // 2, stack - (64 << 20)) & ~0x7FFF
@@ -258,67 +329,80 @@ def gen_rows(rng, row_bytes=264):
 
 
 # ---------------------------------------------------------------- scheduler
-def simulate(gen, cycles_total=40000, warm=4000, depth=32, wdepth=16, policy="adaptive", refresh="pb", hot=False,
-             load=None, age_max=1024, t_ns=None, seed=1):
-    """Run the per-PC scheduler. gen yields (is_write, bank, row, bursts). load=None: closed loop (queues kept full,
-    saturation bandwidth); load=f: open loop, Poisson arrivals at f x the PC's peak burst rate.
-    Returns utilization (data-bus busy fraction), latency stats (controller cycles, queue entry to last data), counters."""
-    c = cycles(t_ns, hot)
-    d = Dram(c, refresh)
-    rng = random.Random(seed)
-    rq, wq = [], []
-    backlog = deque()
-    wdepth = wdepth or depth
-    hi, lo = wdepth * 3 // 4, wdepth // 4
-    draining = False
-    ref_credit = 0.0
-    ref_round_done = set()
-    closing = set()
-    busy = acts = rd_b = wr_b = 0
-    max_open = 0
-    lat = []
-    next_arr = 0.0
-    pending = None
-    mean_b = None
-    for t in range(cycles_total):
-        # arrivals
-        if load is None:
+class PcSched:
+    """The per-PC scheduler of hbm.md H-3, one controller cycle per `step(t)`. It issues through `issue(t, cmd, b, row, ap)`
+    and asks `row_ok(t, cmd)` before any row command (the channel's shared row bus; always true for a lone PC)."""
+
+    def __init__(self, gen, d, c, issue=None, row_ok=None, depth=32, wdepth=16, policy="adaptive", refresh="pb",
+                 load=None, age_max=1024, warm=4000, rng=None):
+        self.gen, self.d, self.c = gen, d, c
+        self.issue = issue or d.issue
+        self.row_ok = row_ok or (lambda t, cmd: True)
+        self.depth, self.wdepth = depth, wdepth or depth
+        self.hi, self.lo = self.wdepth * 3 // 4, self.wdepth // 4
+        self.policy, self.refresh, self.load, self.age_max, self.warm = policy, refresh, load, age_max, warm
+        self.rng = rng or random.Random(1)
+        self.rq, self.wq = [], []
+        self.backlog = deque()
+        self.draining = False
+        self.ref_credit = 0.0
+        self.ref_round_done = set()
+        self.closing = set()
+        self.busy = self.acts = self.rd_b = self.wr_b = 0
+        self.max_open = 0
+        self.lat = []
+        self.next_arr = 0.0
+        self.pending = None
+        self.mean_b = None
+
+    def _arrivals(self, t):
+        rq, wq, gen = self.rq, self.wq, self.gen
+        if self.load is None:
             while True:
-                if pending is None:
-                    pending = next(gen)
-                q = wq if pending[0] else rq
-                if len(q) >= (wdepth if pending[0] else depth):
+                if self.pending is None:
+                    self.pending = next(gen)
+                q = wq if self.pending[0] else rq
+                if len(q) >= (self.wdepth if self.pending[0] else self.depth):
                     break
-                q.append(Entry(t, *pending))
-                pending = None
+                q.append(Entry(t, *self.pending))
+                self.pending = None
         else:
-            if mean_b is None:
-                mean_b = sum(next(gen)[3] for _ in range(256)) / 256
-            while next_arr <= t:
-                backlog.append(Entry(int(next_arr), *next(gen)))
-                next_arr += rng.expovariate(load / mean_b)
-            while backlog:
-                q = wq if backlog[0].wr else rq
-                if len(q) >= (wdepth if backlog[0].wr else depth):
+            if self.mean_b is None:
+                self.mean_b = sum(next(gen)[3] for _ in range(256)) / 256
+            while self.next_arr <= t:
+                self.backlog.append(Entry(int(self.next_arr), *next(gen)))
+                self.next_arr += self.rng.expovariate(self.load / self.mean_b)
+            while self.backlog:
+                q = wq if self.backlog[0].wr else rq
+                if len(q) >= (self.wdepth if self.backlog[0].wr else self.depth):
                     break
-                q.append(backlog.popleft())
+                q.append(self.backlog.popleft())
+
+    def _refresh_pb(self, t, b):
+        self.issue(t, "REFPB", b)
+        self.ref_credit -= 1
+        self.ref_round_done.add(b)
+        if len(self.ref_round_done) == BANKS:
+            self.ref_round_done = set()
+
+    def step(self, t):
+        d, c, rq, wq = self.d, self.c, self.rq, self.wq
+        ok = self.row_ok
+        self._arrivals(t)
         # refresh bookkeeping
-        if refresh == "pb":
-            ref_credit += 1.0 / c["REFIPB"]
-        else:
-            ref_credit += 1.0 / c["REFI"]
+        self.ref_credit += 1.0 / (c["REFIPB"] if self.refresh == "pb" else c["REFI"])
         # read / write mode
-        if draining and (len(wq) <= lo and rq or not wq):
-            draining = False
-        elif not draining and (len(wq) >= hi or (not rq and wq)):
-            draining = True
-        cur = wq if draining else rq
-        refab_pending = refresh == "ab" and ref_credit >= 1
-        urgent = refresh == "pb" and ref_credit >= 8
+        if self.draining and (len(wq) <= self.lo and rq or not wq):
+            self.draining = False
+        elif not self.draining and (len(wq) >= self.hi or (not rq and wq)):
+            self.draining = True
+        cur = wq if self.draining else rq
+        refab_pending = self.refresh == "ab" and self.ref_credit >= 1
+        urgent = self.refresh == "pb" and self.ref_credit >= 8
         # column command: oldest ready row hit (first-ready, first-come-first-served)
         if not refab_pending:
             for e in cur:
-                if d.open[e.b] != e.row or e.b in closing:
+                if d.open[e.b] != e.row or e.b in self.closing:
                     continue
                 cmd = "WR" if e.wr else "RD"
                 if d.earliest(cmd, e.b) <= t:
@@ -326,88 +410,116 @@ def simulate(gen, cycles_total=40000, warm=4000, depth=32, wdepth=16, policy="ad
                     ap = False
                     if e.left == 0:
                         cur.remove(e)
-                        if policy == "close":
+                        if self.policy == "close":
                             ap = True
-                        elif policy == "adaptive":
+                        elif self.policy == "adaptive":
                             ap = not any(o.b == e.b and o.row == e.row for o in rq) and \
                                 not any(o.b == e.b and o.row == e.row for o in wq)
                         if not e.wr:
-                            if t >= warm:
-                                lat.append(t + c["CL"] + c["BL"] + c["PHY_RD"] - e.arr)
-                    d.issue(t, cmd, e.b, e.row, ap)
-                    if t >= warm:
-                        busy += 1
+                            if t >= self.warm:
+                                self.lat.append(t + c["CL"] + c["BL"] + c["PHY_RD"] - e.arr)
+                    self.issue(t, cmd, e.b, e.row, ap)
+                    if t >= self.warm:
+                        self.busy += 1
                         if e.wr:
-                            wr_b += 1
+                            self.wr_b += 1
                         else:
-                            rd_b += 1
+                            self.rd_b += 1
                     break
-        max_open = max(max_open, sum(1 for e in rq if e.left < e.n))
+        self.max_open = max(self.max_open, sum(1 for e in rq if e.left < e.n))
         # row command
         done = False
         if refab_pending:
             if any(r >= 0 for r in d.open):
                 for b in range(BANKS):
-                    if d.open[b] >= 0 and d.earliest("PRE", b) <= t:
-                        d.issue(t, "PRE", b)
+                    if d.open[b] >= 0 and d.earliest("PRE", b) <= t and ok(t, "PRE"):
+                        self.issue(t, "PRE", b)
                         break
-            elif d.earliest("REFAB") <= t:
-                d.issue(t, "REFAB")
-                ref_credit -= 1
+            elif d.earliest("REFAB") <= t and ok(t, "REFAB"):
+                self.issue(t, "REFAB")
+                self.ref_credit -= 1
             done = True
         if not done and urgent:
-            cand = [b for b in range(BANKS) if b not in ref_round_done]
+            cand = [b for b in range(BANKS) if b not in self.ref_round_done]
             b = min(cand, key=lambda x: (d.open[x] >= 0, x))
             if d.open[b] >= 0:
-                closing.add(b)
-                if d.earliest("PRE", b) <= t:
-                    d.issue(t, "PRE", b)
+                self.closing.add(b)
+                if d.earliest("PRE", b) <= t and ok(t, "PRE"):
+                    self.issue(t, "PRE", b)
                     done = True
-            elif d.earliest("REFPB", b) <= t:
-                d.issue(t, "REFPB", b)
-                closing.discard(b)
-                ref_credit -= 1
-                ref_round_done.add(b)
-                if len(ref_round_done) == BANKS:
-                    ref_round_done = set()
+            elif d.earliest("REFPB", b) <= t and ok(t, "REFPB"):
+                self._refresh_pb(t, b)
+                self.closing.discard(b)
                 done = True
         if not done and cur:
             old = cur[0]
-            starving = t - old.arr > age_max
+            starving = t - old.arr > self.age_max
             if starving and d.open[old.b] >= 0 and d.open[old.b] != old.row:
-                closing.add(old.b)
+                self.closing.add(old.b)
             for e in cur:                           # oldest first; a starving entry's bank is closing (no new hits)
                 b = e.b
                 if d.open[b] < 0:
-                    if d.earliest("ACT", b) <= t:
-                        d.issue(t, "ACT", b, e.row)
-                        closing.discard(b)
-                        if t >= warm:
-                            acts += 1
+                    if d.earliest("ACT", b) <= t and ok(t, "ACT"):
+                        self.issue(t, "ACT", b, e.row)
+                        self.closing.discard(b)
+                        if t >= self.warm:
+                            self.acts += 1
                         done = True
                         break
                 elif d.open[b] != e.row:
-                    hit = b in closing or not any(o.b == b and o.row == d.open[b] for o in cur)
-                    if hit and d.earliest("PRE", b) <= t:
-                        d.issue(t, "PRE", b)
+                    hit = b in self.closing or not any(o.b == b and o.row == d.open[b] for o in cur)
+                    if hit and d.earliest("PRE", b) <= t and ok(t, "PRE"):
+                        self.issue(t, "PRE", b)
                         done = True
                         break
-        if not done and refresh == "pb" and ref_credit >= 1:
+        if not done and self.refresh == "pb" and self.ref_credit >= 1:
             busy_banks = {e.b for e in rq} | {e.b for e in wq}
             for b in range(BANKS):
-                if b not in ref_round_done and d.open[b] < 0 and b not in busy_banks and d.earliest("REFPB", b) <= t:
-                    d.issue(t, "REFPB", b)
-                    ref_credit -= 1
-                    ref_round_done.add(b)
-                    if len(ref_round_done) == BANKS:
-                        ref_round_done = set()
+                if b not in self.ref_round_done and d.open[b] < 0 and b not in busy_banks and \
+                        d.earliest("REFPB", b) <= t and ok(t, "REFPB"):
+                    self._refresh_pb(t, b)
                     break
-    n = cycles_total - warm
-    lat.sort()
-    return {"util": busy / n, "rd": rd_b / n, "wr": wr_b / n, "acts_per_kburst": 1000 * acts / max(busy, 1),
-            "lat_mean": sum(lat) / len(lat) if lat else float("nan"),
-            "lat_p99": lat[int(0.99 * (len(lat) - 1))] if lat else float("nan"),
-            "refreshes": d.ref_count, "cycles": cycles_total, "max_open_granules": max_open}
+
+    def result(self, cycles_total):
+        n = cycles_total - self.warm
+        lat = sorted(self.lat)
+        return {"util": self.busy / n, "rd": self.rd_b / n, "wr": self.wr_b / n,
+                "acts_per_kburst": 1000 * self.acts / max(self.busy, 1),
+                "lat_mean": sum(lat) / len(lat) if lat else float("nan"),
+                "lat_p99": lat[int(0.99 * (len(lat) - 1))] if lat else float("nan"),
+                "refreshes": self.d.ref_count, "cycles": cycles_total, "max_open_granules": self.max_open}
+
+
+def simulate(gen, cycles_total=40000, warm=4000, depth=32, wdepth=16, policy="adaptive", refresh="pb", hot=False,
+             load=None, age_max=1024, t_ns=None, seed=1):
+    """Run the per-PC scheduler. gen yields (is_write, bank, row, bursts). load=None: closed loop (queues kept full,
+    saturation bandwidth); load=f: open loop, Poisson arrivals at f x the PC's peak burst rate.
+    Returns utilization (data-bus busy fraction), latency stats (controller cycles, queue entry to last data), counters."""
+    c = cycles(t_ns, hot)
+    d = Dram(c, refresh)
+    sch = PcSched(gen, d, c, depth=depth, wdepth=wdepth, policy=policy, refresh=refresh, load=load, age_max=age_max,
+                  warm=warm, rng=random.Random(seed))
+    for t in range(cycles_total):
+        sch.step(t)
+    return sch.result(cycles_total)
+
+
+def simulate_channel(gens, cycles_total=40000, warm=4000, act_ck=None, refresh="pb", seed=1, arbiter=True, **kw):
+    """Two PC schedulers on one `Channel` (review X-2(b)). Each cycle PC 0 (CK phase 0) decides first, then PC 1 sees
+    whether PC 0's command holds the row bus; an ACT of PC 1 holds PC 0's next slot (hbm.md H-3, channel arbiter).
+    act_ck overrides ACT_CK (1 = independent PCs). arbiter=False schedules each PC as if it were alone (the checker
+    then raises). Returns the two per-PC results."""
+    c = cycles(kw.pop("t_ns", None), kw.pop("hot", False))
+    if act_ck is not None:
+        c["ACT_CK"] = act_ck
+    ch = Channel(c, refresh)
+    sch = [PcSched(gens[p], ch.pc[p], c, issue=(lambda t, cmd, b=0, row=None, ap=False, p=p: ch.issue(p, t, cmd, b, row, ap)),
+                   row_ok=(lambda t, cmd, p=p: ch.ok(p, t, cmd)) if arbiter else None, refresh=refresh, warm=warm,
+                   rng=random.Random(seed + p), **kw) for p in (0, 1)]
+    for t in range(cycles_total):
+        for p in (0, 1):
+            sch[p].step(t)
+    return [x.result(cycles_total) for x in sch]
 
 
 PATTERNS = {
@@ -496,12 +608,31 @@ def report():
         cc = cycles({"CCDL": v})["CCDL"]
         L.append(f"| {v:.2f} | {cc} | {run('seq_read', t_ns={'CCDL': v})['util']:.3f} | "
                  f"{run('rand_256B_read', t_ns={'CCDL': v})['util']:.3f} | {min(1.0, BGS / cc):.2f} |")
+    L += ["", "## H6. Reduced configurations (review finding I-10)", "",
+          "`seq_read` on PC 0 of a reduced stack. The memmap.md PC index is folded onto the PCs present (`fold_pc`): the R-11 fold "
+          "moves the unused PC bits into the row only, the I-10 fold also XORs them into the bank group and bank.", "",
+          "| config | PCs | leaves | DFI row bits | R-11 fold (row only) | I-10 fold (row + bank XOR) |", "|---|---|---|---|---|---|"]
+    for name, pcs, lv in (("FULL", 32, 4), ("MID", 8, 4), ("MID", 8, 2), ("TINY", 4, 2)):
+        u = [simulate(gen_seq(random.Random(1), pcs=pcs, leaves=lv, xor=x))["util"] for x in (False, True)]
+        L.append(f"| {name} | {pcs} | {lv} | {row_bits(pcs)} | {u[0]:.3f} | {u[1]:.3f} |")
+    L += ["", "## H7. Shared channel command bus (review finding X-2(b))", "",
+          "Two PCs of one channel with independent traffic, scheduled together (`simulate_channel`): PC p drives CK phase p, "
+          "and an ACT that occupies ACT_CK = 2 CK holds the other PC's next slot. ACT_CK = 1 is the independent-PC "
+          "assumption. Mean utilization of the two PCs.", "",
+          "| pattern | ACT_CK = 1 | ACT_CK = 2 | ACT per 1k bursts |", "|---|---|---|---|"]
+    chan_pats = {"seq_read": lambda p: gen_seq(random.Random(1 + p), pc=p), "rand_256B_read": lambda p: gen_rand(random.Random(1 + p)),
+                 "rand_64B_read": lambda p: gen_rand(random.Random(1 + p), bursts=2)}
+    for name, g in chan_pats.items():
+        r = {ck: simulate_channel([g(0), g(1)], act_ck=ck) for ck in (1, 2)}
+        L.append(f"| {name} | {sum(x['util'] for x in r[1]) / 2:.3f} | {sum(x['util'] for x in r[2]) / 2:.3f} | "
+                 f"{sum(x['acts_per_kburst'] for x in r[2]) / 2:.0f} |")
     L += ["", "## Timing table used (controller cycles at 1.2 GHz)", "",
           "| parameter | ns | cycles |", "|---|---|---|"]
     for k, v in T_NS.items():
         L.append(f"| t{k} | {v:g} | {c[k]} |")
     for k in ("BL", "CCDS", "CCDR", "PHY_RD", "RC", "RTW", "WTR_S", "WTR_L", "WRP"):
         L.append(f"| {k} (derived or fixed) | {c[k] * ns:.2f} | {c[k]} |")
+    L.append(f"| ACT_CK (fixed, CK slots on the channel row bus) | {c['ACT_CK'] * ns / 2:.2f} | {c['ACT_CK']} CK |")
     L.append("")
     return "\n".join(L)
 

@@ -216,8 +216,11 @@ checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; a
 - Exit: spec reviewed. `isa.yaml` generator emits SV/C++/Python. Every block has an interface table.
   **Met (2026-11-01)** as a self-review, followed by an independent review of the whole spec set (findings I-1 to I-15, X-1 to X-6,
   all open: [spec_review.md](reports/spec_review.md)).
-  - **Before Phase 3 RTL** on `core/dma`, `core/seq` and `hbm`, resolve the findings listed for that block in the review's
-    "Before Phase 3" table. The high-severity ones are I-1 (deadlock), I-2, I-3 and X-3 (hang).
+  - **Gating findings closed (2026-11-01, fix session).** The findings the review's "Before Phase 3" table lists for `core/dma`
+    (I-1, I-2, I-3, I-5, I-12(a), X-3), `core/seq` (I-4, I-11) and `hbm` (I-9, I-10, I-12(b), X-1, X-2(b), X-3) are fixed at the
+    spec level; see the Resolutions section of [spec_review.md](reports/spec_review.md). Phase 3 RTL on those blocks may start once
+    a verification session has checked the fixes. X-2 (a), (c)-(e) stay on the hbm.md H-9 JESD238 checklist as timing-table
+    parameters.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)
@@ -235,7 +238,9 @@ checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; a
 ### Phase 4: RTL, memory system, NoC, links, integration (L)
 - `noc`: router (VCs, credits) and a parameterized mesh generator.
 - `hbm`: controller RTL. PHY = behavioral DFI responder. DRAM = behavioral bank-state model with a **timing-violation
-  checker** (tRCD, tRP, tRAS, tRRD, tFAW, tCCD, refresh).
+  checker** (tRCD, tRP, tRAS, tRRD, tFAW, tCCD, refresh, PREA, and the channel-scope command-bus rule).
+  The checker runs the `test_hbm.py` sequences (one violating and one exact-gap sequence per rule) and the rule-removal test
+  against its own rule table (hbm.md H-5).
 - `link`: D2D and C2C link-layer RTL (CRC-32C, go-back-N replay, shared-pool credits), behavioral PHY with configurable latency,
   bandwidth and error injection. Collectives are DMA programs (d2d_c2c.md L-7), not an engine.
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.

@@ -35,7 +35,10 @@ There is **one controller per stack**:
 
 - **Clock *(P2)*:** the controller runs at `clk_mc` = CK / 2 = 1.2 GHz.
   - One BL8 burst (32 B) on one PC takes exactly one `clk_mc` cycle, so one column command per PC per cycle is full rate.
-  - The two PCs of a channel share the command bus. Each PC is given a fixed DFI phase, which makes the 32 PC engines independent.
+  - The two PCs of a channel share the channel's row and column command buses. PC p drives CK phase p of each `clk_mc` cycle. A
+    command that occupies one CK leaves the PCs independent, but an ACT that occupies 2 CK (as in HBM2; `ACT_CK`, (A)) holds the
+    other PC's next slot. So the PC engines are **not** independent: the two of a channel share a row-bus arbiter (H-3 step 7),
+    and the checker has a channel-scope rule (H-4; review finding X-2(b)).
   - Async FIFOs separate `clk_mc` from the 1.5 GHz NoC.
   - In `TINY` and `MID` the parameter `MC_SYNC = 1` puts both on one clock, so unit simulations need no clock crossing.
 - **Bandwidth check:**
@@ -49,12 +52,17 @@ There is **one controller per stack**:
   That is 256 KiB per controller and **1 MiB per die** (microarch.md §8).
 - **Reduced configurations (review finding R-11):**
   - `TINY`: 1 stack, 2 leaves, 4 PCs. `MID`: 2 stacks of 8 PCs.
-  - Both keep the memmap.md §3 decode unchanged and **fold** the 5-bit PC index `pc`:
+  - Both keep the memmap.md §3 decode unchanged and **fold** the 5-bit PC index `pc` (`hbm.fold_pc`):
     - leaf = the low log2(LEAVES) bits of `pc[4:3]`;
     - PC within the leaf = `pc[2:0] mod PCS_PER_LEAF`;
-    - the unused `pc` bits become the lowest bits of an extended row.
-  - A 2 KiB block therefore still lands on one leaf, and the map stays one-to-one.
-  - The DRAM model's sparse storage does not care about the larger row count.
+    - the k = log2(32 / PCS) unused `pc` bits become the lowest bits of an extended row;
+    - **and they are XORed into `{ba, bg}`** (bank group first; review finding I-10). Without this the granules of a 2 KiB block
+      that land on one physical PC differ only in the row, so they are row conflicts in one bank: `seq_read` reached 0.68-0.72 on
+      `MID` and 0.55 on `TINY` against 0.99 on `FULL`. With it they reach 0.98-0.99 (hbm_experiments.md H6).
+  - A 2 KiB block therefore still lands on one leaf, and the map stays one-to-one (the folded bits are kept in the row, so the XOR
+    can be undone).
+  - The DFI row address is `15 + k` bits: 17 for `MID`, 18 for `TINY` (parameter `ROW_BITS`, H-5). The DRAM model's sparse storage
+    does not care about the larger row count.
 
 ## H-2. Requests from the NoC
 
@@ -127,8 +135,17 @@ row command (ACT, PRE, REFpb; REFab only in the rejected all-bank mode).
      and the refresh uses an idle row-command slot.
    - At 8 credits (8 postponed) refresh becomes urgent: the next bank in the round is closed and refreshed even if requests wait for it.
 
-The sequence is the reference for the RTL scheduler. `simulate()` is the executable form and is cycle-accurate to it. The RTL may
-pipeline the selection over 2 cycles if it keeps one command per bus per cycle.
+7. **Channel row-bus arbiter *(review finding X-2(b))*:**
+   - The two PC engines of a channel decide in phase order each `clk_mc` cycle: PC 0 (CK phase 0) first, then PC 1.
+   - A PC issues a row command only if the channel's row bus is free in its slot. An ACT of PC 0 in cycle t holds PC 1's slot in
+     cycle t; an ACT of PC 1 in cycle t holds PC 0's slot in cycle t + 1. Commands of one CK never collide, because the phases
+     differ. Column commands take one CK and need no arbitration (an (A) to confirm, H-9).
+   - No PC starves: a PC issues at most one ACT per tRRD_S (3 cycles), so it blocks the other at most one slot in three.
+   - Cost (H7): at most 0.001 of utilization on streaming, random and 64 B traffic.
+
+The sequence is the reference for the RTL scheduler. `simulate()` is the executable form and is cycle-accurate to it;
+`simulate_channel()` runs two PC schedulers with the step-7 arbiter on one `Channel` checker. The RTL may pipeline the selection over 2
+cycles if it keeps one command per bus per cycle.
 
 ## H-4. Timing table
 
@@ -154,6 +171,7 @@ Representative HBM3 values, converted at `clk_mc` = 1.2 GHz (0.833 ns) and round
 | tWTRL | 6.25 | 8 | Ramulator 2 |
 | tCCDL | 2.5 | 3 | (A) 4 nCK at 6.4 Gb/s, kept in ns |
 | tRREFD | 8 | 10 | (A) REFpb to REFpb in one PC |
+| tRREFDA | 8 | 10 | (A) REFpb to ACT of another bank in one PC, assumed = tRREFD (review I-9 b; H-9) |
 | tRFCPB | 220 | 264 | (A) 24 Gb die |
 | tRFCAB | 410 | 492 | (A) 24 Gb die, DDR5 class |
 | tREFI | 3900 | 4680 | JEDEC convention; halved above 85 °C |
@@ -170,6 +188,7 @@ Fixed and derived values (cycles):
 | WTR_S / WTR_L | 15 / 17 | CWL + BL + tWTR_S / tWTR_L |
 | WRP | 34 | CWL + BL + tWR (write to precharge) |
 | REFIPB | 97.5 | tREFI / 48 banks |
+| ACT_CK | 2 CK | (A) CK slots an ACT occupies on the channel's row bus; every other command 1 (review X-2(b); H-9) |
 
 **Rule table** (`hbm.rules()`):
 - The checker enforces, for every pair (previous command, next command, scope), a minimum gap.
@@ -178,20 +197,32 @@ Fixed and derived values (cycles):
   - same bank group (same SID);
   - same SID;
   - other SID;
-  - whole PC.
+  - whole PC;
+  - channel (the row bus shared by two PCs; the gap is in CK slots, PC p in slot 2t + p).
 
 | Next | Previous -> gap |
 |---|---|
-| ACT | ACT: RC (bank), RRDL (bank group), RRDS (PC); PRE: RP (bank); REFpb: RFCPB (bank), RRDL (bank group); REFab: RFCAB; at most 4 ACT/REFpb per tFAW |
+| ACT | ACT: RC (bank), RRDL (bank group), RRDS (PC); PRE or PREA: RP (bank); REFpb: RFCPB (bank), RRDL (bank group), RREFDA (PC); REFab: RFCAB; at most 4 ACT/REFpb per tFAW |
 | RD | ACT: RCDRD (bank); RD: CCDL (bank group), CCDS (SID), CCDR (other SID); WR: WTR_L (bank group), WTR_S (PC) |
 | WR | ACT: RCDWR (bank); WR: CCDL / CCDS / CCDR as for RD; RD: RTW (PC) |
 | PRE | ACT: RAS; RD: RTP; WR: WRP (all same bank). Auto-precharge happens at max(RD + RTP or WR + WRP, ACT + RAS) |
-| REFpb | PRE: RP (bank); REFpb: RREFD (PC); ACT: RRDL (bank group), RRDS (PC); counts toward tFAW |
+| PREA | the PRE rules for every bank of the PC (RAS, RTP, WRP); closes every bank, and RP then applies to each |
+| REFpb | PRE or PREA: RP (bank); REFpb: RFCPB (same bank, also across a round boundary), RREFD (PC); ACT: RRDL (bank group), RRDS (PC); REFab: RFCAB; counts toward tFAW |
+| REFab | PRE or PREA: RP (every bank); REFpb: RFCPB; REFab: RFCAB |
+| any row command | ACT on either PC of the channel: ACT_CK CK slots (channel) |
+
+Review findings I-9 and X-1 added PREA, REFpb → ACT of any bank (RREFDA), REFpb → REFpb of the same bank (RFCPB), REFab → REFab
+(RFCAB) and the channel rule. Four rules are redundant under this table and kept because a different device table could make them
+bind: RC (= RAS + RP), CCDS for RD and WR (one column command per cycle), and REFpb → ACT in the bank group (RRDL ≤ RREFDA).
 
 State rules:
-- ACT only to a closed bank. RD/WR only to the open row. REFpb only to a closed bank, and each bank once per round of 48.
+- ACT only to a closed bank. RD/WR only to the open row. REFpb only to a closed bank, and each bank once per round of 48. REFab only
+  with every bank closed. PREA closes every bank.
 - One row and one column command per cycle.
 - At most 8 REFpb behind schedule.
+- Any other command (power-down, self-refresh, MRS, ZQ, ECS, ...) is rejected: the model does not cover it, so the checker must not
+  accept it silently.
+- Not checked: tRAS maximum and the refresh pull-in limit. The scheduler bounds both (refresh closes every bank once per round).
 
 ## H-5. DFI-like boundary and the behavioral DRAM model
 
@@ -204,7 +235,7 @@ command, and read data returned at a fixed latency.
 |---|---|---|---|
 | `row_cmd` | ctrl -> phy | 3 | NOP, ACT, PRE, PREA, REFPB, REFAB |
 | `row_sid`, `row_bg`, `row_ba` | ctrl -> phy | 2, 2, 2 | bank of the row command |
-| `row_addr` | ctrl -> phy | 15 | row (ACT) |
+| `row_addr` | ctrl -> phy | `ROW_BITS` = 15 + log2(32 / PCS): 15 (`FULL`), 17 (`MID`), 18 (`TINY`) | row (ACT), extended by the PC fold (H-1) |
 | `col_cmd` | ctrl -> phy | 2 | NOP, RD, WR |
 | `col_ap` | ctrl -> phy | 1 | auto-precharge |
 | `col_sid`, `col_bg`, `col_ba` | ctrl -> phy | 2, 2, 2 | bank of the column command |
@@ -215,14 +246,17 @@ command, and read data returned at a fixed latency.
 
 The behavioral DRAM model (`tb/models/hbm_pc_model.sv`, testbench only, Phase 4) contains:
 - bank state and sparse storage, an associative array keyed by (SID, bank group, bank, row, column);
-- **the timing checker**: the H-4 rule table and state rules. It reports a violation with `$error` and counts them, and the
-  regression requires zero;
+- **the timing checker**: the H-4 rule table and state rules, per PC, plus the channel-scope rule over the two PCs of a channel. It
+  reports a violation with `$error` and counts them, and the regression requires zero;
 - the refresh-lag check;
 - parameters: `t_*` (default: H-4), `PHY_RD`, and an optional random read-data delay jitter that stays within the fixed-latency
   contract and is off by default.
 
-`hbm.Dram` is its reference: `tb/unit/test_hbm.py` checks each rule class against hand-made violating sequences. Phase 4 runs the same
-sequences against the SV model.
+`hbm.Dram` and `hbm.Channel` are its reference. `tb/unit/test_hbm.py` has, for every rule in `hbm.rules()`, one sequence that violates
+it by one cycle and one that meets it exactly, plus the state rules. A rule-removal (mutation) test deletes each rule in turn and
+requires a sequence to start passing; only the four redundant rules above may be deleted unnoticed, and the test checks that they
+are redundant (review finding X-1). Phase 4 runs the same sequences against the SV model, and the same mutation test against its
+rule table.
 
 ## H-6. Results ([hbm_experiments.md](../reports/hbm_experiments.md))
 
@@ -235,7 +269,7 @@ The frozen roofline assumes 0.85 sustained HBM efficiency (arch.md). The control
 | reads : writes 3 : 1 | 0.90 | prefill; compute-bound anyway |
 | random 256 B granules | 0.97 | paged KV, sparse attention blocks |
 | random 264 B rows (Engram) | 0.89 bus, 0.82 useful | 0.917 of the bytes moved are row bytes |
-| random 64 B | 0.42 | bound by tFAW: avoid; the DMA gathers whole rows |
+| random 64 B | 0.40 | bound by tFAW and tRREFDA: avoid; the DMA gathers whole rows |
 
 The 0.85 frozen value therefore keeps 0.10-0.14 margin for what this model leaves out:
 - load imbalance across PCs;
@@ -252,7 +286,7 @@ Decisions this evidence supports:
   - write 16: 32 gains 1% on decode traffic and 5% on 3:1 traffic, at twice the buffer.
   - Read return buffer 16 granules: at most 11 are in transfer at once (H3).
 - **Latency:**
-  - At 85% load, a granule waits 133 ns on average and 370 ns at p99 from queue entry to the last burst out of the PHY (H4).
+  - At 85% load, a granule waits 133 ns on average and 367 ns at p99 from queue entry to the last burst out of the PHY (H4).
   - With about 40 ns of NoC, CDC and response overhead each way, the loaded round trip is about 640 core cycles at p99.
   - The DMA's 512 granules in flight cover 102 B/cycle x 1,285 cycles, which is 2x margin (microarch.md §2.5).
 
@@ -284,6 +318,7 @@ Decisions this evidence supports:
 | `rd_desc` | in | 64 | valid/ready | read granule descriptor (bank, row, col_hi, first burst, count, tag) |
 | `wr_desc` + `wr_data` | in | 64 + 256 B + 8 | valid/ready | write granule, burst mask |
 | `rd_done` | out | tag + 256 B | valid/ready | completed granule to the response packer |
+| `chan_row` | in/out | busy-next-slot, 1 each way | level | to the other PC engine of the channel: an ACT here holds its next slot (H-3 step 7) |
 | `wr_acc` | out | source, burst id, bytes | pulse | write accepted (to the ack coalescer) |
 | `dfi` | out/in | H-5 | | |
 | `cfg` | in | timing table + policy | static | from CSRs |
@@ -313,6 +348,12 @@ Decisions this evidence supports:
 ## H-9. Open items
 
 - Replace the H-4 timing values with JESD238 / vendor HBM3e values. Re-run `make hbm`. Confirm tCCD_L ≤ 2.5 ns (H-6).
+  **JESD238 checklist** (review finding X-2; each is a timing-table parameter or rule, so the answer changes values, not the RTL):
+  - (a) Does tRREFD also govern REFpb → ACT of another bank (`tRREFDA`, assumed equal), and is there a same-bank-group term?
+  - (b) How many CK an ACT and the other row and column commands occupy on the channel's shared buses (`ACT_CK` = 2 assumed, others 1).
+  - (c) Is there a separate write-to-write same-bank-group gap (DDR5 has tCCD_L_WR for on-die ECC)? If so, split CCDL for WR → WR.
+  - (d) The scope of tFAW and tRRD with 3 SIDs: per PC (assumed) or per SID.
+  - (e) Does tPPD (PRE → PRE) exist? If so, add a PRE / PREA → PRE / PREA rule.
 - Host-side ECC: v1 relies on the HBM3 on-die ECC, and the interface carries no ECC bits. To be decided with the RAS requirements.
 - PHY training, ZQ calibration and ECS (error check and scrub) intervals: account for them in the perf simulator (Phase 7) as a fixed
   bandwidth tax.
