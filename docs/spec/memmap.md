@@ -19,7 +19,9 @@ The source network interface resolves the node:
 - **own node:** the local mesh;
 - **same package:** the D2D bridge on the source's row;
 - **same die index, other package:** the C2C port to that package;
-- **anything else:** a fault (`RAIL`). Cross-rail transfers are two DMA operations through a staging buffer (noc.md §6).
+- **anything else:** a fault (`RAIL`). Cross-rail transfers are two DMA operations through a staging buffer (noc.md §6). That includes
+  hashed-table gathers: rows on the other rail of another package are gathered by the sibling die and pushed on
+  (hyper_connections.md G-4, review finding I-8).
 
 There is no virtual memory. Kernels, the compiler and the runtime use physical addresses. The only translation is the KV page table in
 the DMA (§6).
@@ -172,9 +174,10 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 - An access to an unmapped, reserved or forbidden address returns an error response.
 - The initiating core stops with `FAULT_CAUSE`/`FAULT_ADDR` set and sends an interrupt to the CP.
 - Write-add on an HBM address is a fault (`HBM_WADD`): HBM has no read-modify-write path.
-- HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The compiler lays out
-  per-token items so that each write is aligned. The scale rows of a page (§6) can be smaller than 32 B per token (8 B for one
-  128-wide NVFP4 KV group, 4 B for an MXFP4 index key).
+- HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The scale rows of a page
+  (§6) can be smaller than 32 B per token (8 B for one 128-wide NVFP4 KV group, 4 B for an MXFP4 index key). They are not padded:
+  the compiler rewrites the aligned 32 B block that holds the new token's scales from a copy in SPM (tail-block rewrite, hbm.md H-2,
+  review finding I-14).
 - Fault codes: isa.yaml `fault_cause`.
 
 ## 9. Ordering

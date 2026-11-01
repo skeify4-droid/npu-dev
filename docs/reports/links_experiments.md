@@ -95,3 +95,17 @@ Tokens/s/user at 64 x 128K on the frozen package count, best mapping re-searched
 | Muse Spark Open | 8 | 58 | 61 (+6%) | 63 (+9%) | 64 (+10%) |
 | Qwen3.8-Flash-Next | 2 | 129 | 128 (-1%) | 133 (+3%) | 134 (+4%) |
 | Step 5 Preview | 8 | 104 | 107 (+4%) | 116 (+12%) | 118 (+13%) |
+
+## L7. Hashed-table gathers across rails (review finding I-8)
+
+Models with hashed n-gram tables at the serving point (64 x 128K, fp8 deployment). Sharded over all dies, a fraction of the rows sits on the other rail of another package, which a die cannot read directly (memmap.md section 1). **A**: one copy of the table per rail. **B (chosen)**: the requester's sibling die gathers those rows over C2C and pushes them over D2D (hyper_connections.md G-4).
+
+| model | table GB | packages | weights-only packages: sharded / A | GB per die at serving: sharded / A (usable) | tok/s/user, tok/s/package: sharded / A |
+|---|---|---|---|---|---|
+| DeepSeek V4.1 Flash | 203 | 4 | 2 / 4 | 73.4 / 98.8 (132.5) | 146, 2330 / 146, 2330 |
+| Qwen3.8-Flash-Next | 51 | 2 | 1 / 1 | 79.5 / 92.3 (132.5) | 129, 4118 / 129, 4118 |
+
+| model | staged share of rows | gather bytes per die per step | + D2D per die per step | + latency per gather layer (frozen / bottom-up) | one layer | step share if not hidden |
+|---|---|---|---|---|---|---|
+| DeepSeek V4.1 Flash | 0.375 | 101 KB | 38 KB (0.03 us) | 0.50 / 0.09 us | 172 us | 0.015% |
+| Qwen3.8-Flash-Next | 0.250 | 41 KB | 10 KB (0.01 us) | 0.50 / 0.09 us | 162 us | 0.006% |

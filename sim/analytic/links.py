@@ -12,8 +12,10 @@ import math
 CLOCK = 1.5e9
 # ---------------------------------------------------------------- flit
 NOC_DATA_BITS, NOC_HDR_BITS = 1024, 128          # noc.md section 2: header travels in a sideband
+# Credits are cumulative per-VN counters of freed receive slots, mod 2^12, sent on every flit (idle ones included), so a
+# flit lost to a CRC error loses no credit: the next flit carries the newer total (review finding X-4, d2d_c2c.md L-3).
 LINK_HDR = {"valid": 1, "head": 1, "tail": 1, "vn": 1, "seq": 12, "ack_seq": 12, "ack_type": 2,
-            "credit_req": 4, "credit_rsp": 4, "credit_shared": 6, "rsvd": 20}
+            "credit_req": 12, "credit_rsp": 12, "rsvd": 10}
 CRC_BITS = 32                                    # CRC-32C over header + data
 LINK_FLIT_BITS = NOC_DATA_BITS + NOC_HDR_BITS + sum(LINK_HDR.values()) + CRC_BITS
 LINK_FLIT_B = LINK_FLIT_BITS / 8                 # 156 B
@@ -227,6 +229,61 @@ def decode_sensitivity():
     return rows
 
 
+# ---------------------------------------------------------------- hashed-table gathers across rails (review I-8)
+def table_gather_options():
+    """Models with hashed n-gram tables (hyper_connections.md G-4), at the serving point. Rows of a table sharded over all
+    dies that sit on the other rail of another package cannot be read directly (memmap.md section 1, RAIL).
+    Option A: one table copy per rail (direct gathers, more capacity). Option B (chosen): those rows are gathered by the
+    requester's sibling die over C2C and pushed over D2D (two DMA operations staged in SPM, as in the L-7 all-to-all)."""
+    from . import roofline as R, sweep as SW, hw as HW
+    from npumodel import schema as S
+    hw = HW.make()
+    dpp = hw["dies_per_pkg"]
+    orig = R.capacity
+    rows = []
+    for key, d in SW.load_all().items():
+        tables = d.get("extras", {}).get("tables", [])
+        if not tables:
+            continue
+        wd = SW.deploy_dtype(d, "fp8")
+        dt = dict(d["weights"]["dtypes"], **(wd or {}))
+        tb = S.count_params(d)["table"] * S.DTYPE_BYTES[dt["table"]]
+
+        def cap_a(desc, hw_, packages, pp, tp, batch, ctx, kv_dtype="fp8", weight_dtype=None, with_drafter=True, d=d, tb=tb):
+            r = dict(orig(desc, hw_, packages, pp, tp, batch, ctx, kv_dtype, weight_dtype, with_drafter))
+            if desc is d and packages >= 2:
+                extra = tb * dpp / (packages * dpp) - tb / (packages * dpp)     # a copy per rail instead of one in total
+                r["weights"] += extra
+                r["total"] += extra
+                r["fits"] = r["total"] <= r["limit"]
+            return r
+
+        out = {"model": d["name"], "table_GB": tb / 1e9}
+        for tag, cap in (("base", orig), ("A", cap_a)):
+            R.capacity = cap
+            try:
+                n, r = SW.serving_packages(d, hw)
+                m = R.capacity(d, hw, n, r["pp"], r["tp"], SW.SERVE["batch"], SW.SERVE["ctx"], weight_dtype=wd)
+                out[tag] = {"weights_only": R.min_packages(d, hw, 1, 8192, weight_dtype=wd)[0], "serving": n,
+                            "tok_s_user": r["tok_s_user"], "tok_s_pkg": r["tok_s_total"] / n, "die_GB": m["total"] / 1e9,
+                            "limit_GB": m["limit"] / 1e9, "pp": r["pp"], "tp": r["tp"]}
+            finally:
+                R.capacity = orig
+        n, b = out["base"]["serving"], out["base"]
+        dies = n * dpp
+        ds = dies / b["pp"]
+        per_die = sum(SW.SERVE["batch"] * t["lookups_per_token"] * t["dim"] * S.DTYPE_BYTES[dt["table"]] for t in tables) / ds
+        staged = (n - 1) / (2 * n) if n >= 2 else 0.0                 # rows on the other rail of another package
+        step = 1 / b["tok_s_user"]
+        out["B"] = {"staged_frac": staged, "gather_KB": per_die / 1e3, "d2d_KB": per_die * staged / 1e3,
+                    "d2d_us": per_die * staged / hw["d2d_bw"] * 1e6,
+                    "extra_lat_us_frozen": hw["d2d_lat"] * 1e6, "extra_lat_us_bottom_up": step_latency("D2D") * 1e6,
+                    "layer_us": step / d["dims"]["n_layers"] * 1e6, "gather_layers": len(tables),
+                    "unhidden_frac": len(tables) * hw["d2d_lat"] / step}
+        rows.append(out)
+    return rows
+
+
 # ---------------------------------------------------------------- report
 def report():
     ds, cs = d2d_sizing(), c2c_sizing()
@@ -288,6 +345,26 @@ def report():
     for r in decode_sensitivity():
         L.append(f"| {r['model']} | {r['packages']} | {r['base']:.0f} | {r['sched_frozen']:.0f} ({r['sched_frozen'] / r['base'] - 1:+.0%}) | "
                  f"{r['bottom_up_x2']:.0f} ({r['bottom_up_x2'] / r['base'] - 1:+.0%}) | {r['bottom_up']:.0f} ({r['bottom_up'] / r['base'] - 1:+.0%}) |")
+    tg = table_gather_options()
+    L += ["", "## L7. Hashed-table gathers across rails (review finding I-8)", "",
+          "Models with hashed n-gram tables at the serving point (64 x 128K, fp8 deployment). Sharded over all dies, a fraction of "
+          "the rows sits on the other rail of another package, which a die cannot read directly (memmap.md section 1). "
+          "**A**: one copy of the table per rail. **B (chosen)**: the requester's sibling die gathers those rows over C2C and "
+          "pushes them over D2D (hyper_connections.md G-4).", "",
+          "| model | table GB | packages | weights-only packages: sharded / A | GB per die at serving: sharded / A (usable) | "
+          "tok/s/user, tok/s/package: sharded / A |", "|---|---|---|---|---|---|"]
+    for r in tg:
+        b, a = r["base"], r["A"]
+        L.append(f"| {r['model']} | {r['table_GB']:.0f} | {b['serving']} | {b['weights_only']} / {a['weights_only']} | "
+                 f"{b['die_GB']:.1f} / {a['die_GB']:.1f} ({b['limit_GB']:.1f}) | {b['tok_s_user']:.0f}, {b['tok_s_pkg']:.0f} / "
+                 f"{a['tok_s_user']:.0f}, {a['tok_s_pkg']:.0f} |")
+    L += ["", "| model | staged share of rows | gather bytes per die per step | + D2D per die per step | + latency per gather layer "
+          "(frozen / bottom-up) | one layer | step share if not hidden |", "|---|---|---|---|---|---|---|"]
+    for r in tg:
+        B = r["B"]
+        L.append(f"| {r['model']} | {B['staged_frac']:.3f} | {B['gather_KB']:.0f} KB | {B['d2d_KB']:.0f} KB ({B['d2d_us']:.2f} us) | "
+                 f"{B['extra_lat_us_frozen']:.2f} / {B['extra_lat_us_bottom_up']:.2f} us | {B['layer_us']:.0f} us | "
+                 f"{B['unhidden_frac']:.3%} |")
     L.append("")
     return "\n".join(L)
 

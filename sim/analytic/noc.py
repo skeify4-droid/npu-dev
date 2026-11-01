@@ -233,14 +233,16 @@ def endpoints(packages=2, dies=2):
 
 
 def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, multicast=True, hbm_forwards=False,
-              dma_forwards=False):
+              dma_forwards=False, link_vn=True):
     """Channel dependency graph of the whole system: REQ and RSP routes for every allowed endpoint pair,
     protocol edges (a request is consumed only by emitting its response), and XY-tree multicasts.
 
     split_vn=False puts requests and responses on the same channels (to show protocol deadlock).
     hbm_forwards=True makes HBM leaves forward remote requests (to show why endpoints must not chain requests).
     dma_forwards=True lets a DMA sink read data only by sending it on as a write (a GLOBAL -> GLOBAL copy with no local
-    buffer, review finding I-1): the response channel into a core then waits on that core's request injection."""
+    buffer, review finding I-1): the response channel into a core then waits on that core's request injection.
+    link_vn=False gives each D2D / C2C link one queue for both VNs (review finding I-7): the link layer then dequeues in
+    arrival order, so a blocked REQ holds the RSP behind it."""
     g = defaultdict(set)
     eps = endpoints(packages)
     cores = [e for e in eps if not is_leaf(e[2])]
@@ -293,6 +295,13 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
                         for t in dsts:
                             if t != s:
                                 link(_hops((p, d), route(s, t, "XY"), "REQ", "L"))
+    if not link_vn:                       # rejected (I-7): REQ and RSP share each link's TX / RX queue
+        def m(c):
+            return (c[0], c[1], c[2], "ANY", c[4]) if isinstance(c[0][0], str) else c
+        g2 = defaultdict(set)
+        for a, bs in g.items():
+            g2[m(a)].update(m(b) for b in bs)
+        g = g2
     return g
 
 
@@ -368,7 +377,7 @@ if __name__ == "__main__":
         print(f"{k:24s} max link utilization {u:5.2f}  at {link}")
     print(f"D2D max {d2d_max_bpc():.0f} B/cycle = {d2d_max_bpc() * CLOCK / 1e12:.2f} TB/s per direction")
     for kw in [dict(), dict(packages=4), dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
-               dict(hbm_forwards=True), dict(dma_forwards=True)]:
+               dict(hbm_forwards=True), dict(dma_forwards=True), dict(link_vn=False)]:
         g = build_cdg(**kw)
         c = find_cycle(g)
         print(kw or "baseline", "channels", len(g), "edges", sum(map(len, g.values())), "cycle" if c else "acyclic",

@@ -243,6 +243,12 @@ checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; a
   against its own rule table (hbm.md H-5).
 - `link`: D2D and C2C link-layer RTL (CRC-32C, go-back-N replay, shared-pool credits), behavioral PHY with configurable latency,
   bandwidth and error injection. Collectives are DMA programs (d2d_c2c.md L-7), not an engine.
+  Tests from the independent spec review (d2d_c2c.md L-11):
+  - CRC error on an idle flit, and a replayed flit with stale credit counters: no credit lost or counted twice (X-4);
+  - credit counters wrapping past 2^12 under a long stream (X-4);
+  - REQ blocked at the receiving leaf while RSP keeps draining through the same link (per-VN queues, I-7);
+  - `PKG_TINY` link down under load: every core with a transfer through the link faults with `LINK`, the mesh drains, and the CP
+    still reaches every core (X-5).
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.
@@ -284,6 +290,10 @@ checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; a
 - Input: the **same ISA programs** produced by `sw/compiler` for `FULL` config, plus the routing scenario
   (uniform, Zipf skew α, or a measured histogram).
 - Multi-chip: D2D/C2C link models, topology (ring, 2D torus, switch), collectives, TP/EP/PP mapping.
+- **Program-level deadlock detector** (independent spec review X-6): report a deadlock when every engine and front end of every core
+  is blocked on a semaphore wait (or a full queue behind one) and no transfer is in flight, with the wait chain. The golden
+  instruction-level model (`sw/compiler`, Phase 3) gets the same check next to its SPM race checker; the compiler's issue-order
+  rule (d2d_c2c.md L-7) is what it guards.
 
 **Data handling within 16 GB**
 - Binary trace records (about 24 B each), zstd streamed to the SSD. Rough size: one decode layer on one die is about

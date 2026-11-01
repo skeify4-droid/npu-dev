@@ -446,7 +446,8 @@ instructions:
       Block formats: scales of a non-paged operand are at R[scale_reg] with row stride TD aux0; a PAGED operand's
       scales are in the scale region of the same page. ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
       FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
-      bytes to sem[rsem] of the core that owns the destination address once the data is written.
+      bytes to sem[rsem] of the core that owns the destination address once the data is written; SRAM destinations
+      only (an HBM destination has no owning core: ILLEGAL_FIELD; end the transfer with a SIGNAL instead).
   DMA_GATHER:
     op: 0x41
     fmt: T_DMA

@@ -80,7 +80,14 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
 - HBM writes must be 32 B aligned in both address and size. The controller has no read-modify-write path, and the DFI-like interface
   has no data mask. Anything else faults with `HBM_ALIGN` (isa.yaml `fault_cause`).
 - The compiler lays out data accordingly. Paged KV keeps each page's block scales in a scale region of the same page (memmap.md §6);
-  a token's scale row can be smaller than 32 B (8 B for one 128-wide NVFP4 KV group).
+  a token's scale row can be smaller than 32 B (8 B for one 128-wide NVFP4 KV group, 4 B for a DeepSeek MXFP4 index key).
+- **Tail-block rewrite *(review finding I-14)*:** per-token scale rows are stored at their natural stride, not padded. The compiler
+  keeps the current 32 B block of scale rows (4 or 8 tokens) in SPM and rewrites the whole aligned block each step; the next block
+  starts empty when the current one fills.
+  - Padding each token's scales to 32 B instead would grow a DeepSeek index key from 68 B to 96 B (+41% of the index-scan bytes,
+    and the scan is up to 12% of a step, arch.md §4). The rewrite costs 28 B of extra write per token per step, and no read bytes.
+  - It is safe because a write is acked once queued and merges with any queued write to the same granule (write after write,
+    below), and the step's readers wait on the write's ack or semaphore anyway.
 - The DMA splits writes at 256 B granule boundaries.
 
 **Ordering and hazards inside a PC:**

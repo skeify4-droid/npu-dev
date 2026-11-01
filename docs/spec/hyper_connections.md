@@ -95,6 +95,21 @@ the same path as the planned MXFP4 decompression), destination scratchpad addres
 **G-4: tables are sharded by row range** across the HBM of all dies and packages that hold the model (DeepSeek's 197 GB table alone exceeds one die's 144 GB).
 A remote row costs one C2C/D2D round trip of 264 B. Traffic is ~3 MB per decode step at batch 256: negligible bandwidth, so only the memory map and the address
 translation need to handle it. Capacity is the real impact; it goes into the Phase 1 step 3 package-count analysis.
+*Revised for review finding I-8 (decided 2026-11-01: staging, not replication):*
+- A die reaches its own HBM, its sibling's (D2D) and the same die index of other packages (C2C), but not the other rail of another
+  package (memmap.md §1, `RAIL`). With uniform row-range sharding that is (P - 1) / 2P of the rows on P packages: 3/8 for DeepSeek
+  (4 packages), 1/4 for Qwen (2 packages).
+- **Those rows are staged through the requester's sibling die.** The sibling, which is on the owner's rail, gathers them over C2C
+  into a staging buffer in its own SPM, then pushes them over D2D into the requester's SPM with `rsem`. These are two DMA operations
+  through SRAM, as for the rail-staged all-to-all (d2d_c2c.md L-7, noc.md §4 rule 4). The rows arrive as stored (MXFP8 with inline
+  scales), and the requester converts them with a local SPM-to-SPM `DMA_COPY`, as its direct rows are converted on the way in.
+- **One gather per owner node.** A `DMA_GATHER` has one base, so the CP (G-2) buckets each step's index list by owner node: own die,
+  sibling, each same-rail package, and one staged list per other-rail package, handed to the sibling.
+- **Cost** (links_experiments.md L7): no capacity change and no arch.md change. DeepSeek: +38 KB of D2D per die per decode step
+  (0.03 µs) and one extra D2D hop of latency per gather layer (0.5 µs frozen, 0.09 µs bottom-up), hidden by G-1 inside the
+  preceding layer (about 170 µs); 0.015% of the step even if it were not hidden.
+- Rejected: one table copy per rail. It makes every gather direct, but costs +203 GB on DeepSeek (73 → 99 GB per die at the serving
+  point) and raises the arch.md §3 "weights only" package count from 2 to 4.
 
 **G-5: the gate after the gather** (DeepSeek: per-stream normalized dot product, signed sqrt, sigmoid; Qwen: key/value projections into the 4 streams) is VPU/SFU work plus one GEMM;
 it reuses the HC ops above.

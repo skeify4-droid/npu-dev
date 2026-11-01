@@ -116,6 +116,8 @@ Four mechanisms remove the four kinds of deadlock:
      possible, even though no single packet crosses twice.
    - So packets that arrived over a link use **class X** VCs and go only to endpoints. The dependency order is then
      L channels -> link -> X channels -> sink, which is acyclic.
+   - The link itself is two channels, one per VN: its receive buffer has a queue per VN and its sender arbitrates per VN
+     (d2d_c2c.md L-3, review finding I-7). One arrival-order queue for both would let a blocked REQ hold an RSP (tested below).
 4. **Multi-hop link paths:** a packet crosses **at most one link**.
    - D2D connects the two dies of a package.
    - C2C connects die d of one package only to die d of others: **rail-aligned**, as in GPU rail-optimized networks.
@@ -140,6 +142,7 @@ Four mechanisms remove the four kinds of deadlock:
 | Cross-rail forwarding in hardware (D2D then C2C, both in class X), 4 packages | **cycle** (through a C2C port row) |
 | An HBM leaf consumes a request by issuing one to the sibling die | **cycle** (D2D and back) |
 | A DMA forwards read data as a write (global-to-global copy without a local sink, review I-1) | **cycle** (two cores reading each other) |
+| One link queue for REQ and RSP (no per-VN queues in the link layer, review I-7) | **cycle** (through two C2C links) |
 
 Each rejected design is a test case (`tb/unit/test_noc.py`), so a change that reintroduces one of them fails `make pytest`.
 - Coverage: the check is at channel-class granularity. More VCs per class with free allocation inside the class keep it valid.
@@ -195,8 +198,9 @@ across both planes (`noc.scenarios()`).
   byte-counting semaphores, `SIGNAL`.
 - **QoS:** none beyond round-robin in v1. The perf simulator reports per-class latency, to decide whether HBM responses need priority.
 - **Errors:** a target that cannot serve an address returns `ERR`. The initiating DMA records it, stops the core and interrupts the CP.
-  Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down faults the cores with transfers
-  outstanding (`LINK`).
+  Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down keeps sinking: its bridge answers
+  requests with `ERR` (`LINK`) and drops everything else, so the mesh drains and the cores with transfers through it fault (review
+  finding X-5).
 
 ## 8. Open items
 

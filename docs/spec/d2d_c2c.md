@@ -46,8 +46,8 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
 | 1 | VN | REQ or RSP. Multicast never crosses a link |
 | 12 | seq | flit sequence number, per lane and direction |
 | 12 + 2 | ack_seq, ack_type | cumulative ACK or NAK for the reverse direction (piggybacked) |
-| 4 + 4 + 6 | credit_req, credit_rsp, credit_shared | credits returned to the reverse direction's sender |
-| 20 | reserved | |
+| 12 + 12 | credit_req, credit_rsp | cumulative count of receive slots freed per VN, mod 2^12, on every flit (review finding X-4) |
+| 10 | reserved | |
 | 32 | CRC | CRC-32C (Castagnoli) over all the above |
 
 **Credits *(P2)*:**
@@ -57,6 +57,22 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
 - This is what noc.md §4 needs: RSP always drains even when REQ is stuck, because RSP arrivals go to class X virtual channels that sink
   at endpoints.
 - The receiving bridge moves a packet from the receive buffer into a class X VC of the leaf router, then returns its credits.
+- **Per-VN queues *(review finding I-7)*:** the receive buffer is one pool of slots, but `ll_rx` keeps **one queue per VN** over it and
+  the bridge dequeues each VN independently. A REQ packet blocked on a full class-X REQ VC therefore never holds an RSP packet that
+  arrived behind it. `ll_tx` likewise arbitrates per VN, so a REQ waiting for credits does not block RSP. With one arrival-order queue
+  the reserved RSP slots would not help: `noc.build_cdg(link_vn=False)` finds a cycle through two C2C links (a rejected variant in
+  `test_noc.py`). `noc.py` always modelled per-VN link channels; this makes the spec require them.
+- **Credit return *(review finding X-4)*:**
+  - The receiver sends, on every flit including idle ones, the cumulative number of slots it has freed for each VN since link-up,
+    mod 2^12 (`credit_req`, `credit_rsp`). It never says whether a slot was in the pool or a reserve.
+  - The sender takes the difference to its last value mod 2^12 as the newly returned credits. A flit lost to a CRC error (an idle
+    flit is never replayed) loses nothing: the next flit carries the newer total. A value that is not ahead of the last one in serial
+    order (a replayed, older flit) is ignored.
+  - The sender alone does the pool accounting: it charges each flit it sends to the VN's reserve or to the pool, and applies
+    returned credits of a VN **to that VN's reserve first**, then to the pool. So the reserves cannot drift into the pool, and
+    in-flight flits never exceed pool + 8, whichever slots the receiver used.
+  - 2^12 = 4,096 is more than twice the largest receive buffer (520 flits), so the counter difference is never ambiguous.
+  - This replaces the incremental 4 + 4 + 6-bit credit fields, which a lost idle flit would have leaked for good.
 
 **Ordering:**
 - Each lane delivers flits in order, including across a replay.
@@ -85,9 +101,15 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     **1.26 MiB per die**.
   - 12-bit sequence numbers cover twice the largest replay window.
 - **Link down:** more than 8 consecutive replays of the same flit, or PHY loss of lock.
-  - The bridge stops, records the cause in its CSRs and interrupts the CP.
-  - Outstanding transfers through it never complete. The DMA's per-request timeout (CSR, default 100 µs) faults the core with `LINK`
-    (isa.yaml `fault_cause`).
+  - The bridge records the cause in its CSRs and interrupts the CP.
+  - **It keeps sinking *(review finding X-5)*.** A stopped bridge would back packets up through the mesh REQ-L virtual channels and
+    block unrelated traffic on them: other cores' HBM reads, the cores' fault interrupts to the CP, and the CP's recovery accesses.
+    So after link down the bridge:
+    - answers every request that arrives for the link with `ERR` (cause `LINK`), like a target that cannot serve the address;
+    - drops responses that arrive for the link (their initiators are on the far side, and time out there);
+    - discards its replay buffer and anything still in its receive buffer.
+    The mesh therefore drains, and every core with a transfer through the link faults with `LINK` from the `ERR`.
+  - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
   - Recovery is a runtime action: retrain, then restart the step.
 - **Error injection:** the behavioral PHY flips bits at a configurable rate, or on chosen flits. The Phase 4 tests require that every
   injected error is replayed and that the delivered data is unchanged.
@@ -122,9 +144,14 @@ Collectives use only the following, all existing in ISA v0.1.
 - **Multicast:** `DMA_MCAST`, intra-die only.
 - **Persistent buffers:**
   - Each collective call site owns two receive buffers per peer, used alternately.
+  - **One byte-counting semaphore per buffer parity** *(review finding I-6 c)*: a producer that runs ahead into buffer B would
+    otherwise complete buffer A's count early. With forwarding, one semaphore per chunk slot.
   - The consumer `SIGNAL`s the producer's credit semaphore once a buffer is consumed. Monotonic semaphores mean no reset and no
-    handshake per call.
+    handshake per call (isa.md §3: network-facing semaphores are never reset).
   - The producer's credit wait is normally already satisfied, so it is off the critical path.
+- **SRAM destinations only for `rsem`** *(review finding I-6 b)*. An HBM write has no owning core, so `rsem` with an HBM destination
+  is `ILLEGAL_FIELD`. A transfer into an HBM buffer ends with a `SIGNAL` (release after the acks) that adds its byte count to the
+  consumer's semaphore. Prefill all-to-all buffers are this case.
 - **Deterministic mode** (`deterministic_collectives`, numerics.md N-6):
   - Every contribution is written to its own slot, and the owner reduces with `VRED` in source order.
   - It needs the same number of steps, n slots of buffer, and one `VRED` pass. For the decode TP all-reduce at g = 8 that pass is about
@@ -166,8 +193,25 @@ That is 4 latency steps for any g > 2. The roofline's ring needs 2(g - 1) steps,
    - **Other rail, other package: staged *(P2)*.** The data goes over C2C to the same-rail die of the destination package. That die
      forwards it over D2D in 64 KiB chunks, as soon as each chunk's `rsem` count completes.
      - The forward is a new DMA transfer from SRAM into a buffer reserved in advance, so it is not a network dependency of the first
-       hop (noc.md §4 rule 4).
+       hop (noc.md §4 rule 4). The staging slots are in the forwarder's own SPM, because a DMA has one local operand (isa.md §5).
+     - The forwards are one `DMA_LIST` whose entries wait on their chunk's semaphore (isa.md §5), so they take one queue slot.
      - C2C first, then D2D, because D2D has 1.75x the bandwidth for the forwarded bytes.
+   - **Buffer rules *(review finding I-6 a)*:**
+     - A destination buffer whose consumer waits for a byte total is sized for that whole total (known from the counts) and is not
+       recycled within the exchange. Otherwise the forwarder would wait for credits that come only after the total arrives.
+     - The forwarder's staging ring may be smaller and recycled: a slot is freed when its D2D forward is acknowledged, which depends
+       only on the full-size destination buffer, not on consumption.
+     - Prefill volumes do not fit SPM (2,048 tokens x top-8 x 5,120 in FP8 is 84 MB per die), so those destination buffers are in
+       HBM and complete by `SIGNAL` instead of `rsem` (L-6). The staging ring stays in SPM.
+   - **Issue order *(review finding X-6)*:** an instruction that waits on a remote semaphore blocks its queue, and a full queue (16
+     entries) blocks the in-order front end. So the compiler:
+     1. issues every put that depends only on local data **before** any instruction that waits on a remote semaphore;
+     2. keeps remote waits (chunk forwards, credit waits) in a queue that holds nothing other cores depend on, and puts each group of
+        forwards in one `DMA_LIST` with per-entry waits, so the front end never fills a queue behind them;
+     3. never puts a credit wait ahead of the same core's forwards in one queue.
+     Without rule 1, two forwarders with more than 16 chunks each block on full queues while each one's forwards wait for the
+     other's puts: a deadlock with no network resource involved, which `noc.py` cannot see. The golden model and the Phase 7
+     simulator detect it ("every engine blocked on a semaphore", PLAN Phase 7).
 3. **Combine:** the reverse direction. With write-add (`DMA_SCATTER wop = ADD_BF16/F32`) it is order-dependent for top-k ≥ 3. In
    deterministic mode it writes into `[token, k]` slots, which the VPU sums in k order.
 
@@ -179,6 +223,10 @@ The roofline formula counted only N(1 - 1/g)(1 - 2/g) bytes as off-package, and 
 all-to-all by up to 33% at g = 4 (L5; review finding R-1).
 
 **Pipeline hand-off:** one put-with-signal of the residual stream (n streams with hyper-connections) to the next stage's dies.
+
+**Hashed-table gathers** (DeepSeek Engram, Qwen n-gram; hyper_connections.md G-4): rows on the other rail of another package are
+gathered by the requester's sibling over C2C into its SPM and pushed over D2D with `rsem`, the same two-step staging as the
+all-to-all. The cost is in L7: no capacity, a few tens of KB of D2D per die per step, and one D2D hop of latency that G-1 hides.
 
 ## L-8. What this changes for the frozen architecture
 
@@ -219,8 +267,8 @@ with TP > 2:
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| `pkt_in` / `pkt_out` | in/out | flit_t + VN | valid/ready | to and from the bridge's packet side |
-| `credit_ret` | in | 4 + 4 + 6 | pulse | credits freed by the local RX buffer, sent on the next TX flit |
+| `pkt_in[2]` / `pkt_out[2]` | in/out | flit_t | valid/ready per VN | to and from the bridge's packet side: one queue per VN over the shared pool on RX, per-VN arbitration on TX (I-7) |
+| `credit_ret` | in | 12 + 12 | level | cumulative slots freed per VN by the local RX buffer, mod 2^12, sent on every TX flit (X-4) |
 | `ack_ret` | in | 12 + 2 | pulse | ACK/NAK generated by the local RX, sent on the next TX flit |
 | `phy` | out/in | 1248 | valid/ready | |
 
@@ -254,3 +302,7 @@ with TP > 2:
 - Above 8 packages, through an external rail switch: the switch must keep REQ and RSP separate and do its own link-level retry.
   Perf simulator only.
 - The DMA request timeout and the runtime's recovery after a link-down event are Phase 4 (`link`, `die`) and runtime items.
+- Phase 4 link tests from the review (PLAN Phase 4): CRC error on an idle flit and on a replayed flit carrying stale credits (no
+  credit lost or double-counted, X-4); credit counters wrapping past 2^12; REQ blocked at the receiver while RSP keeps draining
+  (I-7); link down under load on `PKG_TINY`: every core with a transfer through the link faults with `LINK` and the CP still reaches
+  every core (X-5).

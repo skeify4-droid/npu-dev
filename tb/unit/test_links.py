@@ -52,5 +52,23 @@ def test_error_rate_needs_crc():
 
 def test_report_exists():
     s = open(os.path.join(ROOT, "docs", "reports", "links_experiments.md")).read()
-    for h in ("L1.", "L2.", "L3.", "L4.", "L5.", "L6."):
+    for h in ("L1.", "L2.", "L3.", "L4.", "L5.", "L6.", "L7."):
         assert h in s
+
+
+def test_link_credit_fields():
+    """X-4: cumulative per-VN credit counters cover twice the largest receive buffer, so differences are unambiguous."""
+    assert "credit_shared" not in K.LINK_HDR
+    rx = max(K.buffers(k)["rx_shared_flits"] + K.buffers(k)["rx_reserved_flits"] for k in ("D2D", "C2C"))
+    assert 2 ** K.LINK_HDR["credit_req"] >= 2 * rx and K.LINK_HDR["credit_req"] == K.LINK_HDR["credit_rsp"]
+
+
+def test_table_gather_options():
+    """I-8: staging the other-rail rows (option B, chosen) costs no capacity and negligible link time; a copy per rail
+    (option A) would change the frozen arch.md section 3 'weights only' count for DeepSeek."""
+    rows = {r["model"]: r for r in K.table_gather_options()}
+    ds = rows["DeepSeek V4.1 Flash"]
+    assert ds["base"]["serving"] == 4 and ds["base"]["weights_only"] == 2           # arch.md section 3, unchanged by B
+    assert ds["A"]["weights_only"] > ds["base"]["weights_only"]
+    for r in rows.values():
+        assert r["B"]["d2d_us"] < 1.0 and r["B"]["extra_lat_us_frozen"] < 0.05 * r["B"]["layer_us"]
