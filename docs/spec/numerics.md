@@ -83,7 +83,7 @@ Notation:
 | FP32 → E2M1 | `VQUANT` | `RNE` + `sat` to ±6 (NaN: block rule below) |
 | FP32 → INT* | VPU outputs | `RNE`, saturate to the integer range, NaN → 0 |
 | E4M3, E5M2, E2M1, BF16, FP16 → BF16 / FP32 | DMA, VPU inputs | exact. E5M2 Inf stays Inf. A BF16/FP32 subnormal arriving at an arithmetic unit reads as ±0 |
-| MXFP8, MXFP4, NVFP4 → BF16 | DMA `*_BF16` | exact: element × block scale. E2M1 × E4M3 has at most 6 significant bits, BF16 holds 8. The NVFP4 tensor scale (`R[ts_reg]`) is **not** applied to the elements; it becomes a column scale (one per 128-deep K tile). Values outside the BF16 normal range (never seen in real weights) overflow to Inf or flush |
+| MXFP8, MXFP4, NVFP4 → BF16 | DMA `*_BF16` | exact: element × block scale. E2M1 × E4M3 has at most 6 significant bits, BF16 holds 8. The NVFP4 tensor scale (`R[ts_reg]`) is **not** applied to the elements; it becomes a column scale (one per 128-deep K tile). Results in the BF16 subnormal range are **kept** (RNE onto the subnormal grid, as every exact conversion, N-5; review finding I-15 removed the word "flush"); MXFP4 and NVFP4 products are always exact there; only MXFP8 products below 2^-130 can round. Overflow gives Inf (never seen in real weights) |
 | MXFP8, MXFP4, NVFP4 → E4M3 + column scales | DMA `*_E4M3` | **fold**, below |
 
 **Fold (`cvt MXFP4_E4M3`, `NVFP4_E4M3`, `MXFP8_E4M3`).** For each weight row r and each 256-element K tile t (8 MX blocks or 16 NVFP4

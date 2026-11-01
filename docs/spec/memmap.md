@@ -35,8 +35,21 @@ the DMA (§6).
 | `0x200_0000_0000` | 64 x 4 MiB | SPM of core c at `+ c * 4 MiB` | core id c = `(y - 1) * 8 + (x - 1)` for tile (x, y); 32 populated |
 | `0x200_1000_0000` | 64 x 1 MiB | GSRAM slice c at `+ c * 1 MiB` | slice c lives in core tile c |
 | `0x200_2000_0000` | 64 x 1 MiB | CORECTL of core c at `+ c * 1 MiB` | IMEM, DTAB, semaphores, CSRs (§5); 128 KiB used |
-| `0x200_3000_0000` | 16 x 1 MiB | DIECTL block i | 0 CP, 1 host interface, 2-5 HBM controllers 0-3, 6 D2D bridge, 7 C2C bridge, 8 NoC |
+| `0x200_3000_0000` | 16 x 1 MiB | DIECTL block i | 0 CP, 1 host interface, 2-5 HBM controllers 0-3, 6-9 D2D bridges, 10-13 C2C bridges, 14 NoC (table below) |
 | everything else | | unmapped | faults |
+
+**DIECTL blocks** (`isa.yaml` `memmap.diectl`; review finding I-15). The source network interface routes a DIECTL access to the
+endpoint of the leaf listed here:
+
+| Block | Holds | Leaf |
+|---|---|---|
+| 0 | command processor; `MAILBOX` at offset 0: 64 x 8 B, slot c written by core c (`IRQ`, `HALT`, fault code), each write interrupts the CP | W2 |
+| 1 | host interface | W3 |
+| 2-5 | HBM controller of stack 0-3 (hbm.md H-7), through its port-0 leaf | N1, N5, S1, S5 |
+| 6-9 | D2D bridge of sub-link 0-3 (rows 1-4) | E1-E4 |
+| 10-13 | C2C bridge of leaf W1-W4 (2 ports each; the peer routing table) | W1-W4 |
+| 14 | NoC configuration and counters | W2 |
+| 15 | reserved | |
 
 Capacity note:
 - The HBM numbers are binary: 24 Gb dies, so 36 GiB per stack (38.65 GB) and 144 GiB per die.
@@ -97,7 +110,8 @@ blocks stay on one leaf and streams stay at full rate (hbm.md H-1, review findin
 ## 4. On-chip SRAM
 
 - **SPM:**
-  - Byte-addressed, 4 MiB, 32 banks of 64 B with `bank = addr[10:6] ^ addr[15:11]`.
+  - Byte-addressed, 4 MiB, 32 banks of 64 B with `bank = addr[10:6] ^ addr[15:11]` (`isa.spm_bank`). Row pitches that are powers
+    of two from 2 KiB up are padded by 512 B (1 KiB at 16 KiB) so that two-row loads do not collide (microarch.md §2.3).
   - Instructions address the local SPM with offsets (space `SPM`). Other cores' SPMs are reached through the GPA window.
   - Granularity: 32 B (the DMA handles any size; sub-32 B writes use byte masks).
 - **GSRAM:** slice-contiguous 1 MiB windows. Software spreads hot data over slices itself.
@@ -111,8 +125,10 @@ blocks stay on one leaf and streams stay at full rate (hbm.md H-1, review findin
 | `0x00000` | 64 KiB | IMEM (4,096 instructions); writable while the core is stopped, or by DMA overlay followed by `FENCE` |
 | `0x10000` | 8 KiB | DTAB: 256 tile descriptors x 32 B; read by an engine when an instruction starts, so DMA updates follow isa.md §4 |
 | `0x12000` | 256 B | semaphores 0-63, 32-bit: a write sets, a read returns the value |
-| `0x12100` | 256 B | semaphore add window: a write (or DMA `ADD`) adds; this is what `SIGNAL` and `rsem` use |
-| `0x13000` | 4 KiB | CSRs (isa.yaml `csr` enum, 8 B each), plus `START` (write the PC to start) and `STOP` |
+| `0x12100` | 256 B | semaphore add window: a plain write (`wop = WRITE`) adds its 32-bit word as an unsigned integer, mod 2^32; this is what `SIGNAL` and `rsem` use. `ADD_F32` / `ADD_BF16` / `MAX_F32` to CORECTL fault `ADDR_FORBIDDEN` (review finding I-15) |
+| `0x13000` | 4 KiB | CSRs (isa.yaml `csr` enum, 8 B each) |
+| `0x14000` | 8 B | `START`: write a PC (instruction index) to start the core there (CP / host) |
+| `0x14008` | 8 B | `STOP`: write to stop the core after its queues drain (CP / host) |
 
 ## 6. KV pages
 

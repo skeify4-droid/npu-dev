@@ -234,3 +234,32 @@ def test_semaphore_serial_compare():
     assert I.sem_ready(0x00000010, 0xFFFFFFF0)              # wrapped past the target
     assert not I.sem_ready(0xFFFFFFF0, 0x00000010)          # not there yet across the wrap
     assert not I.sem_ready(0, 1 << 31) and I.sem_ready(0, (1 << 31) + 1)   # the 2^31 window
+
+
+def test_diectl_and_corectl(isa):
+    """I-15(e): every DIECTL block names the leaf that serves it; START / STOP have CORECTL offsets."""
+    leaves = {f"{e}{i}" for e, n in (("N", 8), ("S", 8), ("E", 4), ("W", 4)) for i in range(1, n + 1)}
+    dc = isa["memmap"]["diectl"]
+    assert all(r["leaf"] in leaves for r in dc.values())
+    assert sorted(r["block"] for r in dc.values()) == list(range(15))
+    assert [dc[f"D2D{r}"]["leaf"] for r in range(4)] == ["E1", "E2", "E3", "E4"]
+    assert [dc[f"C2C{r}"]["leaf"] for r in range(4)] == ["W1", "W2", "W3", "W4"]
+    assert {"START", "STOP"} <= set(isa["memmap"]["corectl"])
+    bad = copy.deepcopy(isa)
+    bad["memmap"]["corectl"]["STOP"]["offset"] = bad["memmap"]["corectl"]["START"]["offset"]
+    with pytest.raises(I.IsaError):
+        I.validate(bad)
+
+
+def test_spm_bank_strides():
+    """I-13(a), memmap.md section 4: row starts at power-of-two pitches do not all spread, and a stationary load of two
+    256 B rows per cycle collides at 2, 4 and 64 KiB pitches; padding the pitch (512 B, or 1 KiB at 16 KiB) removes it."""
+    def pair_ok(pitch):
+        rb = lambda base: {I.spm_bank(base + o) for o in range(0, 256, 64)}
+        return all(not (rb(i * pitch) & rb((i + 1) * pitch)) for i in range(0, 128, 2))
+    spread = {p: len({I.spm_bank(i * p) for i in range(64)}) for p in (2048, 4096, 8192, 16384, 32768, 65536)}
+    assert spread == {2048: 32, 4096: 16, 8192: 8, 16384: 4, 32768: 2, 65536: 1}
+    assert [pair_ok(1 << k) for k in range(11, 17)] == [False, False, True, True, True, False]
+    for k in range(11, 18):
+        assert pair_ok((1 << k) + (1024 if k == 14 else 512))
+    assert all(len({I.spm_bank(b + o) for o in range(0, 2048, 64)}) == 32 for b in range(0, 1 << 22, 2048 * 7))

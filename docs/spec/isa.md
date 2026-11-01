@@ -224,7 +224,7 @@ The FFN `down(swiglu(gate(x), up(x)))` for the tokens routed to one expert.
     VEW       func=SWIGLU d=R25 td=H  s0=R26 td=ACC_G  s1=R27 td=ACC_U              wsem=S3 wimm=1  ssem=S4 sinc=1
     MXU_MM    a=R25 td=H  w=R22 td=SPM_D  trans_w=1 acc=R28 m=R11 cs=R23 wsem=S4 wimm=1  ssem=S5 sinc=1   # (also waits S2: see note)
     VEW       func=COPY d=R29 td=Y_BF16 s0=R30 td=ACC_Y                              wsem=S5 wimm=1  ssem=S6 sinc=1
-    DMA_SCATTER dq=2 src=R29 td=Y_ROWS dst=R31 td=OUT idx=R32 wop=ADD_F32 rsem=S7     wsem=S6 wimm=1   # combine
+    DMA_SCATTER dq=2 src=R29 td=Y_ROWS dst=R31 td=OUT idx=R32 wop=ADD_BF16 rsem=S7    wsem=S6 wimm=1   # combine (BF16 rows)
 ```
 
 Each instruction waits on at most one semaphore. The second `MXU_MM` also depends on S2, so in real code the down-weight DMA signals
@@ -240,7 +240,8 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
 - ACC or SPM range overflow;
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
 - an invalid page-table entry in paged DMA;
-- a D2D/C2C link going down with transfers outstanding (d2d_c2c.md L-4);
+- a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4);
+- a DMA request with no response within the timeout CSR (`TIMEOUT`; review finding I-15, which separates it from `LINK`);
 - an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);
 - a `DMA_MCAST` without `rsem` (`ILLEGAL_FIELD`).
 

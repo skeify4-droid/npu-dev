@@ -196,6 +196,7 @@ enums:
     PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
     LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4)
     ERR_RSP: 13        # a target returned ERR for another reason
+    TIMEOUT: 14        # a DMA request got no response within the timeout (CSR); a link going down reports LINK instead
   list_op:             # DMA_LIST entry kinds (dma_list_entry.op)
     COPY: 0
     GATHER: 1
@@ -581,7 +582,7 @@ instructions:
     desc: >-
       Streaming top-k per row: merges the scores s0 [R x C] into the running state d (values FP32 [R x k] then
       indices int32 [R x k]). Column c has index p2_reg + c. init clears the state; final sorts it descending.
-      Ties keep the lower index. BLOCKMAX: block size in p_reg bits 31:0.
+      Ties keep the lower index. BLOCKMAX: block size in p_reg bits 31:0. 1 <= k <= 2048 (else ILLEGAL_FIELD).
   VROUTE:
     op: 0x88
     fmt: T_VPU
@@ -664,13 +665,31 @@ memmap:
     SPM:     {base: 0x20000000000, stride: 0x400000, count: 64, size: 0x400000, desc: "core c scratchpad, 4 MiB (32 cores populated)"}
     GSRAM:   {base: 0x20010000000, stride: 0x100000, count: 64, size: 0x100000, desc: "global SRAM slice in core tile c, 1 MiB"}
     CORECTL: {base: 0x20020000000, stride: 0x100000, count: 64, size: 0x20000, desc: "core c control block"}
-    DIECTL:  {base: 0x20030000000, stride: 0x100000, count: 16, size: 0x100000, desc: "die blocks: 0 CP, 1 host interface, 2-5 HBM controllers, 6 D2D bridge, 7 C2C bridge, 8 NoC"}
+    DIECTL:  {base: 0x20030000000, stride: 0x100000, count: 16, size: 0x100000, desc: "die blocks (memmap.diectl): 0 CP, 1 host interface, 2-5 HBM controllers, 6-9 D2D bridges, 10-13 C2C bridges, 14 NoC"}
   corectl:                  # offsets inside a core control block
     IMEM:    {offset: 0x00000, size: 0x10000}
     DTAB:    {offset: 0x10000, size: 0x02000}
     SEM:     {offset: 0x12000, size: 0x00100, desc: "64 x 32-bit; a write sets, a read returns the value"}
-    SEM_ADD: {offset: 0x12100, size: 0x00100, desc: "a write (or DMA wop ADD) adds to the semaphore"}
+    SEM_ADD: {offset: 0x12100, size: 0x00100, desc: "a write adds its 32-bit word as an unsigned integer, mod 2^32 (wop must be WRITE)"}
     CSR:     {offset: 0x13000, size: 0x01000, desc: "csr enum x 8 B"}
+    START:   {offset: 0x14000, size: 0x00008, desc: "write a PC (instruction index) to start the core there; CP / host only"}
+    STOP:    {offset: 0x14008, size: 0x00008, desc: "write any value to stop the core after its queues drain; CP / host only"}
+  diectl:                   # DIECTL block index -> what it holds and the leaf whose endpoint serves it (memmap.md section 2)
+    CP:      {block: 0, leaf: W2, desc: "command processor; MAILBOX at offset 0x0000: 64 x 8 B, slot c written by core c (IRQ / HALT / fault code)"}
+    HOST:    {block: 1, leaf: W3, desc: "host interface"}
+    HBM0:    {block: 2, leaf: N1, desc: "HBM controller of stack 0 (hbm.md H-7 CSRs), through its port-0 leaf"}
+    HBM1:    {block: 3, leaf: N5, desc: "HBM controller of stack 1"}
+    HBM2:    {block: 4, leaf: S1, desc: "HBM controller of stack 2"}
+    HBM3:    {block: 5, leaf: S5, desc: "HBM controller of stack 3"}
+    D2D0:    {block: 6, leaf: E1, desc: "D2D bridge of sub-link 0 (row 1); blocks 7-9: rows 2-4 (E2-E4)"}
+    D2D1:    {block: 7, leaf: E2}
+    D2D2:    {block: 8, leaf: E3}
+    D2D3:    {block: 9, leaf: E4}
+    C2C0:    {block: 10, leaf: W1, desc: "C2C bridge of leaf W1 (2 ports, routing table CSR); blocks 11-13: W2-W4"}
+    C2C1:    {block: 11, leaf: W2}
+    C2C2:    {block: 12, leaf: W3}
+    C2C3:    {block: 13, leaf: W4}
+    NOC:     {block: 14, leaf: W2, desc: "NoC configuration and counters, served by the CP leaf"}
   hbm:
     stack_bytes: 0x900000000   # 36 GiB, 12-Hi of 24 Gb dies
     sid_bytes:   0x300000000   # 12 GiB per stack ID (3 SIDs)
@@ -685,4 +704,4 @@ memmap:
       ba:     [18, 17]         # hashed: ba ^= row[8:7]
       row:    [33, 19]         # 0 .. 24575
     rows: 24576
-  spm_bank: "bank = addr[10:6] ^ addr[15:11]"
+  spm_bank: "bank = addr[10:6] ^ addr[15:11]; pad power-of-two row pitches >= 2 KiB (memmap.md section 4)"

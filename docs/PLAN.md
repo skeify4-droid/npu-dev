@@ -228,10 +228,12 @@ checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; a
 |---|---|---|
 | `common` | FIFOs (incl. async FIFO for the HBM `clk_mc` domain), credit interfaces, arbiters (RR, priority), SRAM wrapper (behavioral ↔ fakeram macro switch) | formal |
 | `arith` | FP8/BF16 multipliers, 4-way dot-product PE, FP32 adder/accumulator, converters, MXFP4 decoder | **exhaustive** FP8×FP8 (65,536 pairs per format) vs `ml_dtypes`; BF16 random + corners |
-| `core/mxu` | output-stationary or weight-stationary array (Phase 2 decides), skew/de-skew, accumulator SRAM | cocotb GEMM vs NumPy |
+| `core/mxu` | weight-stationary array (decided in Phase 2, microarch.md §2.2), skew/de-skew, column-scale and rowscale multipliers | cocotb GEMM vs NumPy (`numerics.mxu_mm`) |
+| `core/acc` | accumulator SRAM (2048 x 64 FP32), MXU read-modify-write port, VPU port, conflict stall | directed + random vs NumPy |
 | `core/vpu`, `sfu` | lanes, reductions, exp/recip/rsqrt (LUT + polynomial), top-k unit | ULP-error bounds vs NumPy |
-| `core/dma` | strided, gather, page-indirect, MXFP4 decompress, outstanding-request tracking | cocotb + formal on address generator |
-| `core/seq` | ISA fetch/decode, queues, scoreboard, semaphores | directed + random programs |
+| `core/dma` | strided, gather/scatter, paged (row pages with in-page scales), MXFP4 / NVFP4 / MXFP8 conversion to E4M3 + column scales or BF16 (256 elements/cycle), outstanding-request tracking, ack counting | cocotb + formal on address generator |
+| `core/seq` | ISA fetch/decode, queues with captured operands, semaphores (serial-number compare); no scoreboard (isa.md §10) | directed + random programs |
+| `core/ni` | network interface: initiator for the DMA, SPM / GSRAM / CORECTL target, write-add ALU, ack coalescing (noc.md §2) | cocotb vs `noc.ack_coalescer` |
 | `core/spm` | banked scratchpad, bank-conflict arbitration | formal (no lost/duplicated requests) |
 - Exit: every block has lint-clean code under Verilator `-Wall`, green unit tests and green formal. `TINY` core runs a GEMM program from the assembler.
 

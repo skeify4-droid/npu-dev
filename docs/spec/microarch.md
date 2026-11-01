@@ -106,19 +106,28 @@ isa.md §5) a cheap multiply at the ACC input.
 
 ### 2.3 Scratchpad (SPM)
 - 4 MiB, 32 banks x 128 KiB, 64 B per bank access, one read and one write port per bank (1R1W): 2 KiB/cycle read plus 2 KiB/cycle write.
-- Bank = `addr[10:6] ^ addr[15:11]`, so power-of-two row strides of 2 KiB-64 KiB still spread over the banks.
+- Bank = `addr[10:6] ^ addr[15:11]`. Contiguous 2 KiB always covers all 32 banks. Power-of-two row pitches do **not** all spread
+  (corrected, review finding I-13): over 64 rows the row starts reach 32, 16, 8, 4, 2 and 1 banks at 2, 4, 8, 16, 32 and 64 KiB.
+  A stationary load of two 256 B rows per cycle therefore collides at 2, 4 and 64 KiB pitches. The compiler pads such SPM pitches
+  by 512 B (1 KiB at a 16 KiB pitch), which makes every power-of-two pitch from 2 to 128 KiB conflict-free (`test_isa.py`).
+  - Not changed: folding `addr[20:16]` into the hash (the review's option) still collides at 2 and 4 KiB, and a hash that spreads
+    every row bit over the upper bank bits fixes powers of two but loses on common non-power-of-two pitches (6 and 7 KiB).
 - Peak read clients:
 
 | Client | Read (B/cycle) |
 |---|---|
 | MXU A stream | 256 |
 | MXU stationary load | 512 |
+| MXU scales (`scale_rd`: rowscale, colscale) | 64 |
 | VPU (two BF16 sources at 256 elements per cycle) | 1,024 |
 | DMA out | 256 |
-| **Sum** | **2,048** |
+| NI target (remote reads, and the read half of write-add) | 128 |
+| **Sum** | **2,240** |
 
-  The sum equals the port capacity, so all clients at peak at once would fill it. Writes peak at 1,152 B/cycle: VPU 512, DMA in 512
-  (review finding I-3) and the NI target 128.
+  The sum is 9% above the 2,048 B/cycle port capacity (corrected, review finding I-13: the NI target and MXU scale reads were left
+  out). All clients never peak together: the stationary load runs 32 cycles per tile, and the VPU's two-source peak is an
+  epilogue. Arbitration is per bank, so an overload costs stall cycles, not correctness. Writes peak at 1,152 B/cycle: VPU 512,
+  DMA in 512 (review finding I-3) and the NI target 128.
   Arbitration is round-robin per bank with an age bound. The compiler places tiles to avoid systematic conflicts.
 - If the ASAP7 fakeram flow cannot make 1R1W macros, the fallback is 64 single-port banks of 64 KiB (Phase 6 check).
 
@@ -131,7 +140,8 @@ isa.md §5) a cheap multiply at the ACC input.
   short compositions.
 - Top-k unit:
   - It accepts 256 scores per cycle against a running per-row threshold (the current k-th value).
-  - Survivors enter a 64-wide bitonic merge into the per-row state (k ≤ 4096).
+  - Survivors enter a 64-wide bitonic merge into the per-row state (k ≤ 2048, the largest any target model uses; larger values of
+    the 12-bit `k` field fault `ILLEGAL_FIELD`; review finding I-15).
   - Ties go to the lower index, so results are bit-exact against the golden model.
 
 ### 2.5 DMA

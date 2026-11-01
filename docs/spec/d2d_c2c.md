@@ -110,6 +110,7 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     - discards its replay buffer and anything still in its receive buffer.
     The mesh therefore drains, and every core with a transfer through the link faults with `LINK` from the `ERR`.
   - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
+    It faults with `TIMEOUT`, not `LINK`, because a timeout alone does not show that a link failed (review finding I-15).
   - Recovery is a runtime action: retrain, then restart the step.
 - **Error injection:** the behavioral PHY flips bits at a configurable rate, or on chosen flits. The Phase 4 tests require that every
   injected error is replayed and that the delivered data is unchanged.

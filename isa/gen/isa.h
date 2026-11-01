@@ -416,6 +416,7 @@ enum class FaultCause : uint16_t {
   PTE_INVALID = 11,
   LINK = 12,
   ERR_RSP = 13,
+  TIMEOUT = 14,
 };
 enum class ListOp : uint16_t {
   COPY = 0,
@@ -456,6 +457,23 @@ constexpr uint64_t kCorectlDtab = 0x10000ull;
 constexpr uint64_t kCorectlSem = 0x12000ull;
 constexpr uint64_t kCorectlSem_add = 0x12100ull;
 constexpr uint64_t kCorectlCsr = 0x13000ull;
+constexpr uint64_t kCorectlStart = 0x14000ull;
+constexpr uint64_t kCorectlStop = 0x14008ull;
+constexpr int kDiectlCp = 0;
+constexpr int kDiectlHost = 1;
+constexpr int kDiectlHbm0 = 2;
+constexpr int kDiectlHbm1 = 3;
+constexpr int kDiectlHbm2 = 4;
+constexpr int kDiectlHbm3 = 5;
+constexpr int kDiectlD2d0 = 6;
+constexpr int kDiectlD2d1 = 7;
+constexpr int kDiectlD2d2 = 8;
+constexpr int kDiectlD2d3 = 9;
+constexpr int kDiectlC2c0 = 10;
+constexpr int kDiectlC2c1 = 11;
+constexpr int kDiectlC2c2 = 12;
+constexpr int kDiectlC2c3 = 13;
+constexpr int kDiectlNoc = 14;
 constexpr uint64_t kHbmStackBytes = 0x900000000ull;
 constexpr uint64_t kHbmSidBytes = 0x300000000ull;
 constexpr Field kHbm_byte{4, 0};

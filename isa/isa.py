@@ -196,6 +196,15 @@ def validate(isa):
         for n, r in mm["regions"].items():
             if "stride" in r and r["size"] > r["stride"]:
                 raise IsaError(f"memmap: {n} size exceeds its stride")
+        cc = sorted((r["offset"], r["offset"] + r["size"], n) for n, r in mm["corectl"].items())
+        for (b0, e0, n0), (b1, e1, n1) in zip(cc, cc[1:]):
+            if b1 < e0:
+                raise IsaError(f"memmap corectl: {n0} overlaps {n1}")
+        if cc and cc[-1][1] > mm["regions"]["CORECTL"]["size"]:
+            raise IsaError("memmap corectl: beyond the CORECTL block")
+        blocks = [r["block"] for r in mm.get("diectl", {}).values()]
+        if len(set(blocks)) != len(blocks) or any(not 0 <= x < mm["regions"]["DIECTL"]["count"] for x in blocks):
+            raise IsaError("memmap diectl: block indices must be unique and inside DIECTL")
     return True
 
 
@@ -291,6 +300,11 @@ def unpack(isa, name, word):
             continue
         out[k] = (word >> f["bits"][1]) & _mask(f["bits"])
     return out
+
+
+def spm_bank(addr):
+    """SPM bank of a byte offset (memmap.md section 4): addr[10:6] ^ addr[15:11]."""
+    return ((addr >> 6) & 31) ^ ((addr >> 11) & 31)
 
 
 def sem_ready(value, target, bits=32):
@@ -411,6 +425,8 @@ def emit_sv(isa):
                 L.append(f"  localparam logic [41:0] MM_{n}_STRIDE = 42'h{r['stride']:X};")
         for n, r in mm["corectl"].items():
             L.append(f"  localparam logic [19:0] CORECTL_{n} = 20'h{r['offset']:X};")
+        for n, r in mm.get("diectl", {}).items():
+            L.append(f"  localparam int DIECTL_{n} = {r['block']};")
         h = mm["hbm"]
         L.append(f"  localparam logic [41:0] HBM_STACK_BYTES = 42'h{h['stack_bytes']:X};")
         L.append(f"  localparam logic [41:0] HBM_SID_BYTES = 42'h{h['sid_bytes']:X};")
@@ -468,6 +484,8 @@ def emit_h(isa):
                 L.append(f"constexpr uint64_t kMm{n.capitalize()}Stride = 0x{r['stride']:X}ull;")
         for n, r in mm["corectl"].items():
             L.append(f"constexpr uint64_t kCorectl{n.capitalize()} = 0x{r['offset']:X}ull;")
+        for n, r in mm.get("diectl", {}).items():
+            L.append(f"constexpr int kDiectl{n.capitalize()} = {r['block']};")
         h = mm["hbm"]
         L.append(f"constexpr uint64_t kHbmStackBytes = 0x{h['stack_bytes']:X}ull;")
         L.append(f"constexpr uint64_t kHbmSidBytes = 0x{h['sid_bytes']:X}ull;")

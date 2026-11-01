@@ -286,6 +286,7 @@ group; the group column of the table maps to them.
 | 2 | (group 2) | I-4, I-5, I-11, I-12(a) |
 | 3 | (group 3) | I-9, I-10, X-1, X-2 |
 | 4 | (group 4) | I-6, I-7, I-8, I-14, X-4, X-5, X-6 |
+| 5 | (group 5) | I-13, I-15 |
 
 | # | Status | Group | What was done |
 |---|---|---|---|
@@ -309,3 +310,5 @@ group; the group column of the table maps to them.
 | X-4 | fixed (tests: Phase 4) | 4 | Took cumulative counters: `credit_req` / `credit_rsp` are 12-bit per-VN totals of freed slots on every flit, stale values ignored by serial order; the sender applies returned credits to the VN's reserve first, so no pool bit is needed. Flit stays 1,248 bits (10 reserved bits left). `links.py` updated, `make links` unchanged in L1-L6. Phase 4 tests listed in PLAN. |
 | X-5 | fixed (test: Phase 4) | 4 | Took the suggestion: after link down the bridge keeps sinking, answers requests with `ERR` (`LINK`), drops responses and discards its buffers; the DMA timeout stays as the backstop (d2d_c2c.md L-4, noc.md §7). The `PKG_TINY` link-down test is listed in PLAN Phase 4. |
 | X-6 | fixed (detector: Phase 7) | 4 | Took the schedule rule (local puts before any remote wait) and added two the suggestion implied: remote waits in a queue nothing else depends on, grouped into one `DMA_LIST` with per-entry waits (group 2), and no credit wait ahead of the same core's forwards. The "every engine blocked on a semaphore" detector is listed in PLAN Phase 7 and for the golden model. |
+| I-13 | fixed; optional hash change rejected | 5 | (a) Text corrected with the measured spread, and a compiler rule: pad power-of-two SPM pitches by 512 B (1 KiB at 16 KiB), conflict-free for two-row loads at every pitch 2-128 KiB; `isa.spm_bank` and a test check these claims. Rejected the optional `addr[20:16]` fold: it still collides at 2 and 4 KiB; a full bit-spreading hash fixes powers of two but regresses 6 and 7 KiB pitches. (b) NI target (128) and MXU scales (64) added; the read budget is 2,240 B/cycle, 9% over the port, stated as such. |
+| I-15 | fixed | 5 | (a) PLAN Phase 3: `core/mxu` weight-stationary, `core/seq` without scoreboard, `core/dma` full conversion set, new `core/acc` and `core/ni` rows. (b) isa.md §7 combine uses `ADD_BF16` for BF16 rows. (c) Top-k k ≤ 2048, `ILLEGAL_FIELD` above. (d) Block → BF16 keeps subnormals, matching N-5 and the golden model (`bf16(ftz=False)`). (e) `memmap.diectl` table (block, leaf) with 4 D2D and 4 C2C bridges, the CP `MAILBOX`, `START` / `STOP` in CORECTL; validator checks overlaps. (f) `SEM_ADD` adds an unsigned 32-bit integer, float wops fault. (g) Resolved with I-6(b). (h) New `fault_cause` `TIMEOUT`; `LINK` only from a bridge's `ERR`. |
