@@ -492,3 +492,50 @@ fixes)" section of `docs/reports/spec_review.md` has one row per finding.
 - Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7), the golden-model checks (X-6
   detector, V-2 / W-3 / Z-5 / Z-6 semaphore order, W-4 (a) write order), the Phase 7 converting-rate check (Z-2), vendor PHY
   latencies, and the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fixes for the fourth verification (2026-11-01)
+
+### Changes
+The fourth verification (9aea46f) found Y-1 to Y-10 (spec_review.md, Verification 4). This session fixed all ten on branch
+`spec-verification4-fixes`, one commit per group, with `make pytest` green before each. The "Resolutions (verification 4
+fixes)" section of `docs/reports/spec_review.md` has one row per finding. The user chose between options for Y-2, Y-3, Y-7 and Y-10.
+- **Group 1 (180d3bf), `core/dma` issue side:**
+  - Y-1: an entry without raw slots covers at most one data request; quarter-size scale-only entries cost 19% at 845 cycles.
+  - Y-2: converting reads are counted by format (NVFP4 x1, MXFP4 x1/2, MXFP8 x1/4) against min(`DMA_PACE`, 4.5 x the ring).
+    MXFP4 and MXFP8 weights keep the full rate to 1,200 cycles.
+  - Y-3: one tag per request plus 512 granule credits. DQs take credits in turns of 8 and ring space in turns of 256 B, so
+    neither one-granule nor multi-granule requests starve. The verifier's per-request turn-holding was rejected, because it
+    starves a KV gather. Ring-space starvation was found and fixed as part of this.
+  - Y-6: a converting read may issue when none is in flight; the counter has 18 bits.
+- **Group 2 (cfffee9), `core/ni`, NoC, Phase 7:**
+  - Y-5: partial-granule responses: payload granule-aligned, valid bytes from the tag table (`isa.rd_rsp_layout`).
+  - Y-10: an epoch bit in request and `ERR` headers and CSR `NI_EPOCH`: a stale `LINK` `ERR` is dropped.
+  - Y-4: the §2.5 rates are marked as single-FIFO results; per-PC effects and two options go to Phase 7.
+- **Group 3 (efe47a5), compiler and runtime:**
+  - Y-7: the Engram table keeps its published separate scale array, so no repack is needed and the gather is not split.
+  - Y-8: a credit semaphore's base-table entry is the credits expected so far, which is also its drain target.
+  - Y-9: the single-adder flag exception names `SIGNAL`s from one DQ.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 unchanged; `make numerics`, `make hbm`, `make links` not rerun
+  (no input changed).
+- The pace rule (16 KiB ring), elements/cycle at 500 / 845 / 1,000 / 1,200-cycle round trips:
+  - NVFP4 → BF16 weights 155 / 151 / 127 / 106;
+  - MXFP4 164 and MXFP8 84 at every round trip (164 / 160 / 136 / 114 and 84 / 82 / 69 / 57 under a flat 72 KiB);
+  - the paged NVFP4 KV gather 155 / 154 / 130 / 108.
+- Two DQs at an 845-cycle round trip, data B/cycle: KV gather + plain 28 / 56, NVFP4 weights + KV gather 37 / 37. Without
+  the fix the starved side got 5 or 0.
+- 8 cores on per-PC queues (scratch model, not committed): KV gather 146 / 140 at 500 / 845, against the verifier's 144 / 132.
+  Phase 7 decides.
+
+### Tests
+- `make pytest`: 224 passed (218 before). `test_isa.py` 43 → 49.
+- `make isa` (Verilator lint of `isa_pkg`) clean; the generated files changed for `epoch` and `NI_EPOCH`. No RTL changed.
+
+### Next
+- A verification pass on these fixes (check-first list at the end of spec_review.md, starting with the liveness and fairness
+  of the credit and ring turns). Then the `core/dma` read-issue arbiter. `core/ni` and the rest of `core/dma` can start Phase 3
+  RTL now, and so can `hbm`, `common`, `arith` and `core/seq`.
+- Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7, Y-10), the golden-model checks (X-6
+  detector, semaphore order including Y-8 and Y-9, W-4 (a) write order), the Phase 7 converting-rate check (Z-2, Y-2, Y-4),
+  vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.

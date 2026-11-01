@@ -239,6 +239,13 @@ session checks the fixes next.
     ranges and a queued HBM share. Converting reads are paced by CSR `DMA_PACE` (72 KiB, the user's choice). Inline-scaled
     Engram rows are defined. Semaphores move after a drain wait, and the link-down restart waits for every core, the bridges
     and a drain time. No frozen number changed. `core/dma` waits for one more verification pass.
+  - **Verified a fourth time, then fixed (2026-11-01).** The fourth verification (9aea46f) found Y-1 to Y-10. A fifth fix
+    session resolved all ten on branch `spec-verification4-fixes` (180d3bf, cfffee9, efe47a5; spec_review.md "Resolutions
+    (verification 4 fixes)"). Ring entries without raw slots cover one data request. The pace is counted by format and capped at
+    4.5 x the ring (the user's choice). A read takes one tag and one credit per granule, and DQs share credits and ring space
+    in turns (the user's choice). Partial-granule responses are defined, and an epoch bit drops stale link `ERR`s (the user's
+    choice). The Engram table keeps its separate scale array (the user's choice). No frozen number changed. `core/ni` and
+    `core/dma` may start Phase 3 RTL, except the `core/dma` read-issue arbiter, which waits for a verification pass.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)
