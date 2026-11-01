@@ -151,19 +151,81 @@ isa.md §5) a cheap multiply at the ACC input.
 - Four queues share one engine, which serves them independently *(review finding V-3)*:
   - Each DQ has its own sequencer: the instruction or `DMA_LIST` entry at its head, the semaphore wait of that head, and the
     address-generator state of its started transfers.
-  - Shared resources are the tag table, the staging ring (below), the SPM ports and NI injection. They are taken per read or
-    write packet, round-robin over the DQs that have a packet ready, and only after the head's wait is satisfied.
+  - Shared resources are the tags and granule credits, the pace count, the staging ring (below), the SPM ports and NI
+    injection. They are taken per read or write packet, round-robin over the DQs that have a packet ready, and only after the
+    head's wait is satisfied.
+  - **Credit-fair turns *(review finding Y-3; rule chosen by the user, 2026-11-01)*.** A read is ready when its own
+    conditions hold: a data read's scales are in the ring, a scale read's ring space can be taken (next bullet). Tags,
+    granule credits and the pace (below) are not part of readiness. The round-robin winner keeps its turn until it has taken
+    8 granule credits (one full request's worth), and while its next request waits for credits or pace it holds the turn:
+    no other DQ's read overtakes it. A request is never shrunk to fit. The turn passes early when the DQ has nothing ready.
+    Tags, credits and pace are freed by responses, which sink unconditionally, so a held turn always ends.
+  - **Ring turns *(review finding Y-3)*.** The turn is never held for ring space, because ring space is freed by data reads
+    that such a hold could block. Instead, ring allocation takes turns: a DQ that cannot start its next entry (it does not
+    fit, or another DQ is waiting) joins a queue, and only the DQ at its head allocates, keeping that turn for 256 B of
+    ring (one data request's NVFP4 scales). Meanwhile every DQ still issues the data reads of its allocated entries, and
+    those need only tags (below), so the ring drains and the head's entry fits.
+  - Why both: per request or per entry, round-robin hands out shared space in proportion to the request or entry size.
+    Data bytes per cycle at L = 845 with `DMA_PACE` (`isa.staging_ring`, `hbm="server"`, while the streams overlap):
+
+    | arbitration | KV gather + plain | two KV gathers + plain | NVFP4 weights + KV gather |
+    |---|---|---|---|
+    | ready includes free credits (`arb="greedy"`) | 72 / **6** | 37 / 37 / **3** | 37 / 37 (with ring turns) |
+    | turn held for one request (`"hold"`, the fourth verifier's proposal) | **5** / 81 | **5** / **5** / 76 | 38 / 38 |
+    | shrink to the free credits (`"shrink"`, the model before Y-3) | 28 / 56 | 20 / 20 / 41 | 38 / 38 |
+    | **credit-fair turns + ring turns (the rule, `"fair"`)** | 28 / 56 | 18 / 18 / 39 | 37 / 37 |
+    | the rule without ring turns (`ring_turn=False`) | 28 / 56 | 20 / 20 / 41 | **0** / 77 |
+
+    - "greedy": a DQ of one-granule requests (a KV gather: a 32 B scale read and a 256 B row) takes each credit as it is
+      freed, and a 2 KiB read in another DQ, which needs 8 at once, waits (the fourth verifier's model: 1-4 B/cycle).
+    - "hold": round-robin per request gives a 2 KiB read 8 times the bytes of a one-granule read, so it starves the gather.
+    - Without ring turns, the KV gather's 32 B entries take freed ring space before a 256 B weight entry fits.
+    - Under the rule, credits are shared evenly. The KV gather gets less in bytes (28 B/cycle of data plus 3 of scales),
+      because half its credits carry 32 B scale reads.
+    - Shrinking gives similar shares, but it splits reads into more, smaller requests, so it was not taken. Cost of the rule:
+      a credit count per turn and a 4-entry allocation queue.
   - So a DQ whose head waits on a semaphore holds nothing another DQ needs. A started transfer holds its tags until its
     responses sink, and its ring space until its data has been converted (review finding W-6). Neither waits on another DQ:
     every ring entry, once allocated, needs only tags to complete (below). d2d_c2c.md L-7 issue rule 2 relies on this.
-- It keeps up to 512 read granules (256 B) in flight, 128 KiB. That is about 2x the core's HBM share (102 B/cycle) times a typical
+- **Tags and granule credits *(review finding Y-3; option chosen by the user, 2026-11-01)*.** A read request takes one **tag**
+  and one **granule credit** per 256 B granule it touches, which is one per `RD_RSP` it receives (noc.md §2). There are 512
+  of each, so the DMA keeps up to 512 granules (128 KiB) in flight, about 2x the core's HBM share (102 B/cycle) times a typical
   500-cycle loaded round trip.
-  - **Converting reads are paced *(review finding Z-2; option chosen by the user, 2026-11-01)*.** At most `DMA_PACE` bytes
-    (CSR, reset 72 KiB) of converting reads are in flight: the scale and data reads of block-format transfers, counted at
-    issue and returned by their responses (a 17-bit counter and a compare; 0 turns the limit off). Plain reads are limited
-    by tags only. Reads beyond the share times the round trip add nothing to the delivered rate; they only wait in the HBM
-    queue, where a converting stream's scale reads would wait behind its own data and every ring entry and tag would be
-    held longer (staging ring, below).
+  - A tag is an entry of the tag table, named by the 9-bit `tag` of the `RD_REQ` and of each of its `RD_RSP`s, whose `gidx`
+    names the granule. Any free entry serves, so allocation does not fragment. Every request takes at least one credit, so
+    the table never runs out before the credits.
+  - A credit is freed when its `RD_RSP` sinks, and the tag when the request's last one has. An `ERR` other than `LINK`, or the
+    request's timeout, frees the tag and its remaining credits (isa.md §8).
+  - A scale read is a read request like any other: a KV row's 32 B scale read takes one tag and one credit, a 2 KiB scale
+    read one tag and 8 credits.
+  - Rejected: consecutive granule tags (a request takes k consecutive tags). Allocation would need k contiguous free tags and
+    would fragment like the ring.
+  - **Converting reads are paced *(review findings Z-2, Y-2, Y-6; options chosen by the user, 2026-11-01)*.** At most
+    min(`DMA_PACE`, 4.5 x the `DMA_STAGE` size) **weighted bytes** of converting reads are in flight (CSR `DMA_PACE`, reset
+    72 KiB; 4.5 x the 16 KiB default ring is also 72 KiB). Converting reads are the scale and data reads of block-format
+    transfers, counted at issue and returned by their responses.
+    - NVFP4 reads count their bytes, MXFP4 reads half and MXFP8 reads a quarter: a shift by the transfer's format, so the
+      count follows the scale bytes in flight (32, 16 and 8 B per 256 B granule).
+    - Hardware: an 18-bit counter (512 granules of NVFP4 reads weigh 2^17 B), a shift-add for the cap, a min and a compare.
+    - A converting read may always issue when no converting read is in flight, so any nonzero limit makes progress, also
+      one below a single request (review finding Y-6; the literal "at most `DMA_PACE` bytes" hangs at 1 KiB on the first 2
+      KiB read). 0 turns the limit off, the cap included.
+    - Plain reads are limited by tags only. Reads beyond the share times the round trip add nothing to the delivered rate;
+      they only wait in the HBM queue, where a converting stream's scale reads would wait behind its own data and every ring
+      entry and tag would be held longer (staging ring, below).
+    - Why by format: under a flat 72 KiB the MX streams, which the ring covers far beyond 845 cycles, are bound by the
+      limit alone (rate ≤ limit / L). MXFP4 weights then run at 136 elements/cycle and MXFP8 at 69 at L = 1,000, against
+      164 / 84 with tags only. Counted by format, both keep the full rate to 1,200 cycles and NVFP4 is unchanged. NVFP4 and
+      MXFP4 in two DQs at L = 1,000 deliver 80 B/cycle together instead of 66.
+    - Why the cap: the ring covers a stream's scales for ring / (2 x scale bytes per cycle) cycles. The share times that is
+      4.5 x the ring for NVFP4 (32 B of scales per 288 B), whatever the share. So a runtime that shrinks the ring needs no
+      new `DMA_PACE`. At 8 KiB the cap (36 KiB) gives the KV gather 130 elements/cycle at L = 500, against 104 with 72 KiB.
+    - Why the CSR stays (rejected: the limit derived from `DMA_STAGE` alone, the fourth verifier's proposal): the KV gather
+      is bound by its tags (two per row), not by the ring, and its best limit is about 72 KiB at any ring size. A 24 or 32
+      KiB ring with a derived 108 or 144 KiB limit drops it from 154 to 123 / 110 at 845 cycles.
+    - Cost of the weighting: a per-row MXFP8 gather with a separate scale array (an 8 B scale read and a 256 B row; the
+      Engram table, hyper_connections.md §4) is tag-bound like the KV gather and gained from the flat limit: 0.22 rows/cycle
+      at 845 cycles, against 0.30. It is hidden (G-1), and still 3x the 0.07 of inline-scaled rows at that round trip.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
   and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
@@ -193,7 +255,8 @@ isa.md §5) a cheap multiply at the ACC input.
     Size 0 makes block-format conversion fault (`ILLEGAL_FIELD`).
   - **Ring allocation *(review findings W-1, Z-1)*.** The ring is allocated in **entries**. An entry is a run of whole
     conversion units: the scale reads of their out-of-line scales, the raw slots of its split units, and the data reads of
-    those units. It usually has one scale read; it has two when the run's scales cross a 2 KiB block of the scale array
+    those units. **An entry without raw slots covers the units of at most one data request** (at most 2 KiB inside one 2 KiB
+    block; review finding Y-1, below). It has one scale read, or two when its scales cross a 2 KiB block of the scale array
     (a fold tile's 8 or 16 B of scales at an offset that is not a multiple of their size, as with K not a multiple of 256).
     - **Every data read and every conversion unit belongs to exactly one entry *(review finding Z-1)*.** An entry boundary is
       a unit boundary. Where it falls inside a granule, the DMA cuts the read there: that granule is two partial reads (a
@@ -201,12 +264,15 @@ isa.md §5) a cheap multiply at the ACC input.
       - Why: if the granule were one read, issued once both entries' scales are in the ring, the older entry could complete
         only after the younger one is allocated. With several DQs the ring's oldest entry can be the only one of its DQ,
         with the ring full behind it, and in-order reclaim lets nothing past it. Four DQs that stream DeepSeek index-key
-        rows (64 B) from row 2 of a page, with 1 KiB or 2 KiB scale reads, deadlock that way at cycle 1,716 (4 KiB ring) and
+        rows (64 B) from row 2 of a page, with 1 KiB or 2 KiB scale reads (entries above the Y-1 size, which the rule must
+        survive anyway), deadlock that way at cycle 1,716 (4 KiB ring) and
         5,977 (16 KiB); contiguous fold tiles from byte 64 at 1,037 and 1,292 (`isa.staging_ring`, `boundary="shared"`;
         the third verifier's own model had 1,715 / 5,976 and 1,051 / 1,298). One DQ cannot deadlock this way, because its
         next entry is the ring's next allocation.
       - Cost: one more request per entry boundary inside a granule, and at most one 32 B HBM burst read twice. The DMA ends
-        an entry on a granule boundary when a unit boundary falls on one, so aligned streams have no cut.
+        an entry on a granule boundary when a unit boundary falls on one, so aligned streams have no cut. With Y-1 a
+        contiguous non-split stream ends its entries on 2 KiB blocks, so cuts come from entries with raw slots (fold tiles
+        from byte 64, contiguous inline rows) and from rows that share a granule.
     - **An entry's scales and the raw slots of all its split units are one allocation, taken when its first scale read is
       issued** (when its first data read is issued if it has no scale read, as for inline-scaled rows). Its data reads then
       need only tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the
@@ -216,19 +282,34 @@ isa.md §5) a cheap multiply at the ACC input.
       entry. Its raw slot holds the rows, 272 B per row in 16 B units.
     - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
       beginning) and is freed when all its data has been converted. Space comes back in allocation order.
-    - **Ring and entry size *(review finding Z-3)*.** `DMA_STAGE` must hold at least 2 KiB, or a block-format conversion
-      faults `ILLEGAL_FIELD` (size 0 included). The DMA forms entries of at most a quarter of the ring, shortening the run
-      of units. The quarter is a rate target: four entries in flight let scales run a round trip ahead of their data.
-      Liveness needs only entry ≤ ring. No single unit's entry is larger than 272 B (an Engram row; a split MXFP8 fold
-      tile is 256 + 8 B, a split 4-bit tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, so the DMA can
-      always meet the target. A ring below the 16 KiB default lowers the rate (below), never liveness.
+    - **Ring and entry size *(review findings Z-3, Y-1)*.** `DMA_STAGE` must hold at least 2 KiB, or a block-format
+      conversion faults `ILLEGAL_FIELD` (size 0 included). Liveness needs only entry ≤ ring; the two size rules are rate
+      rules, and the DMA meets them by shortening the run of units.
+      - **An entry without raw slots covers at most one data request** (256 B of NVFP4 scales for 2 KiB of data, 128 B of
+        MXFP4, 64 B of MXFP8). A non-split entry's scales stay in the ring from its scale read until its last element is
+        converted: two round trips plus the time T_entry its own data takes to stream. So the ring must hold scale rate x
+        (2 L + T_entry), which is scale rate x 2 L plus about one entry's scales, and large entries take ring space from the
+        round trip. NVFP4 weights at L = 845 (`isa.staging_ring`, paced / with `DMA_PACE`): one data request per entry
+        153 / 151 elements/cycle; 16 granules 151 / 149; 64 granules (one 2 KiB scale read) 141 / 137; a quarter of the
+        ring (4 KiB of scales, 32 KiB of data) 124 / 123, as the formula predicts (124). The cost is one scale request per
+        data request, about one per 27 cycles at the share.
+      - **An entry with raw slots is at most a quarter of the ring.** Split units and inline rows hold their data in the
+        ring, so those streams are ring-bound anyway (below); the quarter keeps one entry from taking the ring.
+      - No single unit's entry is larger than 272 B (an Engram row; a split MXFP8 fold tile is 256 + 8 B, a split 4-bit
+        tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, and a non-split unit lies inside one granule, so
+        inside one request. The DMA can therefore always meet both rules. A ring below the 16 KiB default lowers the rate
+        (below), never liveness.
+      - Replaced (Z-3): "the quarter is a rate target: four entries in flight let scales run a round trip ahead". For
+        entries without raw slots it is wrong at 845 cycles (124 against 153 above).
     - **Order of reads *(review finding Z-8)*.** Within a DQ, the scale read of its next entry goes before its own data reads
       whenever that entry's space can be taken (greedy read-ahead). That is what keeps a converting stream at the HBM rate.
       Across DQs, scale and data reads alike take the shared resources per packet, round-robin (above), so one DQ's scale
-      read does not overtake another DQ's data read; per-DQ order is all the read-ahead needs. A scale read takes
-      ceil(scale bytes / 256) tags, as a data read of that size would.
+      read does not overtake another DQ's data read; per-DQ order is all the read-ahead needs. A scale read takes one tag
+      and one credit per granule it touches, as a data read of that size would (above).
     - Reference: `isa.staging_ring`, a cycle model of the rule. Entries can carry HBM byte ranges; their reads are then the
-      granule pieces of the range, cut at entry boundaries and grouped into requests inside one 2 KiB block. `test_isa.py`
+      granule pieces of the range, cut at entry boundaries and grouped into requests inside one 2 KiB block. Its defaults
+      are the rule: entry sizes checked (`sizing="rate"`), turn-holding (`arb="hold"`), one response and one credit per
+      granule (`rsp="granule"`), and the pace weighted by format with the cap (`pace="format"`, `fmt` per DQ). `test_isa.py`
       runs mixed split and non-split streams, one DQ or four, with greedy read-ahead, and they always complete; the
       shared-granule reading deadlocks with four DQs. Phase 3 adds `core/dma` formal properties: every allocated ring entry
       needs only tags to complete, and no data read waits for the scales of an entry other than its own.
@@ -240,31 +321,41 @@ isa.md §5) a cheap multiply at the ACC input.
       not committed).
   - **What 16 KiB is sized for: scales.** A non-split unit's scales live from their read to the data's conversion, about two
     round trips. 16 KiB holds 1,024 cycles of NVFP4 scales at the converter's rate (16 B/cycle). At the HBM share (87 B/cycle,
-    155 elements/cycle of NVFP4 → BF16) it keeps the full rate up to a round trip of about 845 cycles (`isa.staging_ring`:
-    154.7 at 500, 152.9 at 845, 127 at 1,000), and 8 KiB does not (76 at 845). A smaller ring only lowers the rate.
+    155 elements/cycle of NVFP4 → BF16) it keeps the full rate up to a round trip of about 845 cycles, with entries of one
+    data request (`isa.staging_ring`: 154.7 at 500, 153.3 at 845, 129 at 1,000), and 8 KiB does not (about 75 at 845). A
+    smaller ring only lowers the rate. MXFP4 and MXFP8 carry 16 and 8 B of scales per granule, so 16 KiB covers them to
+    about 1,600 and 3,100 cycles.
     - **These rates need the pacing *(review finding Z-2)*.** They come from the paced model (`hbm="paced"`: every
       response exactly one round trip after its issue). With the share modelled as a queue (`hbm="server"`: requests reach
-      a FIFO served at 87 B/cycle, so the core's own backlog adds to the round trip) and greedy issue up to 512 tags, the
-      weight stream runs at 142 / 119 / 111 elements/cycle at 500 / 845 / 1,000 cycles, and the paged NVFP4 KV gather (one
-      entry per row: a 32 B scale read, then the 256 B row) at 136 / 111 / 104. The third verifier's model, with
-      per-granule requests, had 130 / 110 / 103 and 135 / 111; `max_req=1` gives 128 / 109 / 102. The backlog lengthens
-      both round trips of every entry, so the weight stream becomes ring-bound. It also lengthens every tag's hold time,
-      and the KV gather spends one tag per 32 B scale read, so it becomes tag-bound, and a larger ring does not help it.
-    - **With `DMA_PACE` at 72 KiB** (about the share times the 845 cycles the ring covers) the queue model gives the paced
-      rates back:
+      a FIFO served at 87 B/cycle, one response per granule, so the core's own backlog adds to the round trip) and greedy
+      issue up to 512 credits, the weight stream runs at 130 / 110 / 103 elements/cycle at 500 / 845 / 1,000 cycles, and the
+      paged NVFP4 KV gather (one entry per row: a 32 B scale read, then the 256 B row) at 136 / 111 / 104. That is the third
+      verifier's model (130 / 110 / 103 and 135 / 111); with one response per request (`rsp="request"`, the model before
+      Y-3) the weights had 142 / 119 / 111. The backlog lengthens both round trips of every entry, so the weight stream
+      becomes ring-bound. It also lengthens every tag's hold time, and the KV gather spends one tag per 32 B scale read, so
+      it becomes tag-bound, and a larger ring does not help it.
+    - **With the pace rule** (72 KiB, about the share times the 845 cycles the ring covers for NVFP4, counted by format,
+      capped at 4.5 x the ring; above) the queue model gives the paced rates back. Elements/cycle at L = 500 / 700 / 845 /
+      1,000 / 1,200 (`isa.staging_ring`, `hbm="server"`; weights in entries of one 2 KiB request; "all" means the full rate
+      at every L):
 
-      | elements/cycle at L = 500 / 700 / 845 / 1,000 | weights (NVFP4 → BF16) | paged NVFP4 KV gather |
-      |---|---|---|
-      | paced bound (16 KiB) | 155 / 155 / 153 / 129 | 155 / 155 / 155 / 130 |
-      | queue, tags only (16 KiB) | 142 / 128 / 119 / 111 | 136 / 118 / 111 / 104 |
-      | queue, `DMA_PACE` 72 KiB (the rule) | 155 / 155 / 150 / 127 | 155 / 155 / 154 / 130 |
-      | queue, 24 or 32 KiB ring, tags only | 155 / 155 / 155 / 155 | 136 / 118 / 110 / 103 |
-      | queue, 24 KiB + 72 KiB | 155 / 155 / 152 / 130 | 155 / 155 / 154 / 130 |
-      | queue, 32 KiB + 80 KiB | 155 / 155 / 155 / 145 | 155 / 155 / 146 / 130 |
+      | | NVFP4 → BF16 weights | MXFP4 weights | MXFP8 weights | paged NVFP4 KV gather |
+      |---|---|---|---|---|
+      | need (the share) | 155 | 164 | 84 | 155 |
+      | paced bound (16 KiB) | 155 / 155 / 153 / 129 / 107 | all | all | 155 / 155 / 155 / 130 / 108 |
+      | queue, tags only (16 KiB) | 130 / 118 / 110 / 103 / 96 | all | all | 136 / 118 / 111 / 104 / 96 |
+      | **queue, the rule (16 KiB)** | 155 / 155 / 151 / 127 / 106 | all | all | 155 / 155 / 154 / 130 / 108 |
+      | queue, flat 72 KiB (the Z-2 rule) | 155 / 155 / 151 / 127 / 106 | 164 / 164 / 160 / 136 / 114 | 84 / 84 / 82 / 69 / 57 | 155 / 155 / 154 / 130 / 108 |
+      | queue, 24 KiB, tags only | 155 / 155 / 155 / 155 / 144 | all | all | 136 / 118 / 110 / 104 / 96 |
+      | queue, 24 KiB + the rule | 155 / 155 / 151 / 128 / 106 | all | all | 155 / 155 / 154 / 130 / 108 |
+      | queue, 32 KiB + `DMA_PACE` 80 KiB | 155 / 155 / 155 / 142 / 119 | all | all | 155 / 155 / 146 / 130 / 108 |
+      | queue, 8 KiB + the rule (cap 36 KiB) | 125 / 90 / 75 / 64 / 53 | 164 / 164 / 151 / 127 / 106 | all | 130 / 93 / 77 / 65 / 55 |
+      | queue, 8 KiB + flat 72 KiB | 103 / 89 / 75 / 64 / 53 | 164 / 164 / 151 / 127 / 106 | 84 / 84 / 82 / 69 / 57 | 104 / 89 / 76 / 64 / 54 |
 
-      Above about 845 cycles the ring (weights) and the tags (KV gather) bind in every model. The limit is fairly sharp: 64
-      KiB gives 138 / 137 at 845, 80 KiB 144 / 146. A runtime that sets a larger ring scales it, to about the share x ring /
-      (2 x the stream's scale bytes per cycle).
+      Above about 845 cycles the ring (NVFP4 weights) and the tags (KV gather) bind in every model; the MX weight streams
+      are bound by neither before 1,200 cycles. The limit is fairly sharp: 64 KiB gives 134 / 137 at 845. A larger ring
+      helps the weights only with a larger `DMA_PACE` (24 KiB + 80 KiB: 155 at 845), at the KV gather's cost (146), so the
+      default stays 72 KiB and the cap covers smaller rings.
     - Options costed for Z-2: the limit (taken: a counter, a compare and a CSR; the ring stays 16 KiB); a larger ring alone
       (8-16 KiB more SPM reserved per core, no hardware, but the KV gather stays 29% short at 845 cycles); both (no better
       for the KV gather, and 24 KiB gains the weights only 2-3 elements/cycle). Rejected: limiting all reads, which would

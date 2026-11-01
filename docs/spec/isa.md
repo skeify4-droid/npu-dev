@@ -242,14 +242,18 @@ Rules:
   - Scales of a paged operand live in the same page as its rows (memmap.md §6), so one page-table entry translates both.
 - **Width of the inbound path** (review findings I-3, V-1): the converter produces 256 elements per cycle and the DMA writes SPM at
   512 B/cycle, shared with the block scales it stages before the data, so the exact NVFP4 → BF16 path carries 1.60x a core's HBM
-  share (numerics.md D1). Converting reads are paced: at most CSR `DMA_PACE` bytes (reset 72 KiB) of them are in flight, so
-  a converting stream's scale reads do not queue behind its own data (microarch.md §2.5, review finding Z-2).
+  share (numerics.md D1). Converting reads are paced: at most min(CSR `DMA_PACE`, 4.5 x the `DMA_STAGE` size) of them are
+  in flight (reset 72 KiB), counted in bytes weighted by format (NVFP4 x1, MXFP4 x1/2, MXFP8 x1/4), so a converting stream's
+  scale reads do not queue behind its own data. A converting read may always issue when none is in flight (microarch.md
+  §2.5, review findings Z-2, Y-2, Y-6). A read request takes one tag and one granule credit per granule (512 of each). The four
+  DQs take credits in turns of 8, the winner holding its turn until they are free, and ring space in turns of 256 B (Y-3).
 - **Scales before data** (review findings V-1, W-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the
   data that uses them, and a conversion unit that spans several responses is staged raw there. A unit's raw slot is taken
   with its scales, when the scale read is issued, so a started entry never waits for ring space. Every data read and every
   unit belongs to exactly one ring entry: a granule shared by two entries is two partial reads (review finding Z-1). So a
   read response never waits for another one, and the ring cannot fill with entries that can never complete (noc.md §4 rule
-  2, microarch.md §2.5). `DMA_STAGE` holds at least 2 KiB, else a block-format conversion faults `ILLEGAL_FIELD` (Z-3).
+  2, microarch.md §2.5). `DMA_STAGE` holds at least 2 KiB, else a block-format conversion faults `ILLEGAL_FIELD` (Z-3). An
+  entry without raw slots covers at most one data request, which is what keeps the rate at long round trips (Y-1).
 - **Scale location and write packets** (review findings V-4, V-5, W-5): an element's block scale is found from its row and its
   whole in-row offset (dims 0, 2, 3). Every dim-0 run starts on a block: the base (or the paged pointer's `byte`), `s1`, `s2` and
   `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` rows (Engram) are exempt: each row is its elements

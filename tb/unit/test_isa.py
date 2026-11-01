@@ -406,16 +406,16 @@ def test_staging_ring_atomic_rule_never_deadlocks(name):
 def test_staging_ring_size_and_entry_bounds():
     """Z-3: the ring is at least 2 KiB (below it, block-format conversion faults ILLEGAL_FIELD), and the DMA forms entries
     of at most a quarter of the ring. The quarter is a rate target, not a liveness condition: entries up to the whole ring
-    still complete (quarter=False), and only an entry larger than the ring can never be allocated."""
+    still complete (sizing="ring"), and only an entry larger than the ring can never be allocated."""
     assert I.RING_MIN == 2048 and 4 * 272 <= I.RING_MIN                     # the largest single unit (an Engram row) fits a quarter
     with pytest.raises(ValueError):
         I.staging_ring([_engram(4)], ring=1024)
     with pytest.raises(ValueError):                                          # 2,176 B entries above a quarter of 4 KiB
         I.staging_ring([_fold_split(4)], ring=4096)
-    r = I.staging_ring(RING_STREAMS["mixed_four_dqs"](16), ring=4096, quarter=False)
+    r = I.staging_ring(RING_STREAMS["mixed_four_dqs"](16), ring=4096, sizing="ring")
     assert r["done"], r
     with pytest.raises(ValueError):                                          # an entry the ring can never hold
-        I.staging_ring([_fold_split(2, tiles=32)], ring=4096, quarter=False)
+        I.staging_ring([_fold_split(2, tiles=32)], ring=4096, sizing="ring")
 
 
 def test_staging_ring_scale_read_tags():
@@ -457,13 +457,18 @@ def test_staging_ring_rejected_rules_deadlock(rule, name):
 
 
 def test_staging_ring_delivery_limited():
-    """Z-2: with the HBM share as a FIFO server (the core's backlog adds to the round trip) and greedy issue up to 512 tags,
-    the paced rates do not hold: the weight stream becomes ring-bound and the paged NVFP4 KV gather (32 B scale read + 256 B
-    row) tag-bound, about 29% short at an 845-cycle round trip (the third verifier, per-granule requests: 130 / 110 / 103).
-    DMA_PACE (72 KiB of converting reads in flight) gives the paced rates back. A larger ring alone fixes only the weights.
-    Plain reads are not paced, so a plain stream keeps the full share at 1,000 cycles."""
+    """Z-2, Y-2: with the HBM share as a FIFO server (the core's backlog adds to the round trip; one response per granule)
+    and greedy issue up to 512 credits, the paced rates do not hold: the NVFP4 weight stream becomes ring-bound and the
+    paged NVFP4 KV gather (32 B scale read + 256 B row) tag-bound, about 29% short at an 845-cycle round trip (the third
+    verifier's per-granule model: 129.6 / 110.3 / 103.4). The pace rule (DMA_PACE 72 KiB, counted by format) gives the paced
+    rates back. Under a flat 72 KiB (the Z-2 rule) MXFP4 and MXFP8 weights, which the ring covers far beyond 845 cycles, are
+    bound by the limit alone: about 136 and 69 at L = 1,000 (the fourth verifier: 134.7 / 69.0); counted by format they keep
+    the full rate to 1,200 cycles. A larger ring alone fixes only the NVFP4 weights. Plain reads are not paced, so a plain
+    stream keeps the full share at 1,000 cycles."""
     need = 87 / (0.5 + 1 / 16)
     w, kv, plain = [_nvfp4_bf16(1500)], [[(32, 0, 1, 256, 512)] * 9000], [[(0, 0, 8, 2048, 2048)] * 1500]
+    mx = {"MXFP4": ([[(128, 0, 8, 2048, 4096)] * 1500], 87 / (0.5 + 1 / 32)),
+          "MXFP8": ([[(64, 0, 8, 2048, 2048)] * 1500], 87 / (1 + 1 / 32))}
     srv = dict(hbm="server")
     pace = dict(hbm="server", inflight=I.PACE_DEFAULT)
     for rt in (500, 845):
@@ -476,8 +481,99 @@ def test_staging_ring_delivery_limited():
     assert I.staging_ring(w, rt=845, **srv)["rate"] < 0.8 * need
     assert I.staging_ring(kv, rt=845, **srv)["rate"] < 0.75 * need
     for rt, theirs in ((500, 129.6), (845, 110.3), (1000, 103.4)):                         # the verifier's per-granule model
-        assert abs(I.staging_ring(w, rt=rt, max_req=1, **srv)["rate"] - theirs) < 0.03 * theirs
+        assert abs(I.staging_ring(w, rt=rt, **srv)["rate"] - theirs) < 0.03 * theirs
+    assert I.staging_ring(w, rt=845, rsp="request", **srv)["rate"] > 1.05 * 110.3          # the model before Y-3: 119
+    for f, (st, nd) in mx.items():
+        assert I.staging_ring(st, rt=1000, fmt=[f], **srv)["rate"] >= 0.99 * nd           # tags only: full rate
+        flat = I.staging_ring(st, rt=1000, fmt=[f], pace="flat", **pace)["rate"]
+        theirs = {"MXFP4": 134.7, "MXFP8": 69.0}[f]
+        assert flat < 0.86 * nd and abs(flat - theirs) < 0.05 * theirs, (f, flat)
+        for rt in (500, 845, 1000, 1200):
+            assert I.staging_ring(st, rt=rt, fmt=[f], **pace)["rate"] >= 0.99 * nd, (f, rt)
+    for rt in (845, 1000):                                                                  # NVFP4: weighting changes nothing
+        assert I.staging_ring(w, rt=rt, pace="flat", **pace)["rate"] == I.staging_ring(w, rt=rt, **pace)["rate"]
     assert I.staging_ring(plain, rt=1000, **pace)["bw"] >= 0.98 * 87
+
+
+def test_staging_ring_pace_cap():
+    """Y-2: the limit is min(DMA_PACE, 4.5 x the ring). The cap is the NVFP4 ring coverage times the share (4.5 x 16 KiB =
+    72 KiB), so a smaller ring needs no runtime change: at 8 KiB it gives the KV gather 130 instead of 104 at L = 500. The
+    limit derived from the ring alone (the fourth verifier's proposal) is rejected: the KV gather is tag-bound, its best
+    limit is about 72 KiB at any ring size, and 4.5 x a 32 KiB ring (144 KiB) drops it to about 110 at L = 845."""
+    need = 87 / (0.5 + 1 / 16)
+    kv = [[(32, 0, 1, 256, 512)] * 9000]
+    pace = dict(hbm="server", inflight=I.PACE_DEFAULT)
+    assert I.PACE_DEFAULT == 9 * 16384 // 2
+    capped = I.staging_ring(kv, ring=8192, rt=500, **pace)["rate"]
+    flat = I.staging_ring(kv, ring=8192, rt=500, pace="flat", **pace)["rate"]
+    assert capped >= 0.82 * need and flat < 0.7 * need, (capped, flat)
+    assert I.staging_ring(kv, ring=32768, rt=845, **pace)["rate"] >= 0.98 * need            # the CSR keeps 72 KiB
+    derived = I.staging_ring(kv, ring=32768, rt=845, hbm="server", inflight=9 * 32768 // 2)["rate"]
+    assert derived < 0.75 * need, derived
+
+
+def test_staging_ring_entry_size():
+    """Y-1: an entry without raw slots covers at most one data request. Its scales stay in the ring for two round trips
+    plus the time its own data takes to stream, so the ring must hold scale rate x 2 L plus about one entry's scales.
+    Quarter-size scale-only entries (4 KiB of NVFP4 scales, 32 KiB of data), which the Z-3 rule allowed, run at about 124
+    elements/cycle at L = 845 instead of 153 (paced) and 123 with DMA_PACE (the fourth verifier's own model: 123.1 / 123.8);
+    the formula predicts each size within 3%. The rule rejects such entries (sizing="rate")."""
+    need = 87 / (0.5 + 1 / 16)
+    sc_rate = 87 * 32 / 288                                         # NVFP4 scale bytes per cycle at the share
+    rates = {}
+    for g in (8, 16, 64, 128):                                      # granules per entry: 256 B .. 4 KiB of scales
+        st = [[(32 * g, 0, g, 256 * g, 512 * g)] * (12000 // g)]
+        rates[g] = I.staging_ring(st, rt=845, sizing="quarter")["rate"]
+        pred = need * min(1.0, 16384 / (sc_rate * 2 * 845 + 32 * g))
+        assert abs(rates[g] - pred) < 0.03 * pred, (g, rates[g], pred)
+        if g > 8:
+            with pytest.raises(ValueError):
+                I.staging_ring(st, rt=845)
+    assert rates[8] >= 0.98 * need and rates[128] < 0.82 * need
+    big = [[(4096, 0, 128, 32768, 65536)] * 90]
+    assert I.staging_ring(big, rt=845, sizing="quarter", hbm="server", inflight=I.PACE_DEFAULT)["rate"] < 0.82 * need
+
+
+def test_staging_ring_tag_arbitration():
+    """Y-3: a read takes one tag and one credit per granule (one per RD_RSP). Data bytes per cycle per DQ at L = 845 with
+    DMA_PACE, while the streams overlap:
+    - arb="greedy" (ready includes free credits): one-credit requests (a KV gather: 32 B scale read, 256 B row) take every
+      freed credit, and a 2 KiB plain read, which needs 8 at once, starves: about 4-6 B/cycle of 87 (the fourth verifier:
+      1-4); with two KV-gather DQs about 3.
+    - arb="hold" (the turn held for one request, the verifier's proposal): round-robin per request gives a 2 KiB read 8x
+      the bytes of a one-granule read, so the KV gather starves instead (about 5 against 81).
+    - arb="fair" (the rule): the winner keeps its turn until it has taken 8 credits, holding for credits and pace: credits
+      are shared evenly (KV about 28 + 3 B/cycle of scales, plain 56; two KV DQs and plain about 18 / 18 / 39).
+    - Ring space starves the same way: next to the KV gather's 32 B entries a weight stream's 256 B entries never fit
+      (ring_turn=False: about 0). With the ring turn (DQs waiting to allocate take turns of 256 B of ring) both get about
+      37."""
+    kv, pl, w = [(32, 0, 1, 256, 512)] * 9000, [(0, 0, 8, 2048, 2048)] * 1500, _nvfp4_bf16(1500)
+    run = dict(hbm="server", inflight=I.PACE_DEFAULT, rt=845)
+    greedy = I.staging_ring([kv, pl], arb="greedy", **run)["bw_dq"]
+    assert greedy[1] < 0.1 * 87 and greedy[0] > 0.7 * 87, greedy
+    assert I.staging_ring([kv, kv[:6000], pl], arb="greedy", **run)["bw_dq"][2] < 0.06 * 87
+    hold = I.staging_ring([kv, pl], arb="hold", **run)["bw_dq"]
+    assert hold[0] < 0.1 * 87, hold
+    fair = I.staging_ring([kv, pl], **run)["bw_dq"]
+    assert min(fair) >= 0.3 * 87 and sum(fair) >= 0.9 * 87, fair
+    three = I.staging_ring([kv, kv[:6000], pl], **run)["bw_dq"]
+    assert min(three) >= 0.2 * 87, three
+    assert I.staging_ring([w, kv], ring_turn=False, **run)["bw_dq"][0] < 0.05 * 87
+    wk = I.staging_ring([w, kv], **run)["bw_dq"]
+    assert min(wk) >= 0.4 * 87, wk
+    assert I.staging_ring([kv[:300], pl[:50], w[:60], kv[:300]], rt=300)["done"]           # four DQs, paced
+
+
+def test_staging_ring_pace_below_one_request():
+    """Y-6: a converting read may always issue when no converting read is in flight. Under the literal rule ("at most
+    DMA_PACE bytes in flight") a 1 KiB limit never issues the first 2 KiB data read and the core hangs; with the rule the
+    stream completes, one read at a time. The counter needs 18 bits: with the limit off, 512 granules of converting reads
+    weigh 2^17 B."""
+    w = [_nvfp4_bf16(200)]
+    assert not I.staging_ring(w, hbm="server", inflight=1024, pace_idle=False)["done"]
+    assert I.staging_ring(w, hbm="server", inflight=1024)["done"]
+    r = I.staging_ring([_nvfp4_bf16(1500)], ring=32768, rt=1000, hbm="server")
+    assert r["peak_infl"] == 1 << 17                                # 2^17: one more than a 17-bit counter holds
 
 
 # Entries with HBM byte ranges (review Z-1). Each DQ streams from its own 1 GiB region.
@@ -500,6 +596,9 @@ def _fold_contig(ring, n=60, base=0, start=64):
     return out
 
 
+Z1_ARB = dict(arb="shrink", ring_turn=False)     # the arbitration before Y-3, under which the Z-1 numbers were taken
+
+
 @pytest.mark.parametrize("kind", ["index_key", "fold_contig"])
 def test_staging_ring_entry_boundaries(kind):
     """Z-1: every data read belongs to exactly one entry. With entries that end mid-granule, the rejected reading ('shared':
@@ -511,16 +610,22 @@ def test_staging_ring_entry_boundaries(kind):
     mk = _index_key if kind == "index_key" else _fold_contig
     for ring in (4096, 16384):
         four = [mk(ring, base=d << 30) for d in range(4)]
-        cut = I.staging_ring(four, ring=ring, boundary="cut")
-        shared = I.staging_ring(four, ring=ring, boundary="shared")
+        cut = I.staging_ring(four, ring=ring, boundary="cut", sizing="quarter")
+        # The deadlock depends on timing (the fourth verifier saw 16 KiB complete with a queue, and the Y-3 arbitration
+        # avoids it there for the index key), so the Z-1 numbers are reproduced with the arbitration of that session.
+        # Cutting is the rule because it removes the cause; under the rule's arbitration "shared" still deadlocks at 4 KiB.
+        shared = I.staging_ring(four, ring=ring, boundary="shared", sizing="quarter", **Z1_ARB)
+        if ring == 4096:
+            assert not I.staging_ring(four, ring=ring, boundary="shared", sizing="quarter")["done"]
         assert cut["done"] and cut["peak"] <= ring, (ring, cut)
         assert not shared["done"] and shared["deadlock"] is not None, (ring, shared)
-        assert I.staging_ring(four[:1], ring=ring, boundary="shared")["done"]
+        assert I.staging_ring(four[:1], ring=ring, boundary="shared", sizing="quarter")["done"]
         plans = I._ring_reads(four[0], "cut")
         assert all(len(r[2]) == 1 for p in plans for r in p)                       # cut: one entry per read
         assert any(len(r[2]) == 2 for p in I._ring_reads(four[0], "shared") for r in p)
     if kind == "index_key":
-        r = I.staging_ring([_index_key(4096, base=d << 30) for d in range(4)], ring=4096, boundary="shared")
+        r = I.staging_ring([_index_key(4096, base=d << 30) for d in range(4)], ring=4096, boundary="shared", sizing="quarter",
+                           **Z1_ARB)
         assert abs(r["deadlock"] - 1715) <= 5                                      # the verifier's number, own model
 
 

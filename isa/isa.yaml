@@ -20,7 +20,7 @@ machine:
   mxu: {rows: 64, cols: 64, dot: 4, k_tile_fp8: 256, k_tile_bf16: 128, wload_bytes_per_cycle: 512}
   vpu: {lanes: 16, lane_width: 16, fp32_fma_per_cycle: 256}
   sfu_per_cycle: 128
-  dma_outstanding_reads: 512      # 256 B granules in flight per core (128 KB, about 2x HBM bandwidth x latency)
+  dma_outstanding_reads: 512      # 256 B granules in flight per core (128 KB, about 2x HBM bandwidth x latency): 512 granule credits and 512 tags, one tag per read request (microarch.md section 2.5, review Y-3)
   queue_depth: 16
 
 queues:
@@ -181,8 +181,8 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
-    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, and every data read belongs to one entry (isa.staging_ring)
-    DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2): [17:0] the most bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
+    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request (isa.staging_ring)
+    DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2, Y-2, Y-6): [17:0] the most weighted bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; NVFP4 counts its bytes, MXFP4 half, MXFP8 a quarter; the limit is min(this, 4.5 x the DMA_STAGE size); a converting read may always issue when none is in flight; 18-bit counter; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
