@@ -294,3 +294,39 @@
   Correction: an earlier note said PLAN §5 asks for an Opus/xhigh ISA + HBM pass; §5 lists that only as an alternative.
 - Phase 3: `common` blocks (FIFOs, async FIFO, credit interfaces, arbiters, SRAM wrapper) and `arith`.
 - Open: vendor HBM3e timing (tCCD_L), PHY latencies, the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: independent spec review (2026-11-01)
+
+### Changes
+- `docs/reports/spec_review.md`: new "Independent review" section from a fresh Opus 5.5 session (high, then xhigh for the two
+  reserved checks). Findings I-1 to I-15 and X-1 to X-6, plus a table of which findings gate which block. No spec, model or test
+  changed; all findings are open.
+- `docs/PLAN.md`: the Phase 2 exit records the review and its gates.
+- Gating fix (this note's session): X-2 gates `hbm` only for (b), the shared command bus of a channel's two PCs. (a), (c)-(e) need
+  JESD238 and go on the H-9 checklist instead of blocking RTL.
+
+### Results
+- **High severity:**
+  - I-1 GLOBAL -> GLOBAL `DMA_COPY` has no response sink (deadlock).
+  - I-2 paged block-scaled KV has no complete ISA operand set.
+  - I-3 the exact NVFP4 -> BF16 path exceeds the 256 B/cycle DMA SPM write port (0.83 of the rate the roofline assumes).
+  - X-3 the R-3 partial-ack coalescing has no completion trigger (hang at low load).
+- **Reproduced by the authoring session** (scratch probes, not committed):
+  - The six `hbm.Dram` gaps of I-9 / X-1 are all accepted.
+  - The mutation test leaves the same 15 of 28 rules deletable.
+  - I-10: `MID` 0.683 and `TINY` 0.562 against `FULL` 0.988; XORing the folded bits into the bank restores 0.99.
+  - I-13: SPM bank spread over 2-64 KiB strides is 32 down to 1 bank.
+  - The I-3 arithmetic.
+- Three of the four high findings (I-1, I-3, X-3) are errors of the authoring session that the self-review missed. X-3 was
+  introduced by the R-3 fix.
+
+### Tests
+- Unchanged: `make pytest` 137 passed. The review's probes (mutation test, the I-1 and I-7 CDG variants) are not yet unit tests.
+
+### Next
+- **Fix session (Opus / high):** resolve the findings that gate `core/dma`, `core/seq` and `hbm` (spec_review.md, "Before Phase 3").
+  Start with I-1, I-2, I-3 and X-3. Land the checker fixes as tests: the mutation test as a unit test, and the I-1 / I-7 cycles in
+  `test_noc.py`.
+- In parallel: Phase 3 `common` and `arith`; nothing in the review blocks them.
+- Later: Phase 4 `link` / `noc` items (I-7, X-4, X-5) and compiler / runtime items (I-6, I-8, I-14, X-6).
+- Open: vendor HBM3e timing (tCCD_L, X-2 checklist), PHY latencies, the DeepSeek `hc_fn` check for numerics D2.

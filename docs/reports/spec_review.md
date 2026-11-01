@@ -172,10 +172,16 @@ before the block that uses it; **L** = text, consistency, or a cheap improvement
 |---|---|
 | `core/dma` | I-1, I-2, I-3, I-5, I-12(a), X-3 |
 | `core/seq` | I-4, I-11 |
-| `hbm` | I-9, I-10, I-12(b), X-1, X-2, X-3 |
+| `hbm` | I-9, I-10, I-12(b), X-1, X-2(b), X-3 |
 | `common`, `arith` | none (as the self-review said) |
 | Phase 4 `link`, `noc` | I-7, I-12(b), X-4, X-5 |
 | compiler / runtime | I-6, I-8, I-14, X-6 |
+
+X-2 gates `hbm` only in part:
+- **(b) gates it:** the channel-scope command-bus rule in the checker and the arbiter between a channel's two PCs in H-3 can be
+  specified now. The RTL must not assume the PCs are independent.
+- **(a), (c), (d), (e) do not:** they need JESD238 or a vendor datasheet, which is not available. Resolving them means adding them to
+  the H-9 JESD238 checklist. The RTL keeps them as timing-table parameters, so the values change without an RTL change.
 
 **Not checked:**
 - the generated SV / C++ against a compile (`make isa` only);
