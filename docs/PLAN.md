@@ -302,8 +302,11 @@ session checks the fixes next.
 - **Program-level deadlock detector** (independent spec review X-6): report a deadlock when every engine and front end of every core
   is blocked on a semaphore wait (or a full queue behind one) and no transfer is in flight, with the wait chain. The golden
   instruction-level model (`sw/compiler`, Phase 3) gets the same check next to its SPM race checker; the compiler's issue-order
-  rule (d2d_c2c.md L-7) is what it guards. It also checks the kernel-boundary rule (isa.md §3, review finding V-2): every add to a
-  network-facing semaphore follows the consumer's credit for that buffer parity's previous use, also across kernels.
+  rule (d2d_c2c.md L-7) is what it guards. It also checks the kernel-boundary rule (isa.md §3, review findings V-2, W-3): every add to a
+  network-facing semaphore is causally after its owner's wait for that semaphore's previous use, also across kernels and when
+  the index moved to another call site (the final credit), every wait target is the carried base plus the use's total
+  (data-dependent totals from the program's SPM base table), and a multicast source waits for one credit per destination.
+  And the write-after-write rule (hbm.md H-2, W-4 a): two writes of the same HBM bytes are ordered by an ack.
 
 **Data handling within 16 GB**
 - Binary trace records (about 24 B each), zstd streamed to the SSD. Rough size: one decode layer on one die is about

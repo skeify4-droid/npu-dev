@@ -223,9 +223,10 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
     two forms are the same.
   - DeepSeek index key, B = 4 (`test_isa.py` `test_paged_scatter_append`): four 64 B data packets, and four 32 B scale packets
     from 32 indices.
-- The DeepSeek block's later rows are written as their tokens arrive (tail-block rewrite, §8). Each rewrite merges with any queued
-  write to the same granule (hbm.md H-2). MiniMax's own NVFP4 index key (64 B + 8 B per token) is the same case with 4 rows per
-  block.
+- The DeepSeek block's later rows are written as their tokens arrive (tail-block rewrite, §8). MiniMax's own NVFP4 index key
+  (64 B + 8 B per token) is the same case with 4 rows per block. The network does not keep issue order (§9), so two writes of
+  one block are one write (several tokens in one step) or the second waits for the first one's ack (`ssem`), from one owner
+  core per block (hbm.md H-2, review finding W-4 a). A batched scatter append waits for the previous step's scatter the same way.
 - Reading back:
   - The DeepSeek index scan reads TD `MXFP4`, `PAGED`, n0 = 128, `sc_off` 256, `aux0` 4. Element i0 of row q has its scale at
     `frame * 4 KiB + 64 KiB + q * 4 + floor(i0 / 32)`.
@@ -260,7 +261,8 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 - HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The scale rows of a page
   (§6) can be smaller than 32 B per token (8 B for one 128-wide NVFP4 KV group, 4 B for an MXFP4 index key). They are not padded:
   the compiler rewrites the aligned 32 B block that holds the new token's scales from a copy in SPM (tail-block rewrite, hbm.md H-2,
-  review finding I-14). That block is one 32 B write packet (§6, review finding V-5).
+  review finding I-14). That block is one 32 B write packet (§6, review finding V-5). Two writes of one block are ordered by
+  an ack, not by the controller's merging (review finding W-4 a).
 - Fault codes: isa.yaml `fault_cause`.
 
 ## 9. Ordering

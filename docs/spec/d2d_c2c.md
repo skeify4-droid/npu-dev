@@ -158,8 +158,14 @@ Collectives use only the following, all existing in ISA v0.1.
     handshake per call (isa.md §3: network-facing semaphores are never reset).
   - The producer's credit wait is normally already satisfied, so it is off the critical path.
   - **Across kernels** *(review finding V-2)*: parities, credit counts and semaphore bases carry over, and there is no barrier
-    between kernels. Every network-facing semaphore follows this discipline, including pipeline hand-offs and HBM buffers that
+    between kernels. Every receive buffer follows this discipline, including pipeline hand-offs and HBM buffers that
     complete by `SIGNAL` (isa.md §3).
+  - **Allocation and reassignment** *(review finding W-3, isa.md §3)*: every network-facing semaphore, credits and `SIGNAL`-only
+    handshakes included, belongs to one call site for the whole program. It moves to another call site only at a quiescent
+    point, or after its owner's last wait at the old one, with a final credit from the owner to each new adder. Data-dependent
+    bases (the all-to-all's byte totals, L-7) are carried by the program in an SPM base table, not by the CP.
+  - **Multicast and many-to-one buffers:** the producer waits for one credit per consumer of a use, n for a `DMA_MCAST` to n
+    cores.
 - **SRAM destinations only for `rsem`** *(review finding I-6 b)*. An HBM write has no owning core, so `rsem` with an HBM destination
   is `ILLEGAL_FIELD`. A transfer into an HBM buffer ends with a `SIGNAL` (release after the acks) that adds its byte count to the
   consumer's semaphore. Prefill all-to-all buffers are this case.

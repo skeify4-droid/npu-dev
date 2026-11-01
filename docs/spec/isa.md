@@ -60,24 +60,50 @@ Rules:
 - **Kernel boundaries** *(review findings I-4, V-2; rule chosen by the user, 2026-11-01)*. There is no barrier between kernels: a
   core starts its next kernel when it halts, so adds of kernel k + 1 from a faster producer may arrive while a consumer is still in
   kernel k. Two rules keep the kernels apart:
-  - **Credit before reuse.** Every network-facing semaphore belongs to a receive buffer under the d2d_c2c.md L-6 discipline: two
-    buffers per call site used alternately, one semaphore per buffer parity, and a credit `SIGNAL` from the consumer once it has
-    consumed a buffer. A producer writes a parity's buffer, and adds to its semaphore, only after the credit for that parity's
-    previous use. Parities and credit counts carry across kernel boundaries, so a kernel boundary is only another call. This holds
-    for collectives, pipeline hand-offs and HBM buffers that complete by `SIGNAL`.
-  - **Carried base.** A wait target is `base + count`, where `base` is the previous use's final wait target, carried forward by
-    the program or the runtime (the CP writes it into SPM with the launch arguments). Totals per use are fixed at compile time, so
-    the carried base is exact, and it needs no read of the live value.
+  - **Credit before reuse.** Every receive buffer follows the d2d_c2c.md L-6 discipline: two buffers per call site used
+    alternately, one semaphore per buffer parity, and a credit `SIGNAL` from the consumer once it has consumed a buffer. A
+    producer writes a parity's buffer, and adds to its semaphore, only after the credit for that parity's previous use.
+    Parities and credit counts carry across kernel boundaries, so a kernel boundary is only another call. This holds for
+    collectives, pipeline hand-offs and HBM buffers that complete by `SIGNAL`.
+  - **Every network-facing semaphore belongs to one call site** *(review finding W-3)*, like a buffer: buffer semaphores,
+    credit semaphores and `SIGNAL`-only handshakes (count exchanges, ready flags) alike. The compiler allocates them for the
+    whole program, across kernels, and records the map with the program. A credit or flag counts events, not bytes of a
+    reusable buffer, so with an exact base (below) its own waits never pass early and it needs no credit of its own. What it
+    must not see is adds from another call site.
+  - **Reassignment.** With 63 usable semaphores per core, an index will serve several call sites over a program. It moves from
+    call site X to call site Y only:
+    - at a quiescent point (boot, or the CP's restart after a fault; above), or
+    - after its owner's last wait at X, with every add of Y causally after that wait. Adds from other cores wait for a
+      **final credit**: a `SIGNAL` from the owner to each of Y's adders, sent after the last X wait, which Y's first add waits
+      for like any later credit. A credit semaphore's adds are caused by its owner's own buffer writes, so the owner issues Y's
+      first write after its last X credit wait, in the same DQ or behind a local semaphore.
+    - Y's base is X's final target. The extra cost is one `SIGNAL` per adder per move, usually sent long before Y's first add.
+    - Example (W-3): kernel k uses S20 for a "counts ready" handshake from 8 dies; kernel k + 1 maps S20 to a pipeline hand-off.
+      Without the rule, a producer that has already halted k adds to S20 before the consumer's kernel-k wait, which then passes
+      early and reads stale counts. With it, the producer's first hand-off add waits for the consumer's final credit, which the
+      consumer sends after that wait.
+  - **Carried base.** A wait target is `base + count`, where `base` is the previous use's final wait target (whatever call site
+    that was), carried forward exactly, never read from the live value. Where the totals per use are fixed at compile time,
+    the CP may write the bases into SPM with the launch arguments. Where they are data-dependent, the program carries them: the
+    MoE all-to-all's byte totals come from all-gathered counts, which the CP never sees. So each core keeps a **base table** in a
+    runtime-reserved SPM region (64 x 4 B), updated by the program after each wait. It persists across kernels, and the CP zeroes
+    it with the semaphores at a quiescent point.
+  - **A credit wait counts one credit per consumer**: a buffer read by n consumers (a `DMA_MCAST` destination set, or an owner
+    with 32 contributors that each credit their own buffer) is free again at `base + n` credits for that use.
   - Example (V-2): 32 contributors write-add into an owner's buffer with `rsem`. Contributor A halts kernel k and starts k + 1. Its
     adds go to the other parity's semaphore. Its next adds to kernel k's semaphore (kernel k + 2) wait for the owner's credit, which
     the owner sends only after its kernel-k wait. So the owner's kernel-k count holds kernel-k bytes only.
-  - The golden model checks that every add to a network-facing semaphore follows the credit of that parity's previous use.
+  - The golden model checks that every add to a network-facing semaphore is causally after its owner's wait for that
+    semaphore's previous use, whichever call site the use belonged to (the credit for a buffer parity, or the final credit
+    after a reassignment), and that every wait target equals the carried base plus the use's total.
   - Rejected:
     - A barrier per kernel (start kernel k + 1 only after every core that shares a network-facing semaphore has halted k). It puts
       a system-wide sync on the critical path of every kernel: about 0.6-4.5 µs across 8 dies, 0.4-2.7% of a DeepSeek decode step
       at one kernel per layer.
     - Semaphore sets alternating by kernel parity. They double the network-facing semaphores, and kernel k + 2 would still need
       the credit or a lagged barrier.
+    - More semaphores per core instead of reassignment (W-3). The 6-bit semaphore fields are in every tile instruction's sync
+      block, the NoC header (`rsem`) and the list entries, so it is an encoding change, and it only moves the limit.
 - The register value in a wait condition is captured at issue, so loop counters work directly.
 - **Same queue:**
   - MQ and VQ instructions see the memory effects of earlier instructions in the same queue.

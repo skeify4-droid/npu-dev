@@ -86,8 +86,19 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
   starts empty when the current one fills.
   - Padding each token's scales to 32 B instead would grow a DeepSeek index key from 68 B to 96 B (+41% of the index-scan bytes,
     and the scan is up to 12% of a step, arch.md §4). The rewrite costs 28 B of extra write per token per step, and no read bytes.
-  - It is safe because a write is acked once queued and merges with any queued write to the same granule (write after write,
-    below), and the step's readers wait on the write's ack or semaphore anyway.
+  - **Ordering is the program's job** *(corrected, review finding W-4 a)*. The controller keeps same-granule writes in arrival
+    order (write after write, below), but the network does not keep issue order: planes are chosen per packet (memmap.md §9). Two
+    writes of one block issued back to back can land in either order, and the older block, landing last, silently drops a
+    token's scales. So two writes of one block are either one write, or the second is issued only after the first one's ack
+    (its `ssem` completion):
+    - several tokens of one sequence in one step (MTP, speculative decoding, chunked prefill): the SPM block copy takes all of
+      them and the block is written once per step;
+    - one write per step: the next step's rewrite waits on this one's completion semaphore. In decode that wait is normally
+      already satisfied, because the next token depends on this step's attention, which waited for the write's `SIGNAL`. The
+      compiler still emits it: a writer whose attention reads the current token from SPM has no such dependency;
+    - more than one writing core: one owner core per block (the one that holds the SPM copy) issues every write of it.
+  - The step's readers wait on the write's ack or semaphore (memmap.md §9). The earlier text said the rewrite was safe because
+    queued writes merge; merging keeps arrival order, not issue order.
 - The DMA splits writes at 256 B granule boundaries and merges adjacent runs into one packet, including consecutive rows of
   one page (review finding V-5). So a tail block of 4 or 8 scale rows is one 32 B write (memmap.md §6 worked example).
 
@@ -97,6 +108,8 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
   - That is enough because a write is acknowledged when queued. A reader ordered after the ack (memmap.md §9) always sees the data.
 - **Write after write:** a write to a granule that already has a write queue entry that has not started issuing merges into it (data
   overwrite, mask OR). Otherwise it is queued behind that entry, and same-granule entries issue in order.
+  - That order is arrival order at the controller. Two writes to the same bytes land in issue order only if the second is issued
+    after the first one's ack (review finding W-4 a); the tail-block rewrite above is the case that needs it.
 - Reads are not ordered among themselves.
 
 **Partial acknowledgements *(P2, review findings R-3, X-3)*:**
