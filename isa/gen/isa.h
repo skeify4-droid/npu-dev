@@ -216,7 +216,8 @@ constexpr Field kNocHeader_mc_x0{111, 108};
 constexpr Field kNocHeader_mc_x1{115, 112};
 constexpr Field kNocHeader_mc_y0{118, 116};
 constexpr Field kNocHeader_mc_y1{121, 119};
-constexpr Field kNocHeader_rsv{127, 122};
+constexpr Field kNocHeader_epoch{122, 122};
+constexpr Field kNocHeader_rsv{127, 123};
 constexpr int kDmaListEntryBits = 256;
 constexpr Field kDmaListEntry_op{2, 0};
 constexpr Field kDmaListEntry_wsem{8, 3};
@@ -403,6 +404,7 @@ enum class Csr : uint16_t {
   SEM_BASE_GPA = 32,
   DMA_STAGE = 33,
   DMA_PACE = 34,
+  NI_EPOCH = 35,
 };
 enum class FaultCause : uint16_t {
   NONE = 0,

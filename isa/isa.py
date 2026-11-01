@@ -405,6 +405,27 @@ def inline_addr(isa, td, base, i0=0, i1=0):
     return row + i0 * info["bits"] // 8, row + td["n0"] * info["bits"] // 8 + i0 // info["block"]
 
 
+def rd_rsp_layout(addr, nbytes, dst, granule=256, burst=32):
+    """Reference for the responses of one read request (noc.md section 2, review finding Y-5). The request covers
+    [addr, addr + nbytes), at most 2 KiB inside one 2 KiB block; its bytes may start and end inside a granule (a cut
+    read, Z-1). It gets one RD_RSP per granule it touches. Returns one dict per response:
+      gidx      granule index, counted from the granule that holds addr (0 for the first);
+      lo, hi    the valid payload bytes [lo, hi): the payload is the whole granule, aligned (payload byte j is HBM byte
+                granule base + j), and only the request's range inside it is valid; the initiator takes lo and hi from
+                its tag-table entry (addr and len), since RD_RSP has no len;
+      spm       SPM destination of payload byte lo: dst is the destination of the request's first byte (addr);
+      bursts    the 32 B bursts of that granule the target reads (only those the range touches)."""
+    if not 0 < nbytes <= 2048 or addr // 2048 != (addr + nbytes - 1) // 2048:
+        raise IsaError("RD_REQ: 1..2048 bytes inside one 2 KiB block")
+    g0 = addr // granule
+    out = []
+    for g in range(g0, (addr + nbytes - 1) // granule + 1):
+        a, b = max(addr, g * granule), min(addr + nbytes, (g + 1) * granule)
+        out.append(dict(gidx=g - g0, lo=a - g * granule, hi=b - g * granule, spm=dst + (a - addr),
+                        bursts=list(range((a % granule) // burst, (b - 1) % granule // burst + 1))))
+    return out
+
+
 def write_packets(runs, granule=256):
     """Reference for the DMA's write packets (isa.yaml DMA_COPY, review finding V-5): runs are (address, bytes) in the
     destination TD's order; adjacent runs merge, and packets never cross a `granule` boundary. Returns (address, bytes)."""

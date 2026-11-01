@@ -28,8 +28,8 @@ Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../report
 
 | Type | VN | Payload | Flits | Notes |
 |---|---|---|---|---|
-| RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target) |
-| RD_RSP | RSP | 256 B | 2 | one per 256 B granule: tag + granule index; destination space reserved at request time |
+| RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target); `len` in bytes, so it may start and end inside a granule (a cut read, microarch.md §2.5) |
+| RD_RSP | RSP | 256 B | 2 | one per 256 B granule the request touches: tag + granule index; the payload is that granule, aligned (partial granules below); destination space reserved at request time |
 | WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id and the burst's total bytes (`blen`); a burst is ≤ 2 KiB and inside one 2 KiB-aligned block, so it has one target (the DMA splits there, as for reads; review V-10) |
 | WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target (rules below) |
 | SEM | REQ | 8 B | 1 | `SIGNAL`: add or set at a semaphore address (a WR to the add window) |
@@ -46,8 +46,24 @@ A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on 
 - `tag` (9 bits: a read tag, or a write burst id), `len` (12 bits, bytes), `addr` (49 bits, requests only).
 - Type-specific fields share bits: `gidx` (granule index, `RD_RSP`), `cause` and `err_wr` (`ERR`), `wop` and `rsem` (`WR`, `MC_WR`), `blen`
   (total bytes of the burst, `WR`, `SEM`), and the multicast rectangle (`MC_WR`).
+- `epoch` (1 bit, `RD_REQ`, `WR`, `SEM` and `ERR`): the requesting core's CSR `NI_EPOCH`, echoed in a bridge's `ERR`, so a
+  core can drop a stale `ERR` (`LINK`) of the step before a restart (d2d_c2c.md L-4 (f), review finding Y-10). 5 bits stay
+  reserved.
 
 Header in the sideband means a 256 B write is 2 flits, not 3.
+
+**Partial granules *(review finding Y-5)*.** A read request covers bytes [`addr`, `addr` + `len`), inside one 2 KiB block,
+and may start or end inside a granule (the DMA cuts a granule that two ring entries share, microarch.md §2.5, Z-1).
+- It gets one `RD_RSP` per 256 B granule it touches. `gidx` counts granules from the one that holds `addr` (0 for the first).
+- Every payload is its granule, aligned: payload byte j is the target's byte at the granule base + j. Only the request's
+  range inside the granule is valid; the other bytes are not defined. `RD_RSP` has no `len`, so the initiator takes the
+  valid range from its tag-table entry (the request's first byte and length). An NI that packed the payload from the
+  request's first byte would shift the second half of a cut granule by its offset, silently.
+- A target reads only what the range touches: the HBM controller only the 32 B bursts (hbm.md H-2), an SRAM target only
+  the bytes. A granule cut inside a burst has that burst read twice, once per half.
+- `isa.rd_rsp_layout` is the reference (valid range, SPM destination and bursts of each response), tested in `test_isa.py`
+  (`test_rd_rsp_layout`): a granule cut at byte 128 into two requests, a 264 B row from byte 8, contiguous 264 B rows that
+  share a burst, and random requests reassembled in SPM.
 
 **Write acknowledgements** (reviews R-3, X-3). A target keeps a small coalescing table with one entry per (initiator, burst id):
 1. Every accepted `WR` or `SEM` adds its `len` to its entry. The packets of a burst arrive in any order.
@@ -206,14 +222,16 @@ across both planes (`noc.scenarios()`).
 
 - **No ordering guarantee.** The plane and sub-link are chosen per packet. memmap.md §9 gives the program-level ordering tools: acks,
   byte-counting semaphores, `SIGNAL`.
-- **QoS:** none beyond round-robin in v1. The perf simulator reports per-class latency, to decide whether HBM responses need priority.
+- **QoS:** none beyond round-robin in v1. The perf simulator reports per-class latency, to decide whether HBM responses need priority,
+  and the share of each core when converting and plain streams load one stack (review finding Y-4, hbm.md H-9).
 - **Errors:** a target that cannot serve an address returns `ERR`. The initiating DMA records it, stops the core and interrupts the CP.
   Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down keeps sinking: its bridge answers
   requests with `ERR` (`LINK`), including the requests in its replay buffer, and drops everything else, so the mesh drains and
   the cores with transfers through it fault, with `LINK` or, for requests the far side had accepted, `TIMEOUT` (review findings
   X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8). A replay-buffer `ERR` can be stale, so
   it may also fault a core whose transfer completed; it frees no tag, and the CP restarts the whole step (W-2), once every
-  core of the step is idle, the bridge has sent its last `ERR` and a drain time has passed (Z-7).
+  core of the step is idle, the bridge has sent its last `ERR` and a drain time has passed (Z-7). The `ERR` carries the
+  request's `epoch`, and a restarted core drops a `LINK` `ERR` of the previous epoch (Y-10).
 
 ## 8. Open items
 

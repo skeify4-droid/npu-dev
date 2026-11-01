@@ -183,6 +183,7 @@ enums:
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
     DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request (isa.staging_ring)
     DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2, Y-2, Y-6): [17:0] the most weighted bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; NVFP4 counts its bytes, MXFP4 half, MXFP8 a quarter; the limit is min(this, 4.5 x the DMA_STAGE size); a converting read may always issue when none is in flight; 18-bit counter; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
+    NI_EPOCH: 0x023      # [0] epoch put in every request header (noc_header epoch); the CP toggles it on every core of a step while the step is stopped, before a restart; a LINK ERR whose epoch differs is dropped without a fault (d2d_c2c.md L-4 (e), review Y-10)
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
@@ -196,7 +197,7 @@ enums:
     HBM_ALIGN: 9       # HBM write not 32 B aligned in address and size (hbm.md H-2)
     SEM_BUSY: 10       # SSET on a semaphore that queued instructions reference
     PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
-    LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4); may be stale (W-2): always faults, frees no tag, FAULT_ADDR advisory
+    LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4); may be stale (W-2): always faults unless its epoch differs from NI_EPOCH (then dropped, Y-10), frees no tag, FAULT_ADDR advisory
     ERR_RSP: 13        # a target returned ERR for another reason
     TIMEOUT: 14        # a DMA request got no response within the timeout (CSR); a link going down reports LINK instead
   list_op:             # DMA_LIST entry kinds (dma_list_entry.op)
@@ -307,7 +308,7 @@ noc_header:
     tag:      {bits: [38, 30], types: [RD_REQ, RD_RSP, WR, WR_ACK, SEM, ERR]}  # read tag, or write burst id
     len:      {bits: [50, 39], types: [RD_REQ, WR, WR_ACK, SEM, MC_WR]}         # bytes: read size, payload, or acked bytes
     addr:     {bits: [99, 51], types: [RD_REQ, WR, SEM, MC_WR]}                 # target GPA (node resolved by the source)
-    gidx:     {bits: [53, 51], types: [RD_RSP]}                                 # granule index within the read request
+    gidx:     {bits: [53, 51], types: [RD_RSP]}                                 # granule index, counted from the granule that holds the request's first byte; the payload is that granule, aligned, and its valid bytes are the request's range within it (from the tag table, review Y-5)
     cause:    {bits: [57, 54], types: [ERR], enum: fault_cause}
     err_wr:   {bits: [58, 58], types: [ERR]}               # 1: tag is a write burst id, 0: a read tag (review V-10)
     wop:      {bits: [101, 100], types: [WR, MC_WR], enum: wop}
@@ -317,7 +318,8 @@ noc_header:
     mc_x1:    {bits: [115, 112], types: [MC_WR]}
     mc_y0:    {bits: [118, 116], types: [MC_WR]}
     mc_y1:    {bits: [121, 119], types: [MC_WR]}
-    rsv:      {bits: [127, 122]}
+    epoch:    {bits: [122, 122], types: [RD_REQ, WR, SEM, ERR]}    # request epoch (CSR NI_EPOCH, toggled by the CP at each restart); a bridge copies it into its ERR, and a core drops a LINK ERR of the other epoch (d2d_c2c.md L-4 (e), review Y-10)
+    rsv:      {bits: [127, 123]}
 
 # Field layouts. Every tile-queue format starts with the sync block; front-end formats leave it zero.
 sync:

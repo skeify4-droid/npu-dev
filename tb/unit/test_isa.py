@@ -170,7 +170,7 @@ def test_noc_header_widths(isa):
     f = {k: I.width(v["bits"]) for k, v in I.layout_fields(isa, "noc_header").items()}
     m = isa["machine"]
     assert isa["noc_header"]["bits"] == 128                              # flit_t header sideband (microarch.md section 5)
-    assert 1 << f["tag"] >= m["dma_outstanding_reads"]                   # one tag per read granule in flight
+    assert 1 << f["tag"] >= m["dma_outstanding_reads"]                   # one tag per read request, at most one per credit (Y-3)
     assert f["addr"] == isa["memmap"]["gpa_bits"]
     assert 1 << f["len"] > 2048 and 1 << f["blen"] > 2048                # 2 KiB requests and bursts
     assert 1 << f["rsem"] >= m["semaphores"]
@@ -181,6 +181,10 @@ def test_noc_header_widths(isa):
     assert 1 << f["gidx"] >= 2048 // 256                                 # granules of one 2 KiB read
     err = I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type="ERR", tag=0x1FF, err_wr=1, cause="LINK"))
     assert err["err_wr"] == 1 and err["tag"] == 0x1FF                     # V-10: ERR says which tag space its tag is in
+    for t in ("RD_REQ", "WR", "SEM", "ERR"):                             # Y-10: requests carry the epoch, the bridge's ERR echoes it
+        assert I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type=t, epoch=1))["epoch"] == 1
+    with pytest.raises(I.IsaError):
+        I.pack(isa, "noc_header", type="RD_RSP", epoch=1)                # a response carries no epoch
 
 
 def test_layout_validator_rejects(isa):
@@ -641,6 +645,39 @@ def test_staging_ring_sizing():
     assert 20 < split < 40
     eng = I.staging_ring([_engram(1500)])["rate"] / 256                        # Engram rows per cycle
     assert 0.10 < eng < 0.15
+
+
+def test_rd_rsp_layout():
+    """Y-5: partial-granule responses. A read request may start and end inside a granule (a cut read, Z-1); it gets one
+    RD_RSP per granule it touches, gidx counted from the granule of its first byte. The payload is the whole granule,
+    aligned, and its valid bytes are the request's range inside it, taken from the tag-table entry (RD_RSP has no len).
+    The target reads only the 32 B bursts the range touches. Random requests reassemble exactly in SPM."""
+    G = 0x1234_5000                                     # a 2 KiB-aligned HBM address
+    a, b = I.rd_rsp_layout(G, 128, 0x100), I.rd_rsp_layout(G + 128, 128, 0x900)   # one granule cut at byte 128
+    assert a == [dict(gidx=0, lo=0, hi=128, spm=0x100, bursts=[0, 1, 2, 3])]
+    assert b == [dict(gidx=0, lo=128, hi=256, spm=0x900, bursts=[4, 5, 6, 7])]
+    assert b[0]["lo"] * 8 // 4 == 256                   # the second half's first NVFP4 element (tag-table element offset)
+    r = I.rd_rsp_layout(G + 8, 264, 0x2000)             # an Engram row from byte 8: two granules
+    assert [(x["gidx"], x["lo"], x["hi"], x["spm"], x["bursts"]) for x in r] == \
+        [(0, 8, 256, 0x2000, list(range(8))), (1, 0, 16, 0x2000 + 248, [0])]
+    r0, r1 = I.rd_rsp_layout(G, 264, 0), I.rd_rsp_layout(G + 264, 264, 0)   # contiguous rows: burst 0 of granule 1 twice
+    assert r0[-1]["bursts"] == [0] and r1[0]["bursts"][0] == 0 and r1[0]["lo"] == 8
+    assert all(x["lo"] == 0 and x["hi"] == 256 for x in I.rd_rsp_layout(G, 2048, 0))
+    assert [x["gidx"] for x in I.rd_rsp_layout(G, 2048, 0)] == list(range(8))
+    with pytest.raises(I.IsaError):
+        I.rd_rsp_layout(G + 2040, 16, 0)                # crosses a 2 KiB block
+    rng = random.Random(5)
+    hbm = bytes(rng.randrange(256) for _ in range(4096))
+    for _ in range(200):
+        lo = rng.randrange(2048)
+        n = rng.randint(1, 2048 - lo)
+        spm = bytearray(4096)
+        for x in I.rd_rsp_layout(lo, n, 1000):
+            gb = (lo // 256 + x["gidx"]) * 256         # the granule the payload holds
+            payload = hbm[gb:gb + 256]
+            spm[x["spm"]:x["spm"] + x["hi"] - x["lo"]] = payload[x["lo"]:x["hi"]]
+            assert all(gb + 32 * k < lo + n and gb + 32 * k + 32 > lo for k in x["bursts"])
+        assert bytes(spm[1000:1000 + n]) == hbm[lo:lo + n]
 
 
 # ---------------------------------------------------------------- non-paged block operands (memmap.md section 6, review W-5)

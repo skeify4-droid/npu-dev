@@ -229,6 +229,14 @@ isa.md §5) a cheap multiply at the ACC input.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
   and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
+  - **Tag-table entry *(review finding Y-5)*:** the SPM destination of the request's first byte, the byte offset of that
+    byte in its granule, `len`, the granules still outstanding (an 8-bit mask), the DQ, and for a converting read its
+    format (pace weight), its ring entry (the ring offset of its scales or raw slot) and the element offset of its first
+    byte in its conversion unit. Byte 128 of an NVFP4 granule is element 256, so the second half of a cut granule converts
+    from element 256 into its own entry. About 80 bits, 5 KiB for 512 tags.
+  - Response `gidx` g lands at the destination + (g x 256 - the first byte's offset), except g = 0, which lands at the
+    destination. Its valid bytes are the request's range within the granule (noc.md §2, partial granules;
+    `isa.rd_rsp_layout`).
 - **Read data always sinks in local SPM** (or DTAB / IMEM). A DMA never forwards read data as a write, so one of its two operands is
   local (`TD_SPACE` otherwise; review finding I-1). Global-to-global moves are two transfers through an SPM buffer.
 - **Inbound rate *(review findings I-3, V-1)*:** the converter produces 256 elements per cycle and the SPM write port takes
@@ -337,7 +345,8 @@ isa.md §5) a cheap multiply at the ACC input.
     - **With the pace rule** (72 KiB, about the share times the 845 cycles the ring covers for NVFP4, counted by format,
       capped at 4.5 x the ring; above) the queue model gives the paced rates back. Elements/cycle at L = 500 / 700 / 845 /
       1,000 / 1,200 (`isa.staging_ring`, `hbm="server"`; weights in entries of one 2 KiB request; "all" means the full rate
-      at every L):
+      at every L). These are **single-FIFO results for one core** (review finding Y-4): the KV-gather column in particular
+      is optimistic with real per-PC queues and other cores' traffic (below), and Phase 7 checks every column:
 
       | | NVFP4 → BF16 weights | MXFP4 weights | MXFP8 weights | paged NVFP4 KV gather |
       |---|---|---|---|---|
@@ -361,8 +370,24 @@ isa.md §5) a cheap multiply at the ACC input.
       for the KV gather, and 24 KiB gains the weights only 2-3 elements/cycle). Rejected: limiting all reads, which would
       cut a plain stream to 72 B/cycle at a 1,000-cycle round trip; a tag cap, which the third verifier found helps the
       weight stream and hurts the KV gather.
-    - The queue model serves one core's requests in issue order. Real HBM has per-PC queues and other cores' traffic; the
-      Phase 7 performance simulator is the executable check of these rates.
+    - **Per-PC queues and other cores *(review finding Y-4)*.** The queue model serves one core's requests in issue order
+      at its share. Real HBM has 32 per-PC queues per stack, shared by 8 cores. Two effects follow, and neither model below
+      has bank timing, FR-FCFS, refresh or the mesh, so Phase 7 decides (PLAN):
+      - Per-PC latency varies, and in-order reclaim turns the tail into ring occupancy, so the paged KV gather becomes
+        ring-bound. With 8 cores of one stack on it at 72 KiB (32 per-PC FIFOs of 21.75 B/cycle): the fourth verifier's
+        model 144 / 132 elements/cycle at L = 500 / 845 (slowest core 143 / 131), a scratch model of this session 146 / 140,
+        against 155 / 154 for one core alone. The NVFP4 weights: 155 / 146 and 149 / 143. Tags only: 126 / 107 and 128 / 109.
+      - A per-PC FIFO shares bandwidth in proportion to the bytes queued. A converting core's queued bytes are capped by its
+        ring and its pace; a plain core's only by its 128 KiB of credits. hbm.md H-3 is FR-FCFS and oldest first, with no
+        fairness per initiator, and noc.md §7 has no QoS in v1. One converting core among 7 cores streaming plain reads
+        gets about 50 B/cycle (weights) or 44-49 (KV gather), each plain core 90-93, paced or not.
+      - Options for Phase 7 to cost, not taken here:
+        - a 24 KiB ring for KV-heavy kernels (8 KiB more SPM reserved per core, no hardware): 8 cores on the KV gather
+          152 / 141 in the verifier's model, 146 / 142 in this session's;
+        - fairness per initiator in the HBM scheduler. Per-PC round-robin over initiators gives the weight core 85 / 74
+          B/cycle at L = 500 / 845, but the KV core drops to 41 / 38: its 32 B scale reads count as whole turns. So the
+          fairness would have to be weighted by bytes (deficit round-robin), a change to the H-3 scheduler.
+      - The weights hold within about 3-5% of the table, and the mixed-traffic loss does not depend on `DMA_PACE`.
     - Split units hold about 17 times more space per element (a 128 B MXFP4 tile and its 8 B of scales). If every fold tile
       of a stream were split, the ring would carry about 28 elements/cycle, against a need of about 164.
     - **So the compiler never splits fold tiles:** it pads the HBM row pitch of fold-converted weights to a whole number of

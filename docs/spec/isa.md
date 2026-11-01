@@ -338,7 +338,9 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
   restarts the core only then (d2d_c2c.md L-4, review finding W-2). A core the CP stops without a fault behaves the same.
   After a link-down event the CP restarts the step only once every core of the step is idle, faulted or stopped, every down
   bridge reports `err_done` and the drain time `T_DRAIN` has passed, so no stale `ERR` (`LINK`) reaches the new step
-  (d2d_c2c.md L-4 (e), review finding Z-7). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  (d2d_c2c.md L-4 (e), review finding Z-7). Before the restart the CP toggles each core's CSR `NI_EPOCH`, which every
+  request header carries, and a core drops an `ERR` (`LINK`) of the other epoch, so a stale one cannot fault the new step
+  even if it outlives `T_DRAIN` (L-4 (f), review finding Y-10). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
   recovery accesses rely on.
 
 Causes:
@@ -350,7 +352,7 @@ Causes:
 - an invalid page-table entry in paged DMA;
 - a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4). A request the
   far side had already accepted gets no `ERR` and faults with `TIMEOUT` instead. A replay-buffer `ERR` can be stale and name a
-  tag that is free or reused (review finding W-2): an `ERR` (`LINK`) always faults the core, frees no tag, and makes
+  tag that is free or reused (review finding W-2): an `ERR` (`LINK`) of the core's current epoch always faults the core (one of the other epoch is dropped, Y-10), frees no tag, and makes
   `FAULT_ADDR` advisory; the CP restarts every core of the step;
 - a DMA request with no response within the timeout CSR (`TIMEOUT`; review finding I-15, which separates it from `LINK`);
 - an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);

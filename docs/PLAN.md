@@ -251,7 +251,7 @@ session checks the fixes next.
 | `core/vpu`, `sfu` | lanes, reductions, exp/recip/rsqrt (LUT + polynomial), top-k unit | ULP-error bounds vs NumPy |
 | `core/dma` | strided, gather/scatter, paged (row pages with in-page scales), MXFP4 / NVFP4 / MXFP8 conversion to E4M3 + column scales or BF16 (256 elements/cycle), scales staged before their data (`DMA_STAGE` ring), write packets merged across adjacent rows, four DQs served independently, outstanding-request tracking, ack counting | cocotb + formal on address generator; the memmap.md §6 appends (DeepSeek index key, MiniMax KV), the batched `DMA_SCATTER` append and the n2 = 4 group read against `isa.paged_addr`, a non-paged block slice against `isa.block_addr`, an Engram `SCALE_INLINE` gather (MXFP8, 264 B rows, unaligned table base, a row across a 2 KiB block) against `isa.inline_addr` (Z-4), and the `ILLEGAL_FIELD` cases (unaligned block base, `page_shift` below 32 / `aux0`, `DMA_STAGE` below 2 KiB, a `SCALE_INLINE` TD that is paged or not whole blocks); a converting gather whose scale responses are delayed behind its data (`ni_rsp` must keep sinking); a DQ blocked on a semaphore while another DQ streams; the staging ring against `isa.staging_ring` on mixed split / non-split streams in four DQs, with byte ranges whose entries end mid-granule (index-key rows from row 2 of a page, fold tiles from byte 64: cut reads, Z-1); formal properties that every allocated ring entry needs only tags to complete (W-1) and that no data read waits for the scales of an entry other than its own (every read and every unit in exactly one entry, Z-1); `DMA_PACE` holds the weighted bytes of converting reads in flight (NVFP4 x1, MXFP4 x1/2, MXFP8 x1/4) at min(`DMA_PACE`, 4.5 x the `DMA_STAGE` size), leaves plain reads alone, issues a converting read when none is in flight even with a limit below one request (1 KiB against 2 KiB reads), and counts to 2^17 without wrapping (Z-2, Y-2, Y-6); the RTL's entries without raw slots cover at most one data request, checked on a weight stream and an index-key stream against `isa.staging_ring` with `sizing="rate"` (Y-1); tags and credits (one tag per request, one credit per `RD_RSP`) and the credit-fair turns and ring turns: a KV gather plus a plain stream, two KV gathers plus a plain stream, and NVFP4 weights plus a KV gather in separate DQs each get at least the share in `test_staging_ring_tag_arbitration`, and no request is shrunk (Y-3) |
 | `core/seq` | ISA fetch/decode, queues with captured operands, semaphores (serial-number compare); no scoreboard (isa.md §10); no kernel barrier: a core starts its next kernel when it halts (isa.md §3) | directed + random programs |
-| `core/ni` | network interface: initiator for the DMA, SPM / GSRAM / CORECTL target, write-add ALU, ack coalescing (noc.md §2) | cocotb vs `noc.ack_coalescer` |
+| `core/ni` | network interface: initiator for the DMA, SPM / GSRAM / CORECTL target, write-add ALU, ack coalescing (noc.md §2), tag table, request epoch | cocotb vs `noc.ack_coalescer`; the read-response path against `isa.rd_rsp_layout` (Y-5): one NVFP4 granule cut at byte 128 into two requests of two ring entries, checking both halves' data, `gidx` 0, SPM destinations and element offsets (0 and 256), a 264 B row from byte 8, and responses of one request in any order; a `LINK` `ERR` of the other `NI_EPOCH` is dropped without a fault, one of the current epoch faults (Y-10) |
 | `core/spm` | banked scratchpad, bank-conflict arbitration | formal (no lost/duplicated requests) |
 - Exit: every block has lint-clean code under Verilator `-Wall`, green unit tests and green formal. `TINY` core runs a GEMM program from the assembler.
 
@@ -280,7 +280,9 @@ session checks the fixes next.
     idle, the bridge reports `err_done` and `T_DRAIN` has passed, and no core of the restarted step faults. With `T_DRAIN`
     shortened below the hold, the restarted core faults `LINK`, which shows the wait is needed. A core the CP stopped
     without a fault, with a response in flight, is not restarted before that response has arrived. The recovery time is
-    measured (L-11).
+    measured (L-11). With the epoch (Y-10): the same late `ERR`, held past a shortened `T_DRAIN` (an SPM-port stall on a
+    live converting core during the drain), is dropped by the restarted core because its epoch is the old one; with the
+    epoch compare disabled it faults `LINK`, which shows the bit is what protects the step.
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.
@@ -334,9 +336,17 @@ session checks the fixes next.
   credit per destination. Test programs: a credit semaphore moved between two collectives with 8 consumers (Z-5), a reused
   8-adder ready flag with and without parities, and a shared-parity credit semaphore, which must be flagged (Z-6).
   And the write-after-write rule (hbm.md H-2, W-4 a): two writes of the same HBM bytes are ordered by an ack.
-- **Converting-stream rate** (review finding Z-2): NVFP4 → BF16 weight streams and the paged NVFP4 KV gather against the
-  `isa.staging_ring` table in microarch.md §2.5, with real per-PC queues and other cores' traffic, at the default `DMA_PACE`
-  and with it off. If they fall short of the share, retune the default before the RTL freezes it.
+- **Converting-stream rate** (review findings Z-2, Y-2, Y-4): NVFP4 → BF16, MXFP4 and MXFP8 weight streams and the paged
+  NVFP4 KV gather against the `isa.staging_ring` table in microarch.md §2.5 (single-FIFO results), with real per-PC queues,
+  at the default `DMA_PACE` and with it off:
+  - 8 cores of one stack all on the same converting stream (the fourth verifier's FIFO-per-PC model: KV gather 144 / 132 at
+    L = 500 / 845 against 155 / 154 for one core);
+  - mixed traffic: one converting core and seven cores streaming plain reads (about 50 B/cycle against 92 in the FIFO-per-PC
+    models), and four plus four;
+  - MXFP4 and MXFP8 weights at L = 1,000-1,200 under the weighted pace;
+  - two options to cost if they fall short: a 24 KiB ring for KV-heavy kernels, and byte-weighted fairness per initiator
+    in the HBM scheduler (hbm.md H-9). If either is needed, or the default limit is off, change it before the RTL freezes
+    it.
 
 **Data handling within 16 GB**
 - Binary trace records (about 24 B each), zstd streamed to the SSD. Rough size: one decode layer on one die is about

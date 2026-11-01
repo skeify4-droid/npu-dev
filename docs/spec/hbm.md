@@ -70,8 +70,8 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
 
 | Packet | Controller action |
 |---|---|
-| `RD_REQ` (≤ 2 KiB, one leaf) | Decode the granules. They fall on 8 different PCs of this port. Push one read descriptor (bank, row, column-high, first burst, burst count) into each PC's read queue. The request leaves the input only when every granule has been queued. |
-| `RD_RSP` (to the core) | One per granule, 2 flits, tag + granule index. Sent when all of its bursts are in the read return buffer. Granules of one request return in any order. |
+| `RD_REQ` (≤ 2 KiB, one leaf) | Decode the granules. They fall on 8 different PCs of this port. Push one read descriptor (bank, row, column-high, first burst, burst count) into each PC's read queue: only the bursts the request's byte range touches, so a request that starts or ends inside a granule reads part of it (review finding Y-5). The request leaves the input only when every granule has been queued. |
+| `RD_RSP` (to the core) | One per granule touched, 2 flits, tag + granule index (counted from the granule of the request's first byte). The payload is the granule, aligned; bursts not read are undefined (noc.md §2, partial granules). Sent when all of its bursts are in the read return buffer. Granules of one request return in any order. |
 | `WR` (≤ 256 B, inside one granule) | Write the bursts into a write queue entry (burst mask). It is **posted**: acknowledged once it is in the write queue. |
 | `WR_ACK` (to the core) | Carries the burst id and a **byte count**. Coalesced per (source, burst id): sent when the count reaches the burst total `blen` carried by every `WR`, early with a partial count when the table is full, or after `ACK_FLUSH` idle cycles (see below). |
 | anything else | `ERR`: write-add or max to HBM (`HBM_WADD`), a misaligned write (`HBM_ALIGN`), or an address in reserved HBM. |
@@ -379,3 +379,8 @@ Decisions this evidence supports:
 - PHY training, ZQ calibration and ECS (error check and scrub) intervals: account for them in the perf simulator (Phase 7) as a fixed
   bandwidth tax.
 - Port head-of-line blocking and the 4-port split under real traffic: Phase 7 perf simulator.
+- **Fairness per initiator *(review finding Y-4)*.** FR-FCFS shares a PC in proportion to the bytes queued, so a core with a
+  deep plain backlog takes about twice the share of a converting core whose ring and pace cap its queue (microarch.md §2.5).
+  Phase 7 measures it with 8 cores and mixed traffic. If it matters, the fix is byte-weighted round-robin over initiators
+  in step 2's choice of the oldest entry; plain round-robin per request hurts the KV gather, whose 32 B scale reads would
+  count as whole turns.

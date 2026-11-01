@@ -118,7 +118,7 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     every flit in the replay buffer, and link down is declared only after more than 8 timeout-driven replays (about 576
     cycles). The far side's response may already have come back over another sub-link (noc.md §6), and the tag may have been
     reused, possibly by a request that never used the link. So:
-    - **(a)** an `ERR` (`LINK`) always faults the core, whether or not its tag or burst id is outstanding, and it **frees
+    - **(a)** an `ERR` (`LINK`) of the core's current epoch (f) always faults the core, whether or not its tag or burst id is outstanding, and it **frees
       nothing**: it may name a tag that a newer request now holds. Other `ERR` causes come from the target itself and free
       their tag;
     - **(b)** a response or write ack for a tag or burst id that is not outstanding is dropped (after a fault every response
@@ -140,6 +140,19 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
         that its real response already freed can still be on the mesh when the last tag of a core is freed. Arriving after
         the restart, it would fault the new step by (a), and the recovery would start again. Requests that reach the down
         bridge later get their `ERR` at once, and after condition 1 no core of the step sends any.
+    - **(f) Epoch *(review finding Y-10; taken by the user, 2026-11-01)*.** Every request header carries a 1-bit `epoch`
+      (`noc_header`), which the core copies from its CSR `NI_EPOCH`. The CP toggles `NI_EPOCH` on every core of the step
+      while they are stopped, before it restarts the step. A bridge that answers a request (arriving or in its replay
+      buffer) with `ERR` copies the request's `epoch` into it. A core drops an `ERR` (`LINK`) whose `epoch` differs from its
+      `NI_EPOCH`, without a fault.
+      - So a stale `ERR` cannot fault the restarted step, however long it stays on the mesh. 10 µs was about 16x the
+        estimated worst transit, but that estimate assumed every sink keeps draining, and SPM-port arbitration against the
+        DMA is not bounded in the spec.
+      - One bit suffices: two restarts are separated by conditions 1-3 and a link retrain, and an `ERR` two epochs old would
+        have to outlive all of them.
+      - Conditions 1-3 stay, as a backstop that costs nothing at a failure. Other `ERR` causes come from targets and free their
+        tag (a), and condition 1 waits for them, so only `LINK` needs the epoch.
+      - Cost: one header bit (of the 6 reserved), one CSR bit, a compare in `core/ni`, and a bit copied in the bridge.
     - The data outcome is unchanged: the step restarts, and the CP zeroes the network-facing semaphores at the quiescent
       restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive.
   - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface
@@ -313,7 +326,7 @@ with TP > 2:
 | `noc` | in/out | flit_t (2 planes) | credit per VC | leaf router; arrivals injected into class X |
 | `tx[PORTS*LANES]` | out | 1248 | valid/ready (PHY pacing) | link flits to the PHY |
 | `rx[PORTS*LANES]` | in | 1248 | valid | link flits from the PHY (CRC checked here) |
-| `csr` | in/out | 64 | valid/ready | C2C peer routing table, replay counters, CRC error counters, link state (up / down, cause, and `err_done`: every replay-buffer `ERR` injected after link down, review finding Z-7) |
+| `csr` | in/out | 64 | valid/ready | C2C peer routing table, replay counters, CRC error counters, link state (up / down, cause, and `err_done`: every replay-buffer `ERR` injected after link down, review finding Z-7). An `ERR` the bridge generates carries the request's `epoch` (L-4 (f), review finding Y-10) |
 | `irq` | out | 1 | level | link down |
 
 **Link layer TX/RX (`link/ll_tx`, `link/ll_rx`)**, per lane, inside the bridge:
@@ -366,4 +379,5 @@ with TP > 2:
   its side, including the replay buffer) or `TIMEOUT` (requests the far side had accepted), and the CP still reaches every core
   (X-5, V-7); with only the reverse path failed, cores whose transfers completed may also fault with `LINK`, and no late
   response of the old step is accepted after the restart (W-2); a `LINK` `ERR` held on the mesh past the last tag's release
-  does not fault the restarted step, because the CP waits for every core of the step, `err_done` and `T_DRAIN` (Z-7).
+  does not fault the restarted step, because the CP waits for every core of the step, `err_done` and `T_DRAIN` (Z-7), and
+  one held past `T_DRAIN` is dropped by its epoch (Y-10).
