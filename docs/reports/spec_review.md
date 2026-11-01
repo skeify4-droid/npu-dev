@@ -1574,3 +1574,256 @@ exist yet. Probe scripts and logs (`logs/x7_sweep400*.log`) are not committed.
 5. **X-13.** Coalescing per epoch at the targets, and whether a second failure right after a restart is as rare as the 1-bit epoch assumes.
 6. **X-16.** That no v1 path needs an entry without a scale read (the Engram sibling path, E4M3 / BF16 conversions without scales).
 7. **The `bw_dq` 5%-95% window** and the §2.5 table rebuilt on it.
+
+
+# Verification 6 (scoped, 2026-11-02)
+
+**Who:** a sixth verification session (Opus 5.5). It is not the author, any reviewer, any fix session or any earlier
+verifier. This is a narrow pass over the seven items of "For the next verification pass, check first" in the resolutions of
+the verification 5 fixes, nothing else in depth. No spec, model or test was changed; this section is the only edit (branch
+`spec-verification6` from 5de3572). Findings are numbered from U-1.
+
+**Method.** I read CLAUDE.md, Verification 5 and its resolutions, and the text the rows cite: microarch.md §2.5 (credit-fair
+turns, ring turns, P1-P3, the pace, read requests, the tag-table entry, pieces of a converting response) and §2.6, noc.md §2,
+§4, §5 and §7, hbm.md H-2, d2d_c2c.md L-4, isa.md §3, §5 and §8, memmap.md §6, `isa.yaml` (`noc_header` `epoch` and `gidx`,
+`DMA_PACE`, `DMA_STAGE`, `SCALE_INLINE`), PLAN Phase 3 (`core/dma`, `core/ni`) and Phase 4. Then the references and their
+tests: `isa.staging_ring`, `isa.rd_rsp_layout`, `isa.read_requests`, `noc.gather_read`, `noc.rsp_flits`, `test_isa.py`,
+`test_noc.py`, and `isa/isa.py` at ed2ea70 for item 2.
+
+**Own model.** Before reading `isa.staging_ring` I wrote a cycle model of the arbiter from microarch.md §2.5 alone (scratch,
+not committed; no code in common).
+- What it has:
+  - Per-DQ programs of converting transfers (NVFP4 / MXFP4 / MXFP8 weights, paged NVFP4 KV rows, Engram MXFP8 rows, MXFP4
+    fold tiles from byte 64 with raw slots), plain 2 KiB reads, 256 B write packets, semaphore waits, `SIGNAL`s released
+    when every earlier entry, read and write of the DQ is complete, and front-end gaps.
+  - Entries with HBM byte ranges. Reads are granule pieces cut at 2 KiB blocks, scale reads that cross a 2 KiB block of
+    the scale array are two reads of one entry, and data offsets are random multiples of 32 B, so reads touch partial
+    granules.
+  - A circular ring of 16 B units (contiguous with wrap-skip, in-order reclaim, allocated at the entry's first scale
+    read), 512 tags and 8-512 granule credits, and the pace weighted by format and entry shape, capped at 4.5 x the ring,
+    with a converting read always allowed when none is in flight.
+  - Credit-fair turns: quantum 8, held for credits, held for pace against converting DQs only, a write packet counting
+    one. Ring turns: a queue entered when the entry does not fit or another DQ waits, a quantum of 8 data granules, the
+    pass on idle, `"contended"` taking. Variants: the pass at the quantum or at the end of the stream; `"always"` taking;
+    a 256 B quantum; no ring turn; the plain issue under a pace hold with the holder's credits reserved, or with a cap on
+    plain bytes in flight.
+  - One request per cycle and greedy read-ahead. One response per granule. A sink of max(elements / 256, bytes / 512)
+    cycles per piece. Credits, tags and pace are freed at the sink.
+  - HBM `server` (a FIFO at 87 B/cycle, L/2 out and back, 32 B bursts) and `paced` (an issue budget at 87 B/cycle, each
+    response L after issue).
+- What it shares with the reference: the rule text, the two HBM abstractions, the 87 B/cycle share and the stream shapes
+  of the §2.5 table.
+- What it does not share: the code; my own random-program generator; byte ranges and partial granules on every stream;
+  credits freed at the sink, not on arrival; fold tiles as entries with address-derived raw slots; no `SCALE_INLINE`
+  entries (reserved in v1); no `greedy` / `hold` / `shrink` arbitration.
+- **Window:** per-DQ rates are data bytes per cycle from the latest DQ's 5% mark to the earliest DQ's 95% mark of its own
+  data, the window in which every DQ still receives data (written before I read the reference's `bw_dq`). Single-stream
+  rates are elements/cycle over the same window.
+- Calibration against the §2.5 tables at L = 845 (own model):
+  - NVFP4 weights alone 154.6 / 150.0 / 127.3 elements/cycle at 500 / 845 / 1,000, and the KV gather 154.6 / 153.1 /
+    129.7. The §2.5 table has 155 / 151 / 127 and 155 / 154 / 130.
+  - The rule's row of the arbitration table: 28/55, 19/19/40, 37/37, 40/40, 28/28/28.
+
+**Executable checks** (under `scripts/memrun`):
+- `make pytest`: 230 passed (rc 0, 40.7 s, 79 MB peak).
+- Probe scripts with the project venv (largest: three 400-program sweeps, 50 s each, 19 MB peak).
+- `make numerics`, `make hbm`, `make links`: not rerun; their inputs did not change (as the resolutions state).
+- `make isa`: not rerun; nothing under `isa/` changed here, and `make pytest` includes the staleness test.
+
+## Probes (own model, `isa.staging_ring`, the fix session)
+
+**1. The X-7 targeted case** (2 KiB ring, `hbm="server"`, `DMA_PACE` 72 KiB: DQ0 NVFP4 weights; DQ1 37 KV rows, a wait on F,
+37 more; DQ2 200 KV rows, then a `SIGNAL` of F). Last cycle of progress under the pass at the quantum / at the end of the stream;
+the pass on idle completes everywhere in both models:
+
+| ring, L | own | `isa.staging_ring` | fix session / Verification 5 |
+|---|---|---|---|
+| 2 KiB, 500 | **3,641** / 3,641 | 3,649 / 3,649 | 3,649 / 3,628 |
+| 2 KiB, 300 / 845 | 2,241 / 6,056 (both rules) | 2,249 / 6,064 | hangs (no cycle given) |
+| 4 KiB, 300 / 500 / 845 | 1,648 / 2,648 / 4,373 | 1,685 / 2,685 / 4,410 | hangs |
+| 16 KiB, 300 / 500 / 845 | the quantum hangs at 5,060 / 5,460 / 6,500; the end-of-stream pass completes | 5,404 / 5,804 / 6,849; completes | the same pattern |
+| stream ends 160 B into its turn (no semaphore), 2 / 4 KiB | the quantum hangs; the end-of-stream pass and the pass on idle complete | the same (test) | the same |
+
+`hbm="paced"` gives the same cycles to within one.
+
+**2. Random four-DQ programs with cross-DQ semaphores** (own generator).
+- Setup: 1-5 transfers per DQ in one global order; a wait names a `SIGNAL` of an earlier transfer of another DQ, so each
+  program is deadlock-free by itself. Gaps of 1-1,000 cycles. Rings of 2-16 KiB, L = 50-845, 8 / 9 / 16 / 24 / 64 / 512
+  credits, `DMA_PACE` off / 1 / 8 / 16 / 72 KiB, paced or server.
+- Deadlocks under the pass at the quantum / at the end of the stream / on idle:
+
+| sweep | own | fix session | Verification 5 |
+|---|---|---|---|
+| 400 programs, no writes | 261 / 126 / **0** | 182 / 59 / 0 | 332 / 119 / 0 |
+| 400 programs with write transfers | 237 / 89 / **0** | 169 / 46 / 0 | – |
+| 400 with writes, `ring_take="always"` | – / – / **0** | – | – |
+
+In the rule's runs the issue turn was held (for credits or pace) while a different DQ headed the ring queue for 271,700 cycles
+(no writes) and 164,120 cycles (writes), so the case the item asks about occurs often.
+
+**3. A targeted grid against the rule** (four DQs: MXFP4 fold tiles from byte 64 then NVFP4 weights; NVFP4 weights with scale
+reads across a 2 KiB block, a wait, KV rows; plain reads, writes and a wait; KV rows, MXFP8 weights and writes; gaps and two
+cross-DQ semaphores). Rings 2 / 4 KiB, 8 / 9 / 16 / 24 credits, `DMA_PACE` off / 1 / 4 / 72 KiB, L = 50 / 300 / 845, paced and
+server: 192 runs, **0 deadlocks**. In 185,574 of the 6.8 M cycles the issue turn was held while another DQ headed the ring queue.
+
+**4. `ring_take` when contention starts** (own model, L = 845). One DQ streams for 5,000 cycles, then a second starts. Pairs:
+KV → NVFP4, NVFP4 → KV, Engram → NVFP4, NVFP4 → MXFP8 and MXFP8 → NVFP4, at 2, 4 and 16 KiB rings.
+- `"contended"` and `"always"` give identical shares (for example 37.2 / 37.2 at 16 KiB and 4.7 / 4.7 at 2 KiB for KV and
+  NVFP4).
+- The late DQ's first allocation comes 30-280 cycles after its start under both.
+
+**5. The plain issue under a pace hold** (X-8; `hbm="server"`, `DMA_PACE` 16 KiB, data B/cycle):
+
+| case | own | `isa.staging_ring` | fix session |
+|---|---|---|---|
+| NVFP4 weights alone, L = 845 / 1,200 | 16.5 / 11.7 | 16.5 / 11.7 | about 17 |
+| weights + plain, the rule, 845 | **9.5 / 76.3** | 9.5 / 76.4 | 9.6 / 76.2 |
+| weights + plain, held against all, 845 | 16.5 / 16.5 | 16.6 / 16.6 | 16.5 / 16.5 |
+| KV alone, 845 / 1,200 | 17.1 / 12.0 | 17.0 / 12.0 | – |
+| KV + plain, the rule, 845 | **10.7 / 74.9** | 10.7 / 74.9 | 10.7 / 74.9 |
+| KV + plain, held against all, 845 | 17.0 / 34.0 | 17.0 / 34.0 | 17.0 / 34.0 |
+| weights + plain / KV + plain, the rule, 1,200 | 9.5 / 76.3, 10.7 / 74.9 | 9.5 / 76.4, 10.7 / 74.9 | – |
+| default `DMA_PACE`, either hold | 40.9 / 41.0, 27.6 / 55.1 | 41 / 41, 28 / 56 | identical |
+| 2 KiB ring (cap 9 KiB), either hold | 5.4 / 80.9, 5.7 / 80.5 | – | plain 81 either way |
+
+- **The old reference's 14 / 38** (`isa/isa.py` at ed2ea70, run unchanged): 14.2 / 38.2 and 13.8 / 36.9 at 845, 11.2 / 30.1 at
+  1,200.
+  - The cause is as the fix session says. A plain entry (`need` = 0) calls `_allocated(d, 0)`, which makes its DQ the ring
+    owner. `_ring_release` is evaluated only for the DQs in `order`, which is `[hold]` while another DQ holds the issue
+    turn, so the converting holder cannot read scales ahead.
+  - With one line added (`_allocated` returns at once when n = 0), the same code gives 16.6 / 16.6 and 17.0 / 34.1, which
+    matches my model and the current reference. That line accounts for the whole difference.
+- **Can the plain DQ take credits the paced holder then waits for?** Yes. "Has its credits" reserves nothing, so a plain
+  read issued under the hold can leave the holder short, and the holder then holds for credits.
+  - It costs anything only when credits are scarce. At 9 credits with `DMA_PACE` 1-2 KiB the weights get 0.8 B/cycle
+    against 1.2 with the holder's credits reserved, and the plain DQ 1.6 against 1.2. At 24 credits and a 1-2 KiB pace the
+    plain DQ gets 4.8 against 2.4. At 512 credits: 9.5 / 76.3 against 9.7 / 76.1.
+  - Liveness is unaffected. The holder waits at most about 2R: in-flight converting reads return, and then the pace allows
+    one read anyway.
+- **A bound on the trade?** I capped the bytes of plain reads issued outside the turn (own model, weights + plain / KV + plain):
+
+| cap | L = 500 | L = 845 | L = 1,200 |
+|---|---|---|---|
+| none (the rule) | 9.5 / 76.3 | 9.5 / 76.3 | 9.5 / 76.3 |
+| 96 KiB | 10.9 / 74.7 | 10.9 / 74.7 | 10.9 / 74.7 |
+| 72 KiB | 13.9 / 71.4 | 13.9 / 71.4 | 11.7 / **60.2** |
+| 48 KiB | 19.1 / 65.5 | 16.5 / 56.5 | 11.7 / **40.2** |
+
+  The total stays at 85-86 B/cycle as long as the cap is at least the share times L. A cap only moves bytes from the plain DQ
+  to the paced one, which can never exceed its rate alone (16.5 / 11.7). At long round trips a cap costs the plain DQ more
+  than it gives. No bound is needed (item 2 verdict).
+
+**6. The §2.5 arbitration table rebuilt** (`isa.staging_ring`, `hbm="server"`, 72 KiB, the 5%-95% window; data B/cycle for
+KV + plain | two KV + plain | NVFP4 + KV | NVFP4 + MXFP8 | NVFP4 + MXFP8 + plain):
+
+| row, L = 845 | `isa.staging_ring` | own model | §2.5 |
+|---|---|---|---|
+| `greedy` | 73/5, 37/37/2, 37/37, 40/40, 28/28/28 | – | identical |
+| `hold` | 1/85, 5/5/76, 38/37, 40/40, 21/21/42 | – | identical |
+| `shrink` | 28/56, 20/20/41, 37/37, 40/40, 26/27/30 | – | identical |
+| **the rule** | 28/56, 19/19/40, 37/37, 40/40, 28/28/28 | 28/55, 19/19/40, 37/37, 40/40, 28/28/28 | identical |
+| no ring turn | 28/56, 19/19/41, 2/74, 2/82, 6/39/40 | 28/55, 22/13/46, **24/52**, 3/82, 5/40/40 | identical |
+| byte quantum | 28/56, 19/19/40, 37/37, 17/66, 9/38/38 | 28/55, 19/19/40, 37/37, 17/66, 9/38/38 | identical |
+
+At L = 500 the reference gives the rule's 28/56, 20/20/42, 39/38, 40/40, 28/28/28, which matches the §2.5 sentence, and my model
+gives 28/56, 20/20/42, 39/39, 40/40, 28/28/28. The "no ring turn" starvation of NVFP4 + KV depends on timing (my 24/52 against
+the reference's 2/74), as Verification 5 found. Nothing else differs by more than 1 B/cycle.
+
+**7. Converting responses rebuilt from the text** (item 3).
+- I wrote the NI as §2.5 describes it. Per tag it has the unit size, the first byte's offset in its unit and that unit's
+  raw-slot index. It cuts at unit boundaries, takes "every boundary splits a unit or none does", and sets slot = the index
+  plus the boundaries crossed.
+- I compared it with `rd_rsp_layout(unit=)` on 3,000 random entries of 16-256 B power-of-two units, cut into requests at 2 KiB
+  blocks and at random unit boundaries (5,401 requests):
+  - Counting the granule boundaries from the first unit's start up to the piece's unit start: **0 mismatches**.
+  - Counting the boundaries the piece itself has crossed (the literal "number of boundaries crossed"): **3,156
+    mismatches**, on every tail of a split unit and on requests that start past a unit's split point.
+- Unpadded MXFP4 fold rows (U-1), K = 384, `s1` = 192: each row is a 128 B tile and a 64 B short tile.
+  - Over one 2 KiB request, the granule boundaries at 256, 1,024 and 1,792 split a tile, and those at 512, 768, 1,280 and
+    1,536 fall between units.
+  - The text's NI (one unit size of 128 B) gives 16 pieces against the true 24, and it is wrong from byte 128 on.
+  - `rd_rsp_layout(unit=)` cannot express this layout either: it takes one size per entry.
+
+**8. Gather flits** (item 4, by hand from the noc.md §5 inputs). Each core gathers 87 / 288 = 0.302 rows/cycle; 8 cores spread over 4
+leaves and 2 planes of 128 B.
+- KV gather: 3 RSP flits per row → 0.906 (2-flit: 1.21; at the full share 1.06).
+- Engram: 87 / 264 rows → 0.99 (at the full share 1.16).
+- REQ: 2 flits per row → 0.60.
+These agree with `noc.scenarios()` and `test_gather_leaf_load`.
+
+## Verdicts on the seven items
+
+| # | Item | Verdict | Notes |
+|---|---|---|---|
+| 1 | Ring turn's pass (X-7) | **holds, with a note** | No cycle in 800 random programs, 192 targeted runs (8-24 credits, 1-4 KiB pace, writes, gaps, raw slots, scale reads across 2 KiB blocks) and 400 more under `"always"` taking, with the asked-for overlap (issue turn held while another DQ heads the ring queue) in 436 k sweep cycles and 186 k grid cycles. The targeted hang reproduces at 3,641 (reference 3,649, Verification 5 3,628). Keeping the turn through credit, pace and issue-turn waits is safe: each of these ends without the ring (credits and pace by responses within R, the issue turn by rotation), and no other DQ can allocate meanwhile, so the holder's space stays free once it appears. `"contended"` is fair when contention starts (probe 4): the DQ that does not fit takes the turn first, and every share equals `"always"`. P1-P3 are provable, with two wording points (note N-1). |
+| 2 | Plain issue under a pace hold (X-8) | **holds, with a note** | 9.5 / 76.3 and 10.7 / 74.9 reproduce, as does the drop from 16.5 / 17.1 to 9.5 / 10.7. The old 14 / 38 came only from `_allocated(d, 0)` (probe 5). The plain DQ can take credits the holder then waits for, which matters only at ≤ 24 credits. The trade is right: a cap on plain bytes moves the split, not the total (85-86), and costs the plain DQ at long L. No bound (N-2). |
+| 3 | Tag-table fields (X-12) | **finding (U-1), and a note** | For uniform power-of-two units of ≤ 256 B, the text is correct when the count is read precisely, and it agrees with the reference on 5,401 requests. "Every v1 unit that can be split is such a unit" is wrong for a row that is not a whole number of tiles. The fold's short last tile (numerics.md: "the last tile may be shorter"; §2.5: "the last tile of a row is short") gives a request units of two sizes, and a short tile of K mod 256 = 32j elements is 16j B (48 B at K = 352), not always a power of two (U-1). The precise count and the 95-bit estimate are N-3 and N-4. |
+| 4 | 1-flit `RD_RSP` (X-9) | **holds, with a note** | Both ends compute the half from the same (`addr`, `len`), the target from the request and the NI from its tag entry. `ni_rsp`'s 4-flit buffer holds 2-4 responses. noc.md §4 is unaffected: virtual cut-through allocates whole packets (≤ 2 flits), so packet length is not in the dependency graph, and `build_cdg` has no lengths. The loads reproduce (probe 8). No new limit is needed (N-5). |
+| 5 | Epoch on responses (X-13) | **holds, with a finding (U-3)** | Coalescing per (initiator, burst id, epoch): an old-epoch entry that a late packet reopens after the restart is flushed after `ACK_FLUSH` or evicted, and its ack is dropped at the core. It never counts toward a reused burst id. One bit is enough unless a link fails again right after a restart. A packet would then have to outlive both restarts' conditions 1-3 (two `T_DRAIN`s) and the 100 µs timeout, and L-4 (f) now says so. Restarting every step with a faulted core is sound: each toggles its own cores, and the epoch is per initiator, so cross-step traffic keeps its own. Not covered: a late *request* (U-3). |
+| 6 | `SCALE_INLINE` reserved (X-16) | **holds for block formats; finding (U-2)** | Every block-format path has a scale read: the Engram sibling path (an SPM-to-SPM conversion with `scale_reg` on the staged 8 B scale rows), fold tiles, KV and index-key gathers. E4M3 / E5M2 → BF16 has 1 B elements and never splits. BF16 → FP32 and FP32 → BF16 have no element-alignment rule on the global side, so an element can span two granules, a split unit without a scale read (U-2). |
+| 7 | `bw_dq` window | **holds** | The code is the 5% / 95% marks of each DQ's own data with snapshots of all DQs, `None` when empty or when a DQ has no data. The §2.5 table rebuilt on it matches every cell at 845 and the L = 500 sentence (probe 6). My model, written with the same window before I read the code, agrees on the rule's row within 1 B/cycle. |
+
+**Notes** (no failure scenario of their own):
+- **N-1 (P1-P3).**
+  - P1 is a one-cycle safety property on predicates the RTL has (the enumerated pass list). Proving it on the list, not on
+    "any reason other than", is what Phase 3 should do.
+  - P2 as worded is false when the plain request lacks credits ("a ready plain request ... still issues", where readiness
+    excludes credits). Write "a ready plain request of another DQ whose credits and tag are free issues (one per cycle)".
+  - P1 + P3 + the W-1 property imply that a ring-queue head allocates, but the X-7 failure was exactly that it never did.
+    Prove it directly as (P4): a DQ at the head of the allocation queue allocates, or leaves the queue, within a bound in R,
+    the ring size and the quanta.
+  - All four fit the reduced configuration in PLAN.
+- **N-2 (X-8).** §2.5 gives 10 / 76 but not the paced stream's 17 alone. A sentence would make the trade explicit: the paced
+  stream drops to about 10 because the plain DQ's queue lengthens its round trip, and a cap moves bytes without adding any.
+- **N-3 (slot count).** "The count is the number of boundaries crossed" should read "the number of granule boundaries from
+  the first unit's start (the request's first byte minus its element offset) up to the piece's unit start". For a non-split
+  first unit, "that unit's raw-slot index" should be defined as the entry's split units before it. The PLAN `core/ni` test
+  should add a request that starts past a tile's split point (a 2 KiB cut inside a split tile).
+- **N-4 (95 bits).** About 95-101 bits with 22-bit SPM addresses and **10-bit ring offsets**, which means a ring of at most 16
+  KiB. `DMA_STAGE`'s size field ([53:32]) admits up to 4 MiB (18-bit offsets, about 117 bits), and Phase 7 costs 24-32 KiB
+  rings. State the largest ring the RTL supports and fault `DMA_STAGE` above it.
+- **N-5 (gather loads).** At the full share the KV gather would need 1.06 and Engram 1.16 of the leaf links. Every DMA model
+  already limits both gathers to about 0.85 of the share (tag-bound, with the core's 87 B/cycle), so the DMA binds before
+  the mesh. No new limit is needed beyond the §5 rows.
+
+## Verification 6 findings
+
+| # | Sev | From | Finding | Failure scenario | Suggested resolution |
+|---|---|---|---|---|---|
+| U-1 | L | X-12, item 3 | **A request of fold tiles can hold units of two sizes, which one unit size per tag cannot describe.** The fold's last tile of a row is short (numerics.md N-2; §2.5 "the last tile of a row is short"). §2.5 calls a layout that is not padded "legal", converting at the ring-limited rate. When rows are contiguous in HBM and in the output, one request spans rows (`isa.read_requests` merges them), and its units alternate 128 B and 64 B. Granule boundaries then split some units and not others, the opposite of "either every boundary inside the request splits a unit or none does". A short tile need not be a power of two (48 B at K = 352), and it can itself be split. `rd_rsp_layout(unit=)` has one size per entry, so the reference does not cover the case. Even a per-row request (padded pitch) has two unit sizes; it works only if the NI ends the last unit at the request's end, which the text does not say. | MXFP4 → E4M3 fold, K = 384, `s1` = 192, output rows contiguous. One request [0, 2 KiB) spans rows 0-10. The tiles at rows 1, 5 and 9 are split (boundaries 256, 1,024 and 1,792), and the boundaries at 512, 768, 1,280 and 1,536 fall between units. An NI built from the text (unit size 128, first offset 0) cuts at the wrong places from byte 128 on and treats every unit as whole. Row 0's short tile and row 1's tile head go to the converter as one 128 B tile, and the split tiles' halves never reach a raw slot. The result is silently wrong E4M3 weights, or a raw slot that never completes and stalls in-order reclaim. No surveyed model has such a layout (every K is a multiple of 256, and the compiler pads). | **The user's choice.** (a) Keep unpadded layouts legal. The DMA cuts a converting request where the unit size changes (at a row's short last tile, or at the row end), the text states that a request's last unit may be short (it ends at the request's end), and raw slots use the full tile pitch. Add the K = 384 / `s1` = 192 case to `rd_rsp_layout` and the PLAN `core/ni` test. (b) Make split fold tiles illegal in v1, as X-16 did for `SCALE_INLINE`: a fold-converted TD whose tiles can cross a 256 B granule faults `ILLEGAL_FIELD` (the compiler already pads, and memmap.md §6 already says a fold-converted slice starts on a tile). v1 then has no split units at all, so raw slots, response pieces and the unit size and slot index in the tag table leave the v1 `core/dma` and `core/ni` scope, and the reference keeps them for later. I lean to (b): it costs no surveyed model anything and removes the least-exercised path from both blocks. |
+| U-2 | L | X-16, item 6 | **A non-block conversion of 2 or 4 B elements has no alignment rule, so an element can span two granules with no scale read to stage it.** W-5 aligns block formats. BF16 → FP32 and FP32 → BF16 (cvt 9, 10) have no rule that the global base and strides are multiples of the element size, and HBM reads have no alignment requirement. In v1 every ring entry has a scale read (X-16), so the DMA has nowhere to stage half an element. "A response never waits for another" (V-1) forbids holding it in the converter. | `DMA_COPY` GLOBAL → SPM, cvt `BF16_FP32`, source base 0x…0FF, n0 = 1,024. Element 0 is bytes 0xFF-0x100: one byte in the `gidx` 0 response and one in `gidx` 1, or in two requests if the boundary is a 2 KiB block. The converter either waits for the second response (V-1's cycle) or converts a half element, silently. The same applies to FP32 → BF16 at an address ≡ 2 mod 4. | Add to isa.md §5 / `isa.yaml` `DMA_COPY` / `DMA_GATHER`: a converting TD whose source elements are 2 or 4 B has its global base, `s1`-`s3` and a gather's row bytes as multiples of the element size, else `ILLEGAL_FIELD`. Add it to the PLAN `ILLEGAL_FIELD` cases. One sentence; no reference change. |
+| U-3 | L | X-13, item 5 | **The epoch filters responses, acks and `ERR`s, not late requests of the old step.** Targets copy `epoch` but execute every `WR` and `SEM` they accept. A write of the step before a restart that arrives after it lands in SPM and adds its bytes to its `rsem` semaphore, which the CP zeroed at the restart. L-4 (f)'s "whatever its age" is correctly limited to `ERR`s, responses and acks, but (d) and §8 do not say that requests still rest on the time argument. | A `WR` with `rsem` of step N is held past the initiator's 100 µs timeout and `T_DRAIN`, for example behind a stalled SPM port, the premise Y-10 and X-13 (b) were fixed for. It lands after the restart: its bytes add to the semaphore a consumer of the restarted step waits on, and the consumer reads a buffer the new step has not finished writing. | State in L-4 (f) and isa.md §8 that a late request of the old step is kept out only by conditions 1-3 and the timeout, as two restarts in a row are, and add a `WR` with `rsem` held past `T_DRAIN` to the Phase 4 late-packet test. Optional (**a real choice**, not recommended now): SPM and CORECTL targets drop a `WR` or `SEM` whose `epoch` differs from their own core's `NI_EPOCH`. That holds only if no core writes into another step's cores, and the CP's own accesses would need an exemption. |
+
+**Outside the seven items** (one line each, not investigated):
+- memmap.md §6 says "a fold-converted slice on a 256-element tile" as if it were a rule, while microarch.md §2.5 lists "a K
+  slice that does not start on one" as a legal source of split tiles. An RTL engineer who reads memmap faults a TD the
+  reference converts. This is settled by U-1 (b), or by deleting the memmap clause under (a).
+
+## Phase 3 impact
+
+- **`core/dma` read-issue arbiter: RTL may continue as planned.**
+  - Items 1, 2 and 7 hold. The pass on idle, turns under contention, the granule quantum, the hold for pace against
+    converting DQs only and the write packet's credit reproduce in an independent model.
+  - N-1 (P2's wording, and P4 as a direct allocation-liveness property) and N-2 go into Phase 3 as formal-property and text
+    issues, without another fix session.
+- **`core/dma` request former and raw-slot path, and the `core/ni` response pieces: wait for U-1.** It is the user's choice,
+  and it decides whether split units exist in v1:
+  - (b) removes raw slots, pieces and two tag-table fields from both blocks;
+  - (a) adds a request cut and a "last unit may be short" sentence.
+  Either is a short text change with a reference test, not a full fix session. Until then, build the parts U-1 does not
+  touch.
+- **`core/ni` otherwise: may continue.** The 1-flit half-select, the epoch compare and drop, the tag table's destination,
+  range, mask and epoch, and ack coalescing per (initiator, burst id, epoch) hold (items 4 and 5). N-3 and N-4 are RTL
+  issues: the precise slot count if (a) is taken, and the ring-offset width with a `DMA_STAGE` maximum.
+- **U-2:** one `ILLEGAL_FIELD` sentence for the `core/dma` TD checks. It can go in with U-1's text, or into Phase 3 as an RTL
+  check with the sentence added to isa.md then.
+- **U-3:** no Phase 3 impact. It is Phase 4 text and a test.
+
+**Not checked:**
+- anything outside the seven items beyond the one line above, including X-10, X-11 and X-14 except as they appear in probes
+  5 and 6;
+- per-PC HBM (Y-4), the mesh beyond probe 8's hand count, and SPM-port arbitration;
+- the reference's `greedy`, `hold` and `shrink` modes in my model (I took them from the reference only);
+- the generated SV and C++, `make isa`, and `make numerics` / `hbm` / `links`, whose inputs are unchanged;
+- the Phase 4 epoch and late-packet tests, which do not exist yet (item 5 and U-3 are argued, not run);
+- U-1 (a)'s request cut, which I did not build.
