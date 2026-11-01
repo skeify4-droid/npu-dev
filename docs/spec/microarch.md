@@ -219,7 +219,13 @@ isa.md §5) a cheap multiply at the ACC input.
     - **When the pace binds *(X-8)*.** `DMA_PACE` 16 KiB at L = 845, data B/cycle: NVFP4 weights + plain 2 KiB reads 10
       / 76 under the rule, 17 / 17 with the turn held for the pace against every DQ (the text before X-8; the fifth
       verifier's own model 17 / 17), 9 / 76 under "greedy"; KV gather + plain 11 / 75, 17 / 34 and 11 / 75. At the
-      default `DMA_PACE` the two holds give identical shares. The reference before X-8 showed a weaker coupling (14 / 38)
+      default `DMA_PACE` the two holds give identical shares.
+      - **The trade *(review N-2)*.** The paced stream alone gets about 17 B/cycle (NVFP4 weights 16.6, KV gather 17.0;
+        12 at L = 1,200). Next to the plain DQ it drops to about 10 (9.6 / 10.7), because the plain DQ's queue lengthens
+        its round trip, while the two together go from 17 + 17 to 86. The pace is a deliberate throttle, and the plain
+        DQ is limited by tags only. A cap on the plain DQ's bytes in flight only moves bytes between the two (the total
+        stays 85-86, and the paced stream can never exceed its rate alone) and costs the plain DQ more than it gives at
+        long round trips (the sixth verifier's model: a 48 KiB cap gives 11.7 / 40.2 at L = 1,200), so there is none. The reference before X-8 showed a weaker coupling (14 / 38)
       because a plain DQ starting a plain read took the ring turn with 0 bytes and kept the converting DQ from reading
       scales ahead; plain reads take no ring turn.
   - So a DQ whose head waits on a semaphore holds nothing another DQ needs (with the ring turn's pass on idle, X-7). A
@@ -227,14 +233,24 @@ isa.md §5) a cheap multiply at the ACC input.
     (review finding W-6). Neither waits on another DQ: every ring entry, once allocated, needs only tags to complete
     (below). d2d_c2c.md L-7 issue rule 2 relies on this.
   - **Liveness, as Phase 3 proves it *(X-7)*.** Under an environment that returns every granule within R cycles:
-    - (P1) a ring-turn holder, or the head of the allocation queue, that cannot start an entry for a reason other than
-      ring space, credits, pace or the issue turn releases the turn (or leaves the queue) the next cycle;
+    - (P1) a ring-turn holder, or the head of the allocation queue, that cannot start an entry for one of the listed
+      reasons (its transfers have no entry left and its next instruction or `DMA_LIST` entry is not at the head, a
+      semaphore wait, a `SIGNAL` waiting for its release, or a plain read or write next) releases the turn (or
+      leaves the queue) the next cycle. Phase 3 proves it on that list, the predicates the RTL has, not on "any reason
+      other than ring space, credits, pace or the issue turn" *(review N-1)*;
     - (P2) the issue turn is held only while the holder's next request lacks credits or pace, and while it lacks only
-      pace, a ready plain request of another DQ still issues;
-    - (P3) a DQ with a ready read, or a write packet, issues within a bound in R, the turn quantum and the number of DQs.
+      pace, a ready plain request of another DQ whose own resources are free (a tag and its credits for a plain read, a
+      burst id for a write packet) issues, one request per cycle *(N-1: "still issues" was false for a plain read that
+      lacks credits)*;
+    - (P3) a DQ with a ready read, or a write packet, issues within a bound in R, the turn quantum and the number of DQs;
+    - (P4) a DQ at the head of the allocation queue allocates, or leaves the queue, within a bound in R, the ring size
+      and the quanta *(N-1)*. P1, P3 and the W-1 property imply it, but the X-7 hang was exactly a head that never
+      allocated, so Phase 3 proves it directly.
     - The argument: a held issue turn waits only for credits or pace, which responses free; a ring-queue head waits only
       for space, which allocated entries free, since their reads need only credits, pace and issue turns, which rotate;
-      an empty ring takes any entry ≤ the ring (the allocator restarts at 0).
+      an empty ring takes any entry ≤ the ring (the allocator restarts at 0). For P4: while a head waits, no other DQ
+      allocates, so the entries in the ring are a fixed set that P3 drains within its bound per data request plus R and
+      the conversion, and then the head's entry fits; a head that becomes idle leaves the queue by P1.
 - **Tags and granule credits *(review finding Y-3; option chosen by the user, 2026-11-01)*.** A read request takes one **tag**
   and one **granule credit** per 256 B granule it touches, which is one per `RD_RSP` it receives (noc.md §2). There are 512
   of each, so the DMA keeps up to 512 granules (128 KiB) in flight, about 2x the core's HBM share (102 B/cycle) times a typical
@@ -442,7 +458,7 @@ isa.md §5) a cheap multiply at the ACC input.
       programs with cross-DQ semaphore waits and writes; they always complete. The shared-granule reading deadlocks with
       four DQs, and the ring turn without its pass on idle deadlocks with a semaphore wait inside a turn. Phase 3 adds
       `core/dma` formal properties: every allocated ring entry needs only tags to complete, no data read waits for the
-      scales of an entry other than its own, and the arbiter's P1-P3 (above).
+      scales of an entry other than its own, and the arbiter's P1-P4 (above).
     - Rejected: taking the raw slot at the unit's first data read (the text before W-1). Read-ahead fills the ring with
       scales whose data can never get a raw slot: the all-split fold stream below deadlocks at cycle 687 (`test_isa.py`).
     - Rejected: capping read-ahead so that the largest raw slot still fits. In a ring it deadlocks too, because a raw slot
