@@ -456,6 +456,30 @@ def test_staging_ring_rejected_rules_deadlock(rule, name):
         assert r["deadlock"] == 687
 
 
+def test_staging_ring_delivery_limited():
+    """Z-2: with the HBM share as a FIFO server (the core's backlog adds to the round trip) and greedy issue up to 512 tags,
+    the paced rates do not hold: the weight stream becomes ring-bound and the paged NVFP4 KV gather (32 B scale read + 256 B
+    row) tag-bound, about 29% short at an 845-cycle round trip (the third verifier, per-granule requests: 130 / 110 / 103).
+    DMA_PACE (72 KiB of converting reads in flight) gives the paced rates back. A larger ring alone fixes only the weights.
+    Plain reads are not paced, so a plain stream keeps the full share at 1,000 cycles."""
+    need = 87 / (0.5 + 1 / 16)
+    w, kv, plain = [_nvfp4_bf16(1500)], [[(32, 0, 1, 256, 512)] * 9000], [[(0, 0, 8, 2048, 2048)] * 1500]
+    srv = dict(hbm="server")
+    pace = dict(hbm="server", inflight=I.PACE_DEFAULT)
+    for rt in (500, 845):
+        assert I.staging_ring(w, rt=rt, **srv)["rate"] < 0.93 * need
+        assert I.staging_ring(kv, rt=rt, **srv)["rate"] < 0.9 * need
+        assert I.staging_ring(w, rt=rt, **pace)["rate"] >= 0.96 * need
+        assert I.staging_ring(kv, rt=rt, **pace)["rate"] >= 0.98 * need
+        assert I.staging_ring(w, rt=rt, ring=24576, **srv)["rate"] >= 0.99 * need          # a larger ring: weights only
+        assert I.staging_ring(kv, rt=rt, ring=32768, **srv)["rate"] < 0.9 * need
+    assert I.staging_ring(w, rt=845, **srv)["rate"] < 0.8 * need
+    assert I.staging_ring(kv, rt=845, **srv)["rate"] < 0.75 * need
+    for rt, theirs in ((500, 129.6), (845, 110.3), (1000, 103.4)):                         # the verifier's per-granule model
+        assert abs(I.staging_ring(w, rt=rt, max_req=1, **srv)["rate"] - theirs) < 0.03 * theirs
+    assert I.staging_ring(plain, rt=1000, **pace)["bw"] >= 0.98 * 87
+
+
 # Entries with HBM byte ranges (review Z-1). Each DQ streams from its own 1 GiB region.
 def _index_key(ring, n=60, base=0, first=2):
     """DeepSeek MXFP4 index-key rows (64 B, 4 B of scales each) from row `first` of a page, one scale read per entry of up

@@ -213,7 +213,8 @@ Rules:
   - Scales of a paged operand live in the same page as its rows (memmap.md §6), so one page-table entry translates both.
 - **Width of the inbound path** (review findings I-3, V-1): the converter produces 256 elements per cycle and the DMA writes SPM at
   512 B/cycle, shared with the block scales it stages before the data, so the exact NVFP4 → BF16 path carries 1.60x a core's HBM
-  share (numerics.md D1).
+  share (numerics.md D1). Converting reads are paced: at most CSR `DMA_PACE` bytes (reset 72 KiB) of them are in flight, so
+  a converting stream's scale reads do not queue behind its own data (microarch.md §2.5, review finding Z-2).
 - **Scales before data** (review findings V-1, W-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the
   data that uses them, and a conversion unit that spans several responses is staged raw there. A unit's raw slot is taken
   with its scales, when the scale read is issued, so a started entry never waits for ring space. Every data read and every

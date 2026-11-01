@@ -158,6 +158,12 @@ isa.md §5) a cheap multiply at the ACC input.
     every ring entry, once allocated, needs only tags to complete (below). d2d_c2c.md L-7 issue rule 2 relies on this.
 - It keeps up to 512 read granules (256 B) in flight, 128 KiB. That is about 2x the core's HBM share (102 B/cycle) times a typical
   500-cycle loaded round trip.
+  - **Converting reads are paced *(review finding Z-2; option chosen by the user, 2026-11-01)*.** At most `DMA_PACE` bytes
+    (CSR, reset 72 KiB) of converting reads are in flight: the scale and data reads of block-format transfers, counted at
+    issue and returned by their responses (a 17-bit counter and a compare; 0 turns the limit off). Plain reads are limited
+    by tags only. Reads beyond the share times the round trip add nothing to the delivered rate; they only wait in the HBM
+    queue, where a converting stream's scale reads would wait behind its own data and every ring entry and tag would be
+    held longer (staging ring, below).
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
   and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
@@ -236,6 +242,36 @@ isa.md §5) a cheap multiply at the ACC input.
     round trips. 16 KiB holds 1,024 cycles of NVFP4 scales at the converter's rate (16 B/cycle). At the HBM share (87 B/cycle,
     155 elements/cycle of NVFP4 → BF16) it keeps the full rate up to a round trip of about 845 cycles (`isa.staging_ring`:
     154.7 at 500, 152.9 at 845, 127 at 1,000), and 8 KiB does not (76 at 845). A smaller ring only lowers the rate.
+    - **These rates need the pacing *(review finding Z-2)*.** They come from the paced model (`hbm="paced"`: every
+      response exactly one round trip after its issue). With the share modelled as a queue (`hbm="server"`: requests reach
+      a FIFO served at 87 B/cycle, so the core's own backlog adds to the round trip) and greedy issue up to 512 tags, the
+      weight stream runs at 142 / 119 / 111 elements/cycle at 500 / 845 / 1,000 cycles, and the paged NVFP4 KV gather (one
+      entry per row: a 32 B scale read, then the 256 B row) at 136 / 111 / 104. The third verifier's model, with
+      per-granule requests, had 130 / 110 / 103 and 135 / 111; `max_req=1` gives 128 / 109 / 102. The backlog lengthens
+      both round trips of every entry, so the weight stream becomes ring-bound. It also lengthens every tag's hold time,
+      and the KV gather spends one tag per 32 B scale read, so it becomes tag-bound, and a larger ring does not help it.
+    - **With `DMA_PACE` at 72 KiB** (about the share times the 845 cycles the ring covers) the queue model gives the paced
+      rates back:
+
+      | elements/cycle at L = 500 / 700 / 845 / 1,000 | weights (NVFP4 → BF16) | paged NVFP4 KV gather |
+      |---|---|---|
+      | paced bound (16 KiB) | 155 / 155 / 153 / 129 | 155 / 155 / 155 / 130 |
+      | queue, tags only (16 KiB) | 142 / 128 / 119 / 111 | 136 / 118 / 111 / 104 |
+      | queue, `DMA_PACE` 72 KiB (the rule) | 155 / 155 / 150 / 127 | 155 / 155 / 154 / 130 |
+      | queue, 24 or 32 KiB ring, tags only | 155 / 155 / 155 / 155 | 136 / 118 / 110 / 103 |
+      | queue, 24 KiB + 72 KiB | 155 / 155 / 152 / 130 | 155 / 155 / 154 / 130 |
+      | queue, 32 KiB + 80 KiB | 155 / 155 / 155 / 145 | 155 / 155 / 146 / 130 |
+
+      Above about 845 cycles the ring (weights) and the tags (KV gather) bind in every model. The limit is fairly sharp: 64
+      KiB gives 138 / 137 at 845, 80 KiB 144 / 146. A runtime that sets a larger ring scales it, to about the share x ring /
+      (2 x the stream's scale bytes per cycle).
+    - Options costed for Z-2: the limit (taken: a counter, a compare and a CSR; the ring stays 16 KiB); a larger ring alone
+      (8-16 KiB more SPM reserved per core, no hardware, but the KV gather stays 29% short at 845 cycles); both (no better
+      for the KV gather, and 24 KiB gains the weights only 2-3 elements/cycle). Rejected: limiting all reads, which would
+      cut a plain stream to 72 B/cycle at a 1,000-cycle round trip; a tag cap, which the third verifier found helps the
+      weight stream and hurts the KV gather.
+    - The queue model serves one core's requests in issue order. Real HBM has per-PC queues and other cores' traffic; the
+      Phase 7 performance simulator is the executable check of these rates.
     - Split units hold about 17 times more space per element (a 128 B MXFP4 tile and its 8 B of scales). If every fold tile
       of a stream were split, the ring would carry about 28 elements/cycle, against a need of about 164.
     - **So the compiler never splits fold tiles:** it pads the HBM row pitch of fold-converted weights to a whole number of

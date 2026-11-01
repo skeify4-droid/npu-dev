@@ -473,6 +473,7 @@ class _Ring:
 
 
 RING_MIN = 2048          # smallest DMA_STAGE size for block-format conversion (review Z-3); below it ILLEGAL_FIELD
+PACE_DEFAULT = 72 * 1024  # DMA_PACE reset value: bytes of converting reads in flight (review Z-2)
 
 
 def _granule_pieces(lo, hi, granule=256):
@@ -532,9 +533,11 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
       "shared"  (rejected): one read, owned by the older entry and issued once the scales of both are in the ring.
     hbm, how the core's HBM share is spent:
       "paced"   the share is an issue budget (`share` B/cycle) and every response returns exactly `rt` cycles after issue.
-      "server"  (delivery-limited, Z-2): requests issue greedily (tags, `inflight`) into a FIFO server of `share` B/cycle;
-                a response returns at max(issue + rt, the server finishing it). rt is the unloaded round trip.
-    inflight: at most this many read bytes in flight (the DMA pacing limit; None: tags only).
+      "server"  (delivery-limited, Z-2): requests issue greedily (tags, `inflight`) and reach a FIFO server of `share`
+                B/cycle half a round trip later; a response returns half a round trip after the server finishes it. So rt
+                (plus the request's service time) is the minimum round trip, and the core's own queue adds to it.
+    inflight: at most this many bytes of converting reads in flight (scale and data reads of entries that use the ring;
+    the DMA pacing limit, review Z-2; None: tags only). Plain reads (no scales, no raw slot) are limited by tags only.
     quarter: entries must be at most a quarter of the ring (the DMA's sizing rule, a rate target; liveness needs only
     entry <= ring). The ring must be at least RING_MIN bytes.
     Per cycle at most one request is issued, round-robin over the DQs that have one ready. Within its turn a DQ reads
@@ -580,16 +583,16 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
         st = states[d].get(i)
         return st is not None and st["sc_ok"]
 
-    def room(n):
-        return inflight is None or infl == 0 or infl + n <= inflight
+    def room(n, conv_read=True):
+        return not conv_read or inflight is None or infl == 0 or infl + n <= inflight
 
     while done_el < total:
         t += 1
         if hbm == "paced":
             budget = min(budget + share, max_req * 256 + share)
-        for kind, k, nb, pay in arrivals.pop(t, ()):
+        for kind, k, nb, pay, cv in arrivals.pop(t, ()):
             free_tags += k
-            infl -= nb
+            infl -= nb if cv else 0
             last = t
             if kind == "scale":
                 pay["sc_ok"] = True
@@ -626,7 +629,7 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                 e = streams[d][nxt[d]]
                 stags = -(-e[0] // 256)
                 need = e[0] + (e[1] if rule == "atomic" else 0)
-                ok = (e[0] > 0 or not started[d]) and free_tags >= max(1, stags) and room(e[0])
+                ok = (e[0] > 0 or not started[d]) and free_tags >= max(1, stags) and room(e[0], e[0] + e[1] > 0)
                 if ok and need and rule == "capped" and e[0] and not rg.fits(e[0], rmax):
                     ok = False
                 a = rg.alloc(need) if ok and need else None
@@ -637,7 +640,7 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                     nxt[d] += 1
                     started[d].append(st2)
                     if e[0]:
-                        req = ("scale", stags, e[0], st2)
+                        req = ("scale", stags, e[0], st2, True)
             while req is None and started[d] and started[d][0]["ri"] == len(plans[d][started[d][0]["i"]]):
                 started[d].popleft()            # an entry whose reads all belong to an older entry (shared)
             st = started[d][0] if started[d] else None
@@ -648,30 +651,31 @@ def staging_ring(streams, ring=16384, rule="atomic", rt=500, share=87.0, conv=25
                         st["allocs"].append(a)
                         st["raw_ok"] = True
                 plan = plans[d][st["i"]]
-                if st["raw_ok"] and all(ready(d, x) for x in plan[st["ri"]][3]) and room(plan[st["ri"]][1]):
+                cv = st["scale"] + st["raw"] > 0
+                if st["raw_ok"] and all(ready(d, x) for x in plan[st["ri"]][3]) and room(plan[st["ri"]][1], cv):
                     blk = None if plan[st["ri"]][0] is None else plan[st["ri"]][0] // 8
                     k, nb, pay = 0, 0, []
                     while st["ri"] < len(plan) and k < min(max_req, free_tags):
                         g, b, parts, deps = plan[st["ri"]]
                         if k and ((blk is not None and g // 8 != blk) or not all(ready(d, x) for x in deps)
-                                  or not room(nb + b)):
+                                  or not room(nb + b, cv)):
                             break               # a request stays in one 2 KiB block (one HBM leaf)
                         k, nb = k + 1, nb + b
                         pay += [(states[d][x], y) for x, y in parts]
                         st["ri"] += 1
                     if st["ri"] == len(plan):
                         started[d].popleft()
-                    req = ("data", k, nb, pay)
+                    req = ("data", k, nb, pay, cv)
             if req is not None:
-                kind, k, nb, pay = req
+                kind, k, nb, pay, cv = req
                 free_tags -= k
-                infl += nb
+                infl += nb if cv else 0
                 if hbm == "paced":
                     budget -= nb
                     arr = t + rt
-                else:
-                    srv = max(srv, t) + nb / share
-                    arr = max(t + rt, int(-(-srv // 1)))
+                else:                           # the share serves requests in arrival order, half a round trip out
+                    srv = max(srv, t + rt / 2) + nb / share
+                    arr = int(-(-(srv + rt / 2) // 1))
                 arrivals.setdefault(arr, []).append(req)
                 rr = (d + 1) % len(streams)
                 last = t
