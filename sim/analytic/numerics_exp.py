@@ -315,6 +315,14 @@ def fmt_e(x):
     return "-" if x != x else f"{x:.1e}"
 
 
+# DMA weight path widths (microarch.md sections 2.2, 2.5; review finding I-3)
+DMA_CVT_ELEMS = 256        # converter output, elements per cycle
+DMA_SPM_WR = 512           # DMA SPM write port, B/cycle
+MXU_WLOAD = 512            # MXU stationary-load port, B/cycle
+FEED_PATHS = [("MXFP4 -> E4M3 (fold)", 0.53125, 1), ("NVFP4 -> E4M3 (fold)", 0.5625, 1),
+              ("NVFP4 -> BF16 (exact, D1)", 0.5625, 2), ("MXFP8 -> E4M3 (fold)", 1.03125, 1), ("FP8, no conversion", 1.0, 1)]
+
+
 def main():
     r1 = e1()
     c1 = e1_cost()
@@ -340,9 +348,23 @@ def main():
         L.append(f"| {r['fmt']} | {r['dist']} | {r['changed']:.2%} | {r['quant']:.1e} | {fmt_e(r['fold_w'])} | {fmt_e(r['fold_y'])} | "
                  f"{r['a8']:.1e} | {r['fold_a8']:.1e} | {fmt_e(r['a4'])} | {fmt_e(r['bf16'])} |")
     per_core = HW.peaks(hw)["hbm_bw"] / hw["cores"] / hw["clock_hz"]
-    L += ["", f"MXU stationary-load margin in decode (512 B/cycle against a core's HBM share of {per_core:.0f} B/cycle at {hw['hbm_eff']:.0%}, "
-          f"NVFP4 at 0.5625 B/element): FP8 fold {512 / (per_core / 0.5625):.2f}x, BF16 exact {256 / (per_core / 0.5625):.2f}x. "
-          "Both keep decode HBM-bound.", "",
+    L += ["", f"Decode feed margin: a core's HBM share is {per_core:.0f} B/cycle at {hw['hbm_eff']:.0%} "
+          f"({per_core / hw['hbm_eff']:.0f} at peak). Every stage of the weight path must carry "
+          f"that many elements per cycle: the DMA converter ({DMA_CVT_ELEMS} elements/cycle), the DMA SPM write port "
+          f"({DMA_SPM_WR} B/cycle) and the MXU stationary-load port ({MXU_WLOAD} B/cycle). Margin = narrowest stage / need "
+          "(microarch.md section 2.5, review finding I-3).", "",
+          "| path | source B/element | need (elements/cycle) | converter | SPM write | stationary load | margin |",
+          "|---|---|---|---|---|---|---|"]
+    for name, src_b, dst_b in FEED_PATHS:
+        need = per_core / src_b
+        cap = {"wr": DMA_SPM_WR / dst_b, "ld": MXU_WLOAD / dst_b}
+        if "no conversion" not in name:
+            cap["cvt"] = DMA_CVT_ELEMS
+        L.append(f"| {name} | {src_b:g} | {need:.0f} | {cap['cvt'] if 'cvt' in cap else '-'} | {cap['wr']:.0f} | {cap['ld']:.0f} | "
+                 f"{min(cap.values()) / need:.2f}x |")
+    need = per_core / 0.5625
+    L += ["", f"Before the I-3 fix the DMA SPM write port was 256 B/cycle: NVFP4 -> BF16 then carried {256 / 2 / need:.2f}x of the need. "
+          "Decode stays HBM-bound on every path above.", "",
           "Prefill of one 32K-token prompt at the serving package count (best PP/TP mapping) if the NVFP4 tensors always take the BF16 path:", "",
           "| model | NVFP4 tensors | packages | fold (FP8 rate) | exact (BF16 rate) | slowdown |", "|---|---|---|---|---|---|"]
     for c in c1:

@@ -65,14 +65,14 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
 | `RD_REQ` (≤ 2 KiB, one leaf) | Decode the granules. They fall on 8 different PCs of this port. Push one read descriptor (bank, row, column-high, first burst, burst count) into each PC's read queue. The request leaves the input only when every granule has been queued. |
 | `RD_RSP` (to the core) | One per granule, 2 flits, tag + granule index. Sent when all of its bursts are in the read return buffer. Granules of one request return in any order. |
 | `WR` (≤ 256 B, inside one granule) | Write the bursts into a write queue entry (burst mask). It is **posted**: acknowledged once it is in the write queue. |
-| `WR_ACK` (to the core) | Carries the burst id and a **byte count**. Coalesced per (source, burst id) while the coalescing table has room. When it is full, the oldest entry is acked with its partial count (see below). |
+| `WR_ACK` (to the core) | Carries the burst id and a **byte count**. Coalesced per (source, burst id): sent when the count reaches the burst total `blen` carried by every `WR`, early with a partial count when the table is full, or after `ACK_FLUSH` idle cycles (see below). |
 | anything else | `ERR`: write-add or max to HBM (`HBM_WADD`), a misaligned write (`HBM_ALIGN`), or an address in reserved HBM. |
 
 **Write alignment *(P2)*:**
 - HBM writes must be 32 B aligned in both address and size. The controller has no read-modify-write path, and the DFI-like interface
   has no data mask. Anything else faults with `HBM_ALIGN` (isa.yaml `fault_cause`).
-- The compiler pads layouts accordingly. Example: the NVFP4 KV scales of one token are stored for all KV heads together (8 heads x 8 B =
-  64 B), not per head (8 B).
+- The compiler lays out data accordingly. Paged KV keeps each page's block scales in a scale region of the same page (memmap.md §6);
+  a token's scale row can be smaller than 32 B (8 B for one 128-wide NVFP4 KV group).
 - The DMA splits writes at 256 B granule boundaries.
 
 **Ordering and hazards inside a PC:**
@@ -83,12 +83,15 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
   overwrite, mask OR). Otherwise it is queued behind that entry, and same-granule entries issue in order.
 - Reads are not ordered among themselves.
 
-**Partial acknowledgements *(P2, review finding R-3)*:**
+**Partial acknowledgements *(P2, review findings R-3, X-3)*:**
 - A target never needs ack-coalescing state in order to accept a write. If the coalescing table is full, the controller acks an entry
   early with the bytes counted so far.
-- The DMA counts acknowledged bytes per burst, so a burst may be acked in pieces.
 - Without this rule, a full table of partially received bursts could block the packets that would complete them.
-- The same rule holds for SRAM targets (noc.md §2).
+- **Completion trigger (X-3).** Every `WR` carries its burst's total bytes (`blen`, noc.md §2). An entry is acked as soon as its count
+  reaches `blen`. An entry idle for `ACK_FLUSH` cycles (CSR `CTRL`, default 64) is acked with its partial count; that completes a
+  burst whose first entry was evicted early, because its remaining packets can never reach `blen` in a new entry.
+- The DMA counts acknowledged bytes per burst until they reach `blen`, so a burst may be acked in pieces.
+- The same rules hold for SRAM targets (noc.md §2), which ack only once the write is visible.
 
 **Head-of-line blocking:**
 - A request whose 8 granules cannot all be queued holds its port input.
@@ -290,7 +293,7 @@ Decisions this evidence supports:
 | Offset | Name | Contents |
 |---|---|---|
 | `0x000-0x0FF` | `TIMING[n]` | H-4 entries in cycles, 16 bits each, in table order |
-| `0x100` | `CTRL` | page policy (adaptive/open/close), refresh mode (pb/ab), queue watermarks, age cap |
+| `0x100` | `CTRL` | page policy (adaptive/open/close), refresh mode (pb/ab), queue watermarks, age cap, `ACK_FLUSH` |
 | `0x108` | `REF_RATE` | 1x / 2x refresh (temperature) |
 | `0x110` | `STATUS` | init done, error flags, refresh lag maximum |
 | `0x200-0x5FF` | `PC_CNT[32]` | per PC: read bursts, write bursts, ACTs, row hits, refreshes, max queue occupancy |

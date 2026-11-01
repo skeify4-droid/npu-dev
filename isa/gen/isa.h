@@ -130,6 +130,8 @@ constexpr Field kT_DMA_n_reg{49, 45};
 constexpr Field kT_DMA_rsem{44, 39};
 constexpr Field kT_DMA_scale_reg{38, 34};
 constexpr Field kT_DMA_aux_reg{33, 29};
+constexpr Field kT_DMA_pt_reg{28, 24};
+constexpr Field kT_DMA_ts_reg{23, 19};
 constexpr Field kT_DMAMC_dq{90, 89};
 constexpr Field kT_DMAMC_src_reg{88, 84};
 constexpr Field kT_DMAMC_src_td{83, 76};
@@ -183,8 +185,37 @@ constexpr Field kTd_s1{111, 80};
 constexpr Field kTd_s2{143, 112};
 constexpr Field kTd_s3{175, 144};
 constexpr Field kTd_aux0{207, 176};
-constexpr Field kTd_aux1{239, 208};
-constexpr Field kTd_rsv{255, 240};
+constexpr Field kTd_row_bytes{231, 208};
+constexpr Field kTd_sc_off{243, 232};
+constexpr Field kTd_page_shift{248, 244};
+constexpr Field kTd_rsv{255, 249};
+constexpr int kPagedPtrBits = 64;
+constexpr Field kPagedPtr_byte{19, 0};
+constexpr Field kPagedPtr_row{41, 20};
+constexpr Field kPagedPtr_node{48, 42};
+constexpr Field kPagedPtr_rsv{63, 49};
+constexpr int kNocHeaderBits = 128;
+constexpr Field kNocHeader_type{2, 0};
+constexpr Field kNocHeader_hop_x{6, 3};
+constexpr Field kNocHeader_hop_y{9, 7};
+constexpr Field kNocHeader_hop_port{12, 10};
+constexpr Field kNocHeader_ini_node{19, 13};
+constexpr Field kNocHeader_ini_x{23, 20};
+constexpr Field kNocHeader_ini_y{26, 24};
+constexpr Field kNocHeader_ini_port{29, 27};
+constexpr Field kNocHeader_tag{38, 30};
+constexpr Field kNocHeader_len{50, 39};
+constexpr Field kNocHeader_addr{99, 51};
+constexpr Field kNocHeader_gidx{53, 51};
+constexpr Field kNocHeader_cause{57, 54};
+constexpr Field kNocHeader_wop{101, 100};
+constexpr Field kNocHeader_rsem{107, 102};
+constexpr Field kNocHeader_blen{119, 108};
+constexpr Field kNocHeader_mc_x0{111, 108};
+constexpr Field kNocHeader_mc_x1{115, 112};
+constexpr Field kNocHeader_mc_y0{118, 116};
+constexpr Field kNocHeader_mc_y1{121, 119};
+constexpr Field kNocHeader_rsv{127, 122};
 enum class Dtype : uint16_t {
   FP32 = 0,
   BF16 = 1,
@@ -214,6 +245,7 @@ enum class TdFlags : uint16_t {
   IDX64 = 1,
   WRAP = 2,
   SCALE_INLINE = 3,
+  SCALE_REGION = 4,
 };
 enum class Cvt : uint16_t {
   NONE = 0,
@@ -365,6 +397,15 @@ enum class FaultCause : uint16_t {
   PTE_INVALID = 11,
   LINK = 12,
   ERR_RSP = 13,
+};
+enum class NocType : uint16_t {
+  RD_REQ = 0,
+  RD_RSP = 1,
+  WR = 2,
+  WR_ACK = 3,
+  SEM = 4,
+  MC_WR = 5,
+  ERR = 6,
 };
 constexpr uint8_t kNodeSelf = 0x7F;
 constexpr Field kNode{48, 42};

@@ -114,16 +114,39 @@ leaf (hbm.md H-1).
 
 ## 6. KV pages
 
-- A page table is an array of 32-bit PTEs in SPM. The DMA reads it in `PAGED` mode.
+Revised for review finding I-2: pages are counted in rows, never split a row, and carry the block scales of their own rows.
+
+- A page table is an array of 32-bit PTEs in SPM at `R[pt_reg]`. The DMA reads it in `PAGED` mode.
 - PTE bits:
-  - `[29:0]`: frame number in 4 KiB units of the die-local space (covers 4 TiB);
-  - `[30]`: valid;
+  - `[29:0]`: frame number in 4 KiB units of the die-local space (covers 4 TiB), the start of the page;
+  - `[30]`: valid (`PTE_INVALID` otherwise);
   - `[31]`: reserved.
-- Page size: `2^page_shift` bytes (TD `aux0`), at least 4 KiB. The node comes from the base address, so pages may sit on another die of
+- **A page is `2^page_shift` rows** (TD `page_shift`; a row is one token's entry with stride `s1`). Rows never cross a page. A page
+  occupies `ceil(bytes / 4 KiB)` consecutive frames from its PTE's frame, so its size need not be a power of two: a 576 B MLA row
+  works (64 rows = 36 KiB = 9 frames).
+- **Paged pointer.** The base register of a PAGED operand is `isa.yaml` `paged_ptr`: `node` [48:42], `row` [41:20] (first logical
+  row), `byte` [19:0] (offset inside the row, for example one KV group of a row that holds several). The node may name another die of
   the same package or rail.
+- **Address of element (i0, i1, i2, i3)** of a PAGED TD:
+  - logical row `r = row + i1` (`DMA_COPY`), or `r = row + index[i]` (`DMA_GATHER` / `DMA_SCATTER`);
+  - page `r >> page_shift`, row in the page `q = r & (2^page_shift - 1)`;
+  - address `= frame * 4 KiB + q * s1 + byte + i0 * esize + i2 * s2 + i3 * s3`.
+  - Dims 0, 2 and 3 address inside one row: their extent plus `byte` must stay within `s1` (`RANGE` otherwise).
+- **Scale region** (block formats: NVFP4, MXFP4, MXFP8):
+  - Each page holds its rows' data first and then their block scales, at `sc_off * 256 B` from the page start, with scale row
+    stride `aux0`. So one PTE translates both, and data and scales never sit in different pages.
+  - The scale byte of element e of row q is at `frame * 4 KiB + sc_off * 256 + q * aux0 + floor(e / block) * scale_bytes`, where e
+    counts from the start of the row (`byte` converted to elements, plus `i0`).
+  - A TD with `SCALE_REGION` addresses the scale rows themselves (row stride `aux0` at `sc_off`). The KV write path uses it: the
+    data rows and the scale rows of a new token are two transfers.
+  - Non-paged block-format operands (weights) keep the published separate scale array `[rows, K / block]` at `R[scale_reg]`, row
+    stride `aux0`.
 - The runtime (CP) owns the tables. Kernels see them as SPM arrays loaded by DMA.
 - Layout rule:
-  - One page holds a run of consecutive tokens for one layer and one KV group, with token stride `s1`.
+  - One page holds a run of consecutive tokens for one layer, with token stride `s1`. A row is one KV group, or all KV groups of the
+    token (then `byte` selects the group).
+  - Examples: MiniMax NVFP4 KV, 4 groups of 128 per row: 256 B of elements + 32 B of scales per token, 128 rows per page (vLLM's
+    block size) = 32 KiB + 4 KiB = 9 frames. DeepSeek NVFP4 global KV (one 512-wide head): 256 B + 32 B per token.
   - Index keys (MiniMax, DeepSeek, Step region summaries) get their own pages, so the index scan streams contiguous bytes.
 
 ## 7. Layouts the ISA assumes
@@ -149,8 +172,9 @@ leaf (hbm.md H-1).
 - An access to an unmapped, reserved or forbidden address returns an error response.
 - The initiating core stops with `FAULT_CAUSE`/`FAULT_ADDR` set and sends an interrupt to the CP.
 - Write-add on an HBM address is a fault (`HBM_WADD`): HBM has no read-modify-write path.
-- HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The compiler pads layouts
-  where a per-token item is smaller (for example, NVFP4 KV scales are stored for all KV heads of a token together).
+- HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The compiler lays out
+  per-token items so that each write is aligned. The scale rows of a page (§6) can be smaller than 32 B per token (8 B for one
+  128-wide NVFP4 KV group, 4 B for an MXFP4 index key).
 - Fault codes: isa.yaml `fault_cause`.
 
 ## 9. Ordering

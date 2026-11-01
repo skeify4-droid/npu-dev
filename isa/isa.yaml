@@ -56,17 +56,18 @@ enums:
     DTAB: 3          # register holds a byte offset into this core's descriptor table (DMA destination only)
     IMEM: 4          # register holds a byte offset into this core's instruction memory (DMA destination only)
   td_flags:          # bit positions inside the TD flags byte
-    PAGED: 0         # outer address goes through a page table (DMA idx_reg = table base in SPM)
+    PAGED: 0         # dim 1 (the row) is translated through a page table (DMA pt_reg; memmap.md section 6)
     IDX64: 1         # index lists are int64 (default int32)
     WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
     SCALE_INLINE: 3  # block scales follow each row instead of a separate array (DMA gather of MXFP8 rows)
+    SCALE_REGION: 4  # PAGED: address the scale region of each page (offset sc_off, row stride aux0) instead of its data
   cvt:               # DMA conversion on the way into the destination (source format -> destination format)
     NONE: 0
     MXFP4_E4M3: 1    # writes E4M3 data + FP32 column scale per (row, 256-element K tile) to aux_reg
-    NVFP4_E4M3: 2    # same contract; per-16 scales folded, residual rounded RNE (numerics.md N-2)
+    NVFP4_E4M3: 2    # same contract; per-16 scales folded, residual rounded RNE (numerics.md N-2); column scale x R[ts_reg]
     MXFP8_E4M3: 3    # same contract
     MXFP4_BF16: 4    # exact
-    NVFP4_BF16: 5    # exact; the FP32 tensor scale goes to aux_reg as column scales (one per 128-deep BF16 K tile)
+    NVFP4_BF16: 5    # exact; the FP32 tensor scale R[ts_reg] goes to aux_reg as column scales (one per 128-deep BF16 K tile)
     MXFP8_BF16: 6
     E4M3_BF16: 7
     E5M2_BF16: 8
@@ -184,7 +185,7 @@ enums:
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
     ILLEGAL_FIELD: 2   # enum value or field combination not allowed
-    TD_SPACE: 3        # a descriptor's space is not allowed for that operand
+    TD_SPACE: 3        # a descriptor's space is not allowed for that operand (incl. both DMA operands GLOBAL: noc.md section 4)
     ADDR_UNMAPPED: 4   # memmap.md section 8: unmapped, reserved, or hole
     ADDR_FORBIDDEN: 5  # access type not allowed for that initiator and region (memmap.md section 8 table)
     RAIL: 6            # destination node is on the other rail of another package (noc.md section 4)
@@ -195,6 +196,14 @@ enums:
     PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
     LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4)
     ERR_RSP: 13        # a target returned ERR for another reason
+  noc_type:            # NoC packet types (noc.md section 2); REQ VN: RD_REQ, WR, SEM, MC_WR; RSP VN: RD_RSP, WR_ACK, ERR
+    RD_REQ: 0
+    RD_RSP: 1
+    WR: 2
+    WR_ACK: 3
+    SEM: 4
+    MC_WR: 5
+    ERR: 6
 
 # Tile descriptor (TD): 256 bits in DTAB. Shapes are up to 4-D, innermost dim contiguous.
 # Element (i0, i1, i2, i3) is at base + i0*esize + i1*s1 + i2*s2 + i3*s3. A stride of 0 broadcasts.
@@ -210,9 +219,49 @@ td:
     s1:    [111, 80]    # signed byte strides
     s2:    [143, 112]
     s3:    [175, 144]
-    aux0:  [207, 176]   # PAGED: page_shift[4:0]; block formats: scale-array row stride in bytes
-    aux1:  [239, 208]   # gather/scatter: row bytes; block formats: scale-array base offset
-    rsv:   [255, 240]
+    aux0:  [207, 176]   # block formats: scale row stride in bytes; VSOFTMAX softcap: c (FP32)
+    row_bytes: [231, 208]   # gather/scatter: row size in bytes (any size, no alignment needed)
+    sc_off: [243, 232]  # PAGED block formats: offset of the page's scale region, in 256 B units (memmap.md section 6)
+    page_shift: [248, 244]  # PAGED: log2(rows per page)
+    rsv:   [255, 249]
+
+# Base register of a PAGED operand (memmap.md section 6). Generated like the TD.
+paged_ptr:
+  bits: 64
+  fields:
+    byte: [19, 0]       # byte offset inside a row (for example, one KV group of a multi-group row)
+    row:  [41, 20]      # first logical row (DMA_COPY); added to every index (DMA_GATHER / DMA_SCATTER)
+    node: [48, 42]      # node that holds the pages (0x7F = this die)
+    rsv:  [63, 49]
+
+# NoC packet header, the 128-bit sideband of a head flit (noc.md section 2). `select` names the field that gives the
+# packet type; a field with `types` is valid only for those types, so fields of disjoint type sets may share bits.
+# VN and class are not in the header: the VN follows from the type, the class from the virtual channel (flit_t VC).
+noc_header:
+  bits: 128
+  select: type
+  fields:
+    type:     {bits: [2, 0], enum: noc_type}
+    hop_x:    {bits: [6, 3], types: [RD_REQ, RD_RSP, WR, WR_ACK, SEM, ERR]}    # routing target on the current die: the
+    hop_y:    {bits: [9, 7], types: [RD_REQ, RD_RSP, WR, WR_ACK, SEM, ERR]}    # final endpoint, or the link leaf on the
+    hop_port: {bits: [12, 10], types: [RD_REQ, RD_RSP, WR, WR_ACK, SEM, ERR]}  # way; the receiving bridge rewrites it
+    ini_node: {bits: [19, 13]}          # initiator: requests carry it, responses are delivered to it
+    ini_x:    {bits: [23, 20]}
+    ini_y:    {bits: [26, 24]}          # MC_WR: the source row of the XY tree
+    ini_port: {bits: [29, 27]}
+    tag:      {bits: [38, 30], types: [RD_REQ, RD_RSP, WR, WR_ACK, SEM, ERR]}  # read tag, or write burst id
+    len:      {bits: [50, 39], types: [RD_REQ, WR, WR_ACK, SEM, MC_WR]}         # bytes: read size, payload, or acked bytes
+    addr:     {bits: [99, 51], types: [RD_REQ, WR, SEM, MC_WR]}                 # target GPA (node resolved by the source)
+    gidx:     {bits: [53, 51], types: [RD_RSP]}                                 # granule index within the read request
+    cause:    {bits: [57, 54], types: [ERR], enum: fault_cause}
+    wop:      {bits: [101, 100], types: [WR, MC_WR], enum: wop}
+    rsem:     {bits: [107, 102], types: [WR, MC_WR]}
+    blen:     {bits: [119, 108], types: [WR, SEM]}         # total bytes of the burst this packet belongs to (ack trigger)
+    mc_x0:    {bits: [111, 108], types: [MC_WR]}
+    mc_x1:    {bits: [115, 112], types: [MC_WR]}
+    mc_y0:    {bits: [118, 116], types: [MC_WR]}
+    mc_y1:    {bits: [121, 119], types: [MC_WR]}
+    rsv:      {bits: [127, 122]}
 
 # Field layouts. Every tile-queue format starts with the sync block; front-end formats leave it zero.
 sync:
@@ -236,7 +285,8 @@ formats:
   T_DMA:
     sync: true
     fields: {dq: [90, 89], src_reg: [88, 84], src_td: [83, 76], dst_reg: [75, 71], dst_td: [70, 63], cvt: [62, 58],
-             wop: [57, 55], idx_reg: [54, 50], n_reg: [49, 45], rsem: [44, 39], scale_reg: [38, 34], aux_reg: [33, 29]}
+             wop: [57, 55], idx_reg: [54, 50], n_reg: [49, 45], rsem: [44, 39], scale_reg: [38, 34], aux_reg: [33, 29],
+             pt_reg: [28, 24], ts_reg: [23, 19]}
   T_DMAMC:
     sync: true
     fields: {dq: [90, 89], src_reg: [88, 84], src_td: [83, 76], dst_reg: [75, 71], dst_td: [70, 63], rsem: [44, 39],
@@ -273,6 +323,8 @@ field_types:
   n_reg: reg
   scale_reg: reg
   aux_reg: reg
+  pt_reg: reg
+  ts_reg: reg
   list_reg: reg
   addr_reg: reg
   val_reg: reg
@@ -357,19 +409,23 @@ instructions:
     desc: >-
       Copy the tile described by (src_reg, src_td) to (dst_reg, dst_td), converting with cvt and writing with wop.
       Shapes must have the same element count; the destination TD sets the order. n_reg != 0 overrides the outermost
-      count of both TDs. A PAGED TD translates its outermost dimension through the page table at SPM[idx_reg].
-      Block formats read their scales from scale_reg (TD aux fields give the layout); FP8-target conversions write
-      FP32 column scales to SPM[aux_reg]. rsem != 0: every packet adds its payload bytes to sem[rsem] of the core that
-      owns the destination address once the data is written.
+      count of both TDs. At most one operand may be GLOBAL (else TD_SPACE): the other is local (SPM, DTAB, IMEM), so read
+      data always sinks locally (noc.md section 4 rule 2). At most one TD may be PAGED; its row (dim 1) is translated
+      through the page table at SPM[R[pt_reg]] and its base register is a paged pointer (memmap.md section 6).
+      Block formats: scales of a non-paged operand are at R[scale_reg] with row stride TD aux0; a PAGED operand's
+      scales are in the scale region of the same page. ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
+      FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
+      bytes to sem[rsem] of the core that owns the destination address once the data is written.
   DMA_GATHER:
     op: 0x41
     fmt: T_DMA
     queue: DQ
     desc: >-
-      Row gather. src TD aux1 = row bytes (any size, no alignment needed); the index list (int32 or int64 per
-      IDX64) is at SPM[idx_reg] with count from the dst TD outer dims or n_reg. Row i of the destination =
-      source row index[i] (base = src_reg, row pitch = src TD s1). PAGED: indices are logical rows translated
-      through the page table given by scale_reg. Conversions as DMA_COPY (MXFP8 rows with SCALE_INLINE).
+      Row gather. src TD row_bytes = row size (any size, no alignment needed); the index list (int32 or int64 per
+      IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination =
+      source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a
+      logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page.
+      Operand spaces, conversions and scale operands as DMA_COPY (MXFP8 rows with SCALE_INLINE).
       Keeps up to dma_outstanding_reads granules in flight.
   DMA_SCATTER:
     op: 0x42
@@ -377,7 +433,7 @@ instructions:
     queue: DQ
     desc: >-
       Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into
-      SRAM). PAGED as DMA_GATHER.
+      SRAM). Operand spaces as DMA_COPY; PAGED dst as DMA_GATHER's src.
   DMA_MCAST:
     op: 0x43
     fmt: T_DMAMC

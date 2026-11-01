@@ -65,9 +65,12 @@ Rules:
 - A tile operand is a register (base address) plus a DTAB index. Operands include DMA source/destination, MXU A/W, and VPU d/s0/s1/s2.
 - The descriptor gives:
   - dtype and space (GLOBAL, SPM, ACC, DTAB, IMEM);
-  - flags (PAGED, IDX64, WRAP, SCALE_INLINE);
+  - flags (PAGED, IDX64, WRAP, SCALE_INLINE, SCALE_REGION);
   - up to 4 dimensions (`n0` contiguous, `n1`-`n3` with signed byte strides `s1`-`s3`; stride 0 broadcasts);
-  - two auxiliary words (page shift, gather row size, block-scale layout).
+  - `aux0`: the scale row stride of a block format (or the `VSOFTMAX` softcap);
+  - `row_bytes`: the row size of a gather or scatter;
+  - `page_shift` (log2 rows per page) and `sc_off` (the scale region inside a page) for PAGED operands (memmap.md §6).
+- Each field has one meaning (review finding I-2: `aux0` used to be both the page shift and the scale stride).
 - Why descriptors instead of operand fields:
   - A 4-D strided DMA needs about 300 bits of shape.
   - Shapes repeat across loop iterations while bases change.
@@ -84,9 +87,25 @@ Rules:
 
 **DMA (`DQ0`-`DQ3`):**
 - `DMA_COPY`:
-  - 4-D strided copy between any spaces;
-  - optional paging of the outermost dimension;
+  - 4-D strided copy between a local space (SPM, DTAB, IMEM) and any space;
+  - **at most one operand is `GLOBAL`**, otherwise `TD_SPACE` (review finding I-1). Read data must sink in this core's
+    reserved SPM without waiting for anything on the network (noc.md §4 rule 2), so the DMA never sends read data on as a
+    write. A global-to-global move (an HBM page move, or HBM into another core's SPM) is two transfers through a local SPM
+    buffer with a semaphore between them, or the consumer core reads the data itself;
+  - optional paging of the row dimension (memmap.md §6);
   - conversion on the way in (`cvt`) and a write operation at the destination (`wop`: write, add FP32/BF16, max FP32; adds only to SRAM).
+- **Operand registers of `T_DMA`.** Each has one meaning:
+
+  | Field | Holds |
+  |---|---|
+  | `src_reg`, `dst_reg` | base addresses; a PAGED operand's base is a paged pointer (`isa.yaml` `paged_ptr`: node, first row, byte in the row) |
+  | `idx_reg` | SPM offset of the index list (gather, scatter) |
+  | `n_reg` | override of the outermost count (0: from the TD) |
+  | `scale_reg` | address of the scale array of a non-paged block-format operand (row stride TD `aux0`) |
+  | `aux_reg` | SPM offset where FP8- and NVFP4-target conversions write the FP32 column scales (R0: none) |
+  | `pt_reg` | SPM offset of the page table of the PAGED operand (at most one operand is PAGED) |
+  | `ts_reg` | NVFP4 FP32 tensor scale in bits [31:0] (R0: 1.0) |
+
 - `DMA_GATHER` / `DMA_SCATTER`: row lists with any row size and int32/int64 indices. Optional page translation of the row index, so
   sparse-attention KV blocks and paged caches gather in one instruction.
 - `DMA_MCAST`: one SPM tile to the same offset in a rectangle of cores.
@@ -98,7 +117,11 @@ Rules:
   - `MXU_MM` multiplies each K tile's partial sum by it (`cs_reg`).
   - The per-16 / per-32 block scales inside a K tile are folded into the elements (exact for MX formats unless an element underflows;
     NVFP4 rounds, see numerics.md N-2).
-  - Converting to BF16 is exact and needs no column scales. The NVFP4 FP32 tensor scale still goes into `aux_reg` as a column scale.
+  - Converting to BF16 is exact and needs no column scales. The NVFP4 FP32 tensor scale `R[ts_reg]` still goes into `aux_reg` as a
+    column scale. For the fold it multiplies `2^c` (numerics.md N-2 step 4).
+  - Scales of a paged operand live in the same page as its rows (memmap.md §6), so one page-table entry translates both.
+- **Width of the inbound path** (review finding I-3): the converter produces 256 elements per cycle and the DMA writes SPM at
+  512 B/cycle, so the exact NVFP4 → BF16 path carries 1.65x a core's HBM share (numerics.md D1).
 
 **MXU (`MQ`):**
 - `MXU_MM` computes `ACC (+)= A x W` for any M (≤ ACC rows / N tiles), K and N. Inside the instruction the MXU tiles K (256 FP8 or
@@ -171,7 +194,7 @@ S4 as well and the wait is `S4 >= 2`. The compiler's scheduler does this countin
 
 A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP. Causes:
 - illegal opcode or field value;
-- a descriptor whose space is not allowed for that operand;
+- a descriptor whose space is not allowed for that operand, including a DMA with both operands `GLOBAL` (`TD_SPACE`);
 - address faults (memmap.md §8), including `RAIL`;
 - ACC or SPM range overflow;
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);

@@ -232,12 +232,15 @@ def endpoints(packages=2, dies=2):
     return eps
 
 
-def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, multicast=True, hbm_forwards=False):
+def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, multicast=True, hbm_forwards=False,
+              dma_forwards=False):
     """Channel dependency graph of the whole system: REQ and RSP routes for every allowed endpoint pair,
     protocol edges (a request is consumed only by emitting its response), and XY-tree multicasts.
 
     split_vn=False puts requests and responses on the same channels (to show protocol deadlock).
-    hbm_forwards=True makes HBM leaves forward remote requests (to show why endpoints must not chain requests)."""
+    hbm_forwards=True makes HBM leaves forward remote requests (to show why endpoints must not chain requests).
+    dma_forwards=True lets a DMA sink read data only by sending it on as a write (a GLOBAL -> GLOBAL copy with no local
+    buffer, review finding I-1): the response channel into a core then waits on that core's request injection."""
     g = defaultdict(set)
     eps = endpoints(packages)
     cores = [e for e in eps if not is_leaf(e[2])]
@@ -247,6 +250,7 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
         for a, b in zip(path, path[1:]):
             g[a].add(b)
 
+    rsp_in, req_out = defaultdict(set), defaultdict(set)
     for s in cores:                       # requests come from cores (DMA); HBM leaves only respond
         for t in eps:
             if s == t:
@@ -262,6 +266,12 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
             link(q)
             link(r)
             g[q[-1]].add(r[0])            # protocol edge: consuming the request needs the response channel
+            rsp_in[s].add(r[-1])
+            req_out[s].add(q[0])
+    if dma_forwards:                      # rejected (I-1): read data leaves the core again as a write before it can sink
+        for s in cores:
+            for a in rsp_in[s]:
+                g[a].update(req_out[s])
     if hbm_forwards:                      # rejected: a leaf consumes a request by issuing one to the sibling die
         for p in range(packages):
             for d in range(2):
@@ -284,6 +294,42 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
                             if t != s:
                                 link(_hops((p, d), route(s, t, "XY"), "REQ", "L"))
     return g
+
+
+# ---------------------------------------------------------------- write-ack coalescing (noc.md section 2, review X-3)
+def ack_coalescer(arrivals, table=8, flush=64, use_blen=True):
+    """Write-ack coalescing at one target. arrivals: (cycle, source, burst id, bytes, burst total bytes) per WR packet.
+    Rules: one entry per (source, burst id) counts accepted bytes. The entry is acked when its count reaches the burst
+    total (use_blen), when the table is full and a new burst needs an entry (the oldest entry is acked early), and when it
+    has been idle for `flush` cycles (flush=None: never). Accepting a packet never waits for table state.
+    use_blen=False, flush=None is the rule before the fix (ack only on eviction). Returns the acks as
+    (cycle, source, burst id, bytes) and the entries still open at the end (bytes accepted but never acknowledged)."""
+    arrivals = sorted(arrivals)
+    entries = {}                          # (src, burst) -> [bytes, last arrival cycle, allocation order]
+    acks = []
+    order = 0
+    end = (arrivals[-1][0] if arrivals else 0) + (flush or 0) + 1
+    i = 0
+    for t in range(end + 1):
+        if flush is not None:
+            for k in [k for k, e in entries.items() if t - e[1] >= flush]:
+                acks.append((t, *k, entries.pop(k)[0]))
+        while i < len(arrivals) and arrivals[i][0] == t:
+            _, src, bid, n, blen = arrivals[i]
+            i += 1
+            k = (src, bid)
+            if k not in entries:
+                if len(entries) >= table:                     # evict the oldest entry with its partial count
+                    old = min(entries, key=lambda x: entries[x][2])
+                    acks.append((t, *old, entries.pop(old)[0]))
+                entries[k] = [0, t, order]
+                order += 1
+            e = entries[k]
+            e[0] += n
+            e[1] = t
+            if use_blen and e[0] >= blen:
+                acks.append((t, *k, entries.pop(k)[0]))
+    return acks, entries
 
 
 def find_cycle(g):
@@ -322,7 +368,7 @@ if __name__ == "__main__":
         print(f"{k:24s} max link utilization {u:5.2f}  at {link}")
     print(f"D2D max {d2d_max_bpc():.0f} B/cycle = {d2d_max_bpc() * CLOCK / 1e12:.2f} TB/s per direction")
     for kw in [dict(), dict(packages=4), dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
-               dict(hbm_forwards=True)]:
+               dict(hbm_forwards=True), dict(dma_forwards=True)]:
         g = build_cdg(**kw)
         c = find_cycle(g)
         print(kw or "baseline", "channels", len(g), "edges", sum(map(len, g.values())), "cycle" if c else "acyclic",

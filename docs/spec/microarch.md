@@ -113,7 +113,8 @@ isa.md §5) a cheap multiply at the ACC input.
 | DMA out | 256 |
 | **Sum** | **2,048** |
 
-  The sum equals the port capacity, so all clients at peak at once would fill it. Writes peak at 768 B/cycle: VPU 512 and DMA in 256.
+  The sum equals the port capacity, so all clients at peak at once would fill it. Writes peak at 1,152 B/cycle: VPU 512, DMA in 512
+  (review finding I-3) and the NI target 128.
   Arbitration is round-robin per bank with an age bound. The compiler places tiles to avoid systematic conflicts.
 - If the ASAP7 fakeram flow cannot make 1R1W macros, the fallback is 64 single-port banks of 64 KiB (Phase 6 check).
 
@@ -136,13 +137,22 @@ isa.md §5) a cheap multiply at the ACC input.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
   and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
+- **Read data always sinks in local SPM** (or DTAB / IMEM). A DMA never forwards read data as a write, so one of its two operands is
+  local (`TD_SPACE` otherwise; review finding I-1). Global-to-global moves are two transfers through an SPM buffer.
+- **Inbound rate *(review finding I-3)*:** the converter produces 256 elements per cycle and the SPM write port takes 512 B/cycle,
+  so the exact NVFP4 → BF16 path (3.56 bytes out per byte in) carries 1.65x a core's HBM share at 0.85 (numerics.md D1). The
+  network can deliver up to 256 B/cycle of compressed data, more than the converter takes, so `ni_rsp` has a ready signal and a
+  4-flit inbound buffer.
+  - Ready depends only on the converter and the SPM write port, which drain at a fixed rate without waiting for the network. A
+    response is therefore still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.
 - Addressing:
   - 4-D strided addressing from tile descriptors.
   - Paged mode, with a page table in SPM (32-bit PTE, 4 KiB frames).
   - Row gather and scatter with arbitrary row size (Engram 264 B rows) and int32/int64 index lists.
   - Descriptor lists (`DMA_LIST`).
 - Conversion on the inbound path: MXFP4/NVFP4/MXFP8 to E4M3 plus FP32 column scales, or to BF16 exactly; E4M3/E5M2 to BF16;
-  BF16 to and from FP32. Outbound data is written as is. Quantization (KV, activations) is a VPU instruction (`VQUANT`), because it needs
+  BF16 to and from FP32. Outbound data is written as is. Scales come from the operand's scale array (`scale_reg`) or, for paged
+  KV, from the scale region of the same page; the NVFP4 tensor scale from `ts_reg` (isa.md §5, memmap.md §6). Quantization (KV, activations) is a VPU instruction (`VQUANT`), because it needs
   row maxima.
 - Write operations at the destination: plain write, FP32/BF16 add, FP32 max. SRAM targets have the ALU in their network interface; HBM
   takes plain writes only.
@@ -151,8 +161,12 @@ isa.md §5) a cheap multiply at the ACC input.
 - The interface is an initiator for the DMA and a target for SPM, GSRAM and CORECTL (IMEM, DTAB, semaphores, CSRs).
 - Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
 - Plane choice is per packet: round-robin over planes with credits. No ordering is needed (noc.md §7).
-- Write acknowledgements carry a byte count and are coalesced per 2 KiB burst while the coalescing table has room. A full table acks
-  early with a partial count, so accepting a write never waits for ack state (review finding R-3, hbm.md H-2).
+- Write acknowledgements carry a byte count and are coalesced per 2 KiB burst (noc.md §2, hbm.md H-2):
+  - every `WR` carries its burst's total bytes (`blen`), and the target acks when it has accepted them all;
+  - a full table acks its oldest entry early with a partial count, so accepting a write never waits for ack state (review finding R-3);
+  - an entry idle for `ACK_FLUSH` cycles (CSR, default 64) is acked with its partial count, which completes bursts whose entry was
+    evicted (review finding X-3);
+  - an SRAM target acks only after the write, including a write-add, is visible to a later read.
 - 64 semaphores (32-bit) per core, readable and writable over the network (memmap.md §5).
 
 ## 3. Die-level blocks
@@ -224,9 +238,9 @@ Conventions:
 |---|---|---|---|---|
 | q_pop[4] | in | instruction + operands | valid/ready | DQ0-DQ3 |
 | dtab_rd | out/in | idx 8, data 256 | 1-cycle | tile descriptors |
-| spm_rd / spm_wr | out | 256 B/cycle each | valid/ready, banked | data in/out, index lists, page tables |
+| spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales |
 | ni_req | out | flit_t | valid/ready | read requests, write packets |
-| ni_rsp | in | flit_t | valid (always accepted) | read data, acks |
+| ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and `spm_wr` (§2.5) | read data, acks |
 | sem_inc | out | 6 + 4 | pulse | completion signals |
 
 **MXU (`core/mxu`)**
@@ -347,7 +361,7 @@ A leaf never forwards between its mesh ports (noc.md §1). Arrivals from a link 
 |---|---|---|
 | HBM to cores (die) | 3,277 B/cycle at peak | 16 HBM leaves x 2 planes x 128 = 4,096 B/cycle (80% at peak); mesh links at most 80% with stack-affine placement, 85% fully interleaved (noc.md §5) |
 | HBM share to one core | 102 B/cycle | 256 B/cycle per network interface (2 planes) |
-| Weights into the MXU in decode | ≤ 174 B/cycle FP8-equivalent (4-bit weights at the core's HBM share) | 512 B/cycle stationary load |
+| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85) | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle, stationary load 512 B/cycle: 256 elements/cycle in BF16, more in FP8 (numerics.md D1) |
 | D2D | collectives; the Phase 1 roofline is insensitive to D2D bandwidth above 1 TB/s | 1.4 TB/s per direction payload |
 | C2C | 0.8 TB/s per die (8 ports) | 4 leaves x 256 B/cycle = 1.5 TB/s (55% at peak) |
 | Prefill MXU feed | A 256 B/cycle + W 16 KiB per 256 A rows | SPM 2 KiB/cycle read |

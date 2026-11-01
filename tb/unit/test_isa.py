@@ -134,3 +134,78 @@ def test_python_constants_match(isa):
     assert ns["ENUMS"] == isa["enums"]
     assert ns["MEMMAP"]["hbm"]["fields"] == isa["memmap"]["hbm"]["fields"]
     assert ns["ENUMS"]["fault_cause"]["HBM_ALIGN"] == isa["enums"]["fault_cause"]["HBM_ALIGN"]
+
+
+@pytest.mark.parametrize("lay", [l for l in I.LAYOUTS if l in I.load()])
+def test_layout_fields_fit(isa, lay):
+    """Every field of a generated layout fits its width, fields that share bits never share a type, and every field
+    round-trips through pack / unpack at its maximum value."""
+    fields = I.layout_fields(isa, lay)
+    bits = isa[lay]["bits"]
+    assert all(f["bits"][0] < bits for f in fields.values())
+    types = I.layout_types(isa, lay) or [None]
+    sel = isa[lay].get("select")
+    for t in types:
+        valid = {k: f for k, f in fields.items() if t is None or f["types"] is None or t in f["types"]}
+        used = {}
+        for k, f in valid.items():
+            for b in range(f["bits"][1], f["bits"][0] + 1):
+                assert b not in used, f"{lay} {t}: {k} overlaps {used.get(b)}"
+                used[b] = k
+        vals = {k: (1 << I.width(f["bits"])) - 1 for k, f in valid.items() if k != sel and not f["enum"]}
+        vals.update({k: max(isa["enums"][f["enum"]].values()) for k, f in valid.items() if k != sel and f["enum"]})
+        if sel:
+            vals[sel] = t
+        w = I.pack(isa, lay, **vals)
+        assert 0 <= w < 1 << bits
+        back = I.unpack(isa, lay, w)
+        if sel:
+            back[sel] = t
+            vals[sel] = t
+        assert back == {k: vals.get(k, 0) for k in back}
+
+
+def test_noc_header_widths(isa):
+    """The header fields cover what the rest of the spec puts in them (noc.md section 2)."""
+    f = {k: I.width(v["bits"]) for k, v in I.layout_fields(isa, "noc_header").items()}
+    m = isa["machine"]
+    assert isa["noc_header"]["bits"] == 128                              # flit_t header sideband (microarch.md section 5)
+    assert 1 << f["tag"] >= m["dma_outstanding_reads"]                   # one tag per read granule in flight
+    assert f["addr"] == isa["memmap"]["gpa_bits"]
+    assert 1 << f["len"] > 2048 and 1 << f["blen"] > 2048                # 2 KiB requests and bursts
+    assert 1 << f["rsem"] >= m["semaphores"]
+    assert f["ini_node"] == I.width(isa["memmap"]["node_field"])
+    assert (f["hop_x"], f["hop_y"]) == (f["ini_x"], f["ini_y"]) == (4, 3)  # x 0..9 (leaves included), y 0..5
+    mc = I.fmt_fields(isa, "T_DMAMC")
+    assert [f[k] for k in ("mc_x0", "mc_x1", "mc_y0", "mc_y1")] == [I.width(mc[k]) for k in ("x0", "x1", "y0", "y1")]
+    assert 1 << f["gidx"] >= 2048 // 256                                 # granules of one 2 KiB read
+
+
+def test_layout_validator_rejects(isa):
+    bad = copy.deepcopy(isa)
+    bad["noc_header"]["fields"]["gidx"]["types"] = ["RD_RSP", "WR"]      # WR also uses addr at the same bits
+    with pytest.raises(I.IsaError):
+        I.validate(bad)
+    bad = copy.deepcopy(isa)
+    bad["noc_header"]["fields"]["rsv"]["bits"] = [128, 122]
+    with pytest.raises(I.IsaError):
+        I.validate(bad)
+    bad = copy.deepcopy(isa)
+    bad["paged_ptr"]["fields"]["row"] = [42, 20]                         # overlaps node
+    with pytest.raises(I.IsaError):
+        I.validate(bad)
+    with pytest.raises(I.IsaError):
+        I.pack(isa, "noc_header", type="RD_RSP", addr=1)                 # addr is not a response field
+
+
+def test_td_paging_and_scale_fields(isa):
+    """I-2: page shift, scale stride and scale-region offset are separate fields; T_DMA has page-table and tensor-scale
+    operands, so no operand has two meanings."""
+    td = isa["td"]["fields"]
+    assert {"aux0", "row_bytes", "sc_off", "page_shift"} <= set(td)
+    assert I.width(td["page_shift"]) == 5 and 256 << I.width(td["sc_off"]) >= 1 << 20
+    dma = I.fmt_fields(isa, "T_DMA")
+    assert {"idx_reg", "scale_reg", "aux_reg", "pt_reg", "ts_reg"} <= set(dma)
+    assert "SCALE_REGION" in isa["enums"]["td_flags"]
+    pp = I.layout_fields(isa, "paged_ptr")
+    assert pp["node"]["bits"] == tuple(isa["memmap"]["node_field"])

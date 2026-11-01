@@ -30,20 +30,37 @@ Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../report
 |---|---|---|---|---|
 | RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target) |
 | RD_RSP | RSP | 256 B | 2 | one per 256 B granule: tag + granule index; destination space reserved at request time |
-| WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id |
-| WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target, partial when the target's coalescing table is full (R-3) |
+| WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id and the burst's total bytes (`blen`) |
+| WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target (rules below) |
 | SEM | REQ | 8 B | 1 | `SIGNAL`: add or set at a semaphore address (a WR to the add window) |
 | MC_WR | REQ (MC VC) | ≤ 256 B | ≤ 2 | intra-die multicast to a mesh rectangle; posted, no ack; `rsem` applies at each destination |
 | ERR | RSP | none | 1 | address fault / unsupported operation |
 
-A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on the head flit:
-- destination router (x, y) and port;
-- source node, router and port;
-- VN and class;
-- type, tag (9 bits), address (49 bits) and length;
-- `rsem`, multicast rectangle and write op.
+A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on the head flit. Its bit layout is `isa.yaml`
+`noc_header`, generated into `isa_pkg`, `isa.h`, `isa_defs.py` and [isa_ref.md](isa_ref.md) (review finding I-12(b)):
+- `type` (3 bits, enum `noc_type`). The VN follows from the type, and the class (L, X, MC) is the virtual channel, so neither is a
+  header field.
+- `hop_x`, `hop_y`, `hop_port`: where the packet is routed on the current die. That is the final endpoint, or the link leaf on the
+  way to it. The receiving bridge rewrites it: from the address for a request, from the `ini_*` fields for a response.
+- `ini_node`, `ini_x`, `ini_y`, `ini_port`: the initiator. Requests carry it, and responses are delivered to it.
+- `tag` (9 bits: a read tag, or a write burst id), `len` (12 bits, bytes), `addr` (49 bits, requests only).
+- Type-specific fields share bits: `gidx` (granule index, `RD_RSP`), `cause` (`ERR`), `wop` and `rsem` (`WR`, `MC_WR`), `blen`
+  (total bytes of the burst, `WR`, `SEM`), and the multicast rectangle (`MC_WR`).
 
 Header in the sideband means a 256 B write is 2 flits, not 3.
+
+**Write acknowledgements** (reviews R-3, X-3). A target keeps a small coalescing table with one entry per (initiator, burst id):
+1. Every accepted `WR` or `SEM` adds its `len` to its entry. The packets of a burst arrive in any order.
+2. When the count reaches the packet's `blen`, the target sends one `WR_ACK` with the count.
+3. When the table is full and a new burst arrives, the oldest entry is acked early with its partial count. Accepting a write never
+   waits for ack state.
+4. An entry idle for `ACK_FLUSH` cycles (default 64) is acked with its partial count. This completes a burst whose entry was evicted
+   by rule 3: its remaining packets open a new entry that can never reach `blen`.
+5. An SRAM target acks only after the data, including a write-add result, is visible to later reads, and after the `rsem` add. The
+   HBM controller acks when the write is queued (hbm.md H-2).
+
+The initiator counts acknowledged bytes per burst until they reach `blen`. `noc.ack_coalescer` is the executable form; it is tested
+for exact completion at any table size and load, and the rule before X-3 (rules 2 and 4 missing) is shown to hang at low load.
 
 ## 3. Virtual networks and channels
 
@@ -80,6 +97,10 @@ Four mechanisms remove the four kinds of deadlock:
    - Requests and responses use separate VNs.
    - Every response is guaranteed to sink: the requester reserved the destination SPM space (reads) or the ack counter (writes)
      before sending the request.
+   - Sinking may take a bounded time (the DMA converter paces `ni_rsp`, microarch.md §2.5), but it never waits for the network.
+     In particular a DMA never sends read data on as a write: one operand of every DMA transfer is local (`TD_SPACE` otherwise,
+     review finding I-1). If it did, the response channel into a core would wait on that core's request injection, which closes a
+     cycle (tested below).
    - So RSP always drains, and every target can eventually consume a request.
    - Rule: **no endpoint generates a request in order to consume a request.**
      - Bridges never forward a packet.
@@ -87,8 +108,8 @@ Four mechanisms remove the four kinds of deadlock:
      - Command queues written remotely are flow-controlled by the sender, through credit semaphores.
      - Collectives receive into buffers announced beforehand by semaphores.
      - A target never waits for write-ack coalescing state before accepting a write: when its table is full it acks early with a
-       partial byte count (hbm.md H-2). Otherwise partial bursts could hold every table entry while their remaining packets wait
-       behind new bursts in the same VC.
+       partial byte count (§2, hbm.md H-2). Otherwise partial bursts could hold every table entry while their remaining packets wait
+       behind new bursts in the same VC. Liveness (every burst eventually acked) comes from `blen` and the idle flush (§2).
 3. **Deadlock across links:**
    - A die's mesh carries packets heading to a link and packets that arrived from one.
    - If those shared VCs, the cycle `D2D(0->1) -> die-1 column-8 channel -> D2D(1->0) -> die-0 column-8 channel -> D2D(0->1)` is
@@ -118,6 +139,7 @@ Four mechanisms remove the four kinds of deadlock:
 | REQ and RSP on one VN | **cycle** (protocol: request into a core, response out of it) |
 | Cross-rail forwarding in hardware (D2D then C2C, both in class X), 4 packages | **cycle** (through a C2C port row) |
 | An HBM leaf consumes a request by issuing one to the sibling die | **cycle** (D2D and back) |
+| A DMA forwards read data as a write (global-to-global copy without a local sink, review I-1) | **cycle** (two cores reading each other) |
 
 Each rejected design is a test case (`tb/unit/test_noc.py`), so a change that reintroduces one of them fails `make pytest`.
 - Coverage: the check is at channel-class granularity. More VCs per class with free allocation inside the class keep it valid.

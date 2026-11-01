@@ -35,6 +35,49 @@ def test_baseline_deadlock_free(packages):
 
 
 @pytest.mark.parametrize("kw", [dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
-                                dict(hbm_forwards=True)])
+                                dict(hbm_forwards=True),
+                                dict(dma_forwards=True)])          # review I-1: GLOBAL -> GLOBAL copy without a local sink
 def test_rejected_designs_deadlock(kw):
     assert N.find_cycle(N.build_cdg(**kw)) is not None
+
+
+def _bursts(rng, n_src, bursts_per_src, spread):
+    """WR packets of 2 KiB-or-shorter bursts, 256 B packets, arriving in random order within `spread` cycles."""
+    arr, totals = [], {}
+    for s in range(n_src):
+        for b in range(bursts_per_src):
+            blen = 256 * rng.randint(1, 8) - rng.choice([0, 0, 32])     # some bursts end on a partial packet
+            totals[(s, b)] = blen
+            t0 = rng.randrange(spread)
+            left = blen
+            while left:
+                n = min(256, left)
+                arr.append((t0 + rng.randrange(40), s, b, n, blen))
+                left -= n
+    return arr, totals
+
+
+@pytest.mark.parametrize("table", [1, 2, 8])
+@pytest.mark.parametrize("load", ["low", "high"])
+def test_ack_coalescing_completes(table, load):
+    """Review X-3: with the burst total in every WR (`blen`) and an idle flush, every burst is acknowledged exactly, at
+    any table size and load, and no accepted byte waits longer than the flush interval after the last packet."""
+    import random
+    rng = random.Random(table * 7 + (load == "high"))
+    arr, totals = _bursts(rng, n_src=3 if load == "low" else 24, bursts_per_src=2 if load == "low" else 12,
+                          spread=2000 if load == "low" else 200)
+    acks, left = N.ack_coalescer(arr, table=table, flush=64)
+    assert not left
+    got = {}
+    for t, s, b, n in acks:
+        got[(s, b)] = got.get((s, b), 0) + n
+        assert t <= max(a[0] for a in arr if (a[1], a[2]) == (s, b)) + 64
+    assert got == totals
+
+
+def test_ack_coalescing_without_trigger_hangs():
+    """The rule before the fix (ack only when the full table evicts): at low load the bursts are never acknowledged."""
+    import random
+    arr, totals = _bursts(random.Random(3), n_src=2, bursts_per_src=2, spread=500)
+    acks, left = N.ack_coalescer(arr, table=8, flush=None, use_blen=False)
+    assert not acks and set(left) == set(totals)

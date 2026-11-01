@@ -66,7 +66,9 @@ Principles:
 - Value = element × block scale (× tensor scale for NVFP4).
 - FP4 packing: element 2i is in bits [3:0] of its byte and element 2i+1 in bits [7:4].
 - Blocks run along the contiguous (K, input) dimension of a weight, and along the head dimension of a KV entry.
-- Scales are a separate array `[rows, K / block]`, row-major. The DMA reads it through the instruction's auxiliary descriptor.
+- Weights: scales are a separate array `[rows, K / block]`, row-major, at `R[scale_reg]` with row stride TD `aux0`.
+- Paged KV and index keys: each page holds the scales of its rows in a scale region (memmap.md §6).
+- The NVFP4 FP32 tensor scale is the DMA operand `R[ts_reg]` (isa.md §5), and `p_reg` for `VQUANT`.
 
 ## N-2. Conversions
 
@@ -81,7 +83,7 @@ Notation:
 | FP32 → E2M1 | `VQUANT` | `RNE` + `sat` to ±6 (NaN: block rule below) |
 | FP32 → INT* | VPU outputs | `RNE`, saturate to the integer range, NaN → 0 |
 | E4M3, E5M2, E2M1, BF16, FP16 → BF16 / FP32 | DMA, VPU inputs | exact. E5M2 Inf stays Inf. A BF16/FP32 subnormal arriving at an arithmetic unit reads as ±0 |
-| MXFP8, MXFP4, NVFP4 → BF16 | DMA `*_BF16` | exact: element × block scale. E2M1 × E4M3 has at most 6 significant bits, BF16 holds 8. The NVFP4 tensor scale is **not** applied to the elements; it becomes a column scale (one per 128-deep K tile). Values outside the BF16 normal range (never seen in real weights) overflow to Inf or flush |
+| MXFP8, MXFP4, NVFP4 → BF16 | DMA `*_BF16` | exact: element × block scale. E2M1 × E4M3 has at most 6 significant bits, BF16 holds 8. The NVFP4 tensor scale (`R[ts_reg]`) is **not** applied to the elements; it becomes a column scale (one per 128-deep K tile). Values outside the BF16 normal range (never seen in real weights) overflow to Inf or flush |
 | MXFP8, MXFP4, NVFP4 → E4M3 + column scales | DMA `*_E4M3` | **fold**, below |
 
 **Fold (`cvt MXFP4_E4M3`, `NVFP4_E4M3`, `MXFP8_E4M3`).** For each weight row r and each 256-element K tile t (8 MX blocks or 16 NVFP4
@@ -90,7 +92,7 @@ blocks; the last tile may be shorter):
    The DMA buffers one tile per row (≤ 256 elements) to know `amax` before it writes.
 2. Choose `c`, the smallest integer with `amax ≤ 448 · 2^c` (`c = 0` for an all-zero tile).
 3. Write the elements `v = RNE_E4M3(w · 2^-c)` with `sat`. Because of step 2 it never saturates.
-4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale for NVFP4, an exact FP32 product).
+4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4, an exact FP32 product).
 
 `MXU_MM` multiplies each tile's partial sum by `cs` (N-3).
 
@@ -272,8 +274,13 @@ Measured (MiniMax expert shape, three weight distributions):
 | Exact BF16 path | 2e-7 |
 
 Decision D1:
-- **Decode and other memory-bound GEMMs use the exact path** (`cvt NVFP4_BF16`). Decode is HBM-bound, and the stationary-load port
-  still has a 1.65x margin over a core's HBM share with NVFP4 expanded to BF16 (3.31x for FP8).
+- **Decode and other memory-bound GEMMs use the exact path** (`cvt NVFP4_BF16`). Decode is HBM-bound, and every stage of the weight
+  path keeps a 1.65x margin over a core's HBM share at 0.85 with NVFP4 expanded to BF16 (1.41x at peak share): the DMA converter
+  (256 elements/cycle), the DMA SPM write port (512 B/cycle) and the stationary-load port (512 B/cycle) all carry 256 BF16
+  elements per cycle (numerics_experiments.md E1).
+  - Review finding I-3: the margin was first checked at the stationary-load port only. The DMA SPM write port was then 256 B/cycle,
+    which held the exact path to 0.83x of the HBM share. It is now 512 B/cycle (microarch.md §2.5).
+  - The fold paths are also held to 256 elements per cycle by the converter: 1.56x (MXFP4) and 1.65x (NVFP4) over the share.
 - **Compute-bound GEMMs (prefill, large verify batches) use the fold** (`cvt NVFP4_E4M3`).
   - Its error is about the same as the FP8 activation quantization every FP8 deployment already accepts.
   - It is less than half the error of the served W4A4 path.

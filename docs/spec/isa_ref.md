@@ -44,9 +44,9 @@ Generated from `isa/isa.yaml`; the programming model is in [isa.md](isa.md). Eve
 
 | Opcode | Name | Format | Description |
 |---|---|---|---|
-| 0x40 | `DMA_COPY` | T_DMA | Copy the tile described by (src_reg, src_td) to (dst_reg, dst_td), converting with cvt and writing with wop. Shapes must have the same element count; the destination TD sets the order. n_reg != 0 overrides the outermost count of both TDs. A PAGED TD translates its outermost dimension through the page table at SPM[idx_reg]. Block formats read their scales from scale_reg (TD aux fields give the layout); FP8-target conversions write FP32 column scales to SPM[aux_reg]. rsem != 0: every packet adds its payload bytes to sem[rsem] of the core that owns the destination address once the data is written. |
-| 0x41 | `DMA_GATHER` | T_DMA | Row gather. src TD aux1 = row bytes (any size, no alignment needed); the index list (int32 or int64 per IDX64) is at SPM[idx_reg] with count from the dst TD outer dims or n_reg. Row i of the destination = source row index[i] (base = src_reg, row pitch = src TD s1). PAGED: indices are logical rows translated through the page table given by scale_reg. Conversions as DMA_COPY (MXFP8 rows with SCALE_INLINE). Keeps up to dma_outstanding_reads granules in flight. |
-| 0x42 | `DMA_SCATTER` | T_DMA | Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into SRAM). PAGED as DMA_GATHER. |
+| 0x40 | `DMA_COPY` | T_DMA | Copy the tile described by (src_reg, src_td) to (dst_reg, dst_td), converting with cvt and writing with wop. Shapes must have the same element count; the destination TD sets the order. n_reg != 0 overrides the outermost count of both TDs. At most one operand may be GLOBAL (else TD_SPACE): the other is local (SPM, DTAB, IMEM), so read data always sinks locally (noc.md section 4 rule 2). At most one TD may be PAGED; its row (dim 1) is translated through the page table at SPM[R[pt_reg]] and its base register is a paged pointer (memmap.md section 6). Block formats: scales of a non-paged operand are at R[scale_reg] with row stride TD aux0; a PAGED operand's scales are in the scale region of the same page. ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0). FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload bytes to sem[rsem] of the core that owns the destination address once the data is written. |
+| 0x41 | `DMA_GATHER` | T_DMA | Row gather. src TD row_bytes = row size (any size, no alignment needed); the index list (int32 or int64 per IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination = source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page. Operand spaces, conversions and scale operands as DMA_COPY (MXFP8 rows with SCALE_INLINE). Keeps up to dma_outstanding_reads granules in flight. |
+| 0x42 | `DMA_SCATTER` | T_DMA | Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into SRAM). Operand spaces as DMA_COPY; PAGED dst as DMA_GATHER's src. |
 | 0x43 | `DMA_MCAST` | T_DMAMC | Copy a local SPM tile to the same SPM offset (dst_reg, dst_td) in every core of the mesh rectangle x0..x1, y0..y1 of this die (XY-tree multicast in the network). rsem applies at each destination. |
 | 0x44 | `DMA_LIST` | T_DMAL | Execute R[n_reg] + imm DMA descriptors stored back to back at SPM[R[list_reg]] (each 32 B: an encoded DMA_COPY/GATHER/SCATTER/MCAST/SIGNAL operand block with absolute addresses instead of registers). Used for collective schedules and other precomputed transfer lists. Completion = all listed transfers complete. |
 | 0x45 | `SIGNAL` | T_SIG | After every earlier instruction in this DMA queue has completed (writes acknowledged), write to the semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it. Release semantics for producer/consumer hand-off across cores, dies and packages. |
@@ -95,7 +95,7 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 | S_CSR | `rd` [90:86], `rs1` [85:81], `csr` [75:64] |
 | S_FENCE | `qmask` [76:70] |
 | S_IRQ | `imm` [31:0] |
-| T_DMA | `dq` [90:89], `src_reg` [88:84], `src_td` [83:76], `dst_reg` [75:71], `dst_td` [70:63], `cvt` [62:58], `wop` [57:55], `idx_reg` [54:50], `n_reg` [49:45], `rsem` [44:39], `scale_reg` [38:34], `aux_reg` [33:29] |
+| T_DMA | `dq` [90:89], `src_reg` [88:84], `src_td` [83:76], `dst_reg` [75:71], `dst_td` [70:63], `cvt` [62:58], `wop` [57:55], `idx_reg` [54:50], `n_reg` [49:45], `rsem` [44:39], `scale_reg` [38:34], `aux_reg` [33:29], `pt_reg` [28:24], `ts_reg` [23:19] |
 | T_DMAMC | `dq` [90:89], `src_reg` [88:84], `src_td` [83:76], `dst_reg` [75:71], `dst_td` [70:63], `rsem` [44:39], `x0` [20:17], `x1` [16:13], `y0` [12:10], `y1` [9:7] |
 | T_DMAL | `dq` [90:89], `list_reg` [88:84], `n_reg` [83:79], `imm` [31:0] |
 | T_SIG | `dq` [90:89], `addr_reg` [88:84], `val_reg` [83:79], `mode` [78:77], `imm` [31:0] |
@@ -117,14 +117,53 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 | `s2` | [143:112] |
 | `s3` | [175:144] |
 | `aux0` | [207:176] |
-| `aux1` | [239:208] |
-| `rsv` | [255:240] |
+| `row_bytes` | [231:208] |
+| `sc_off` | [243:232] |
+| `page_shift` | [248:244] |
+| `rsv` | [255:249] |
+
+## Paged pointer (base register of a PAGED operand, memmap.md section 6), 64 bits
+
+| Field | Bits |
+|---|---|
+| `byte` | [19:0] |
+| `row` | [41:20] |
+| `node` | [48:42] |
+| `rsv` | [63:49] |
+
+## NoC packet header (head-flit sideband, noc.md section 2), 128 bits
+
+`type` selects the layout; a field marked with types is valid only for those types, so fields of disjoint type sets share bits.
+
+| Field | Bits | Valid for |
+|---|---|---|
+| `type` (`noc_type`) | [2:0] | all |
+| `hop_x` | [6:3] | ERR, RD_REQ, RD_RSP, SEM, WR, WR_ACK |
+| `hop_y` | [9:7] | ERR, RD_REQ, RD_RSP, SEM, WR, WR_ACK |
+| `hop_port` | [12:10] | ERR, RD_REQ, RD_RSP, SEM, WR, WR_ACK |
+| `ini_node` | [19:13] | all |
+| `ini_x` | [23:20] | all |
+| `ini_y` | [26:24] | all |
+| `ini_port` | [29:27] | all |
+| `tag` | [38:30] | ERR, RD_REQ, RD_RSP, SEM, WR, WR_ACK |
+| `len` | [50:39] | MC_WR, RD_REQ, SEM, WR, WR_ACK |
+| `addr` | [99:51] | MC_WR, RD_REQ, SEM, WR |
+| `gidx` | [53:51] | RD_RSP |
+| `cause` (`fault_cause`) | [57:54] | ERR |
+| `wop` (`wop`) | [101:100] | MC_WR, WR |
+| `rsem` | [107:102] | MC_WR, WR |
+| `blen` | [119:108] | SEM, WR |
+| `mc_x0` | [111:108] | MC_WR |
+| `mc_x1` | [115:112] | MC_WR |
+| `mc_y0` | [118:116] | MC_WR |
+| `mc_y1` | [121:119] | MC_WR |
+| `rsv` | [127:122] | all |
 
 ## Enumerations
 
 - `dtype`: FP32 = 0, BF16 = 1, FP16 = 2, E4M3 = 3, E5M2 = 4, MXFP8 = 5, MXFP4 = 6, NVFP4 = 7, INT8 = 8, UINT8 = 9, INT16 = 10, INT32 = 11, INT64 = 12, E8M0 = 13, UINT32 = 14
 - `space`: GLOBAL = 0, SPM = 1, ACC = 2, DTAB = 3, IMEM = 4
-- `td_flags`: PAGED = 0, IDX64 = 1, WRAP = 2, SCALE_INLINE = 3
+- `td_flags`: PAGED = 0, IDX64 = 1, WRAP = 2, SCALE_INLINE = 3, SCALE_REGION = 4
 - `cvt`: NONE = 0, MXFP4_E4M3 = 1, NVFP4_E4M3 = 2, MXFP8_E4M3 = 3, MXFP4_BF16 = 4, NVFP4_BF16 = 5, MXFP8_BF16 = 6, E4M3_BF16 = 7, E5M2_BF16 = 8, BF16_FP32 = 9, FP32_BF16 = 10
 - `wop`: WRITE = 0, ADD_F32 = 1, ADD_BF16 = 2, MAX_F32 = 3
 - `acc_mode`: OVERWRITE = 0, ACCUM = 1, RESCALE = 2
@@ -141,3 +180,4 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 - `hc_post_func`: MHC = 0, GATED = 1
 - `csr`: CORE_ID = 0, NODE_ID = 1, CYCLE = 2, PC = 3, STATUS = 4, FAULT_CAUSE = 5, FAULT_ADDR = 6, FP_STATUS = 7, PERF_SEL = 16, PERF_CNT0 = 17, PERF_CNT1 = 18, SEM_BASE_GPA = 32
 - `fault_cause`: NONE = 0, ILLEGAL_OP = 1, ILLEGAL_FIELD = 2, TD_SPACE = 3, ADDR_UNMAPPED = 4, ADDR_FORBIDDEN = 5, RAIL = 6, RANGE = 7, HBM_WADD = 8, HBM_ALIGN = 9, SEM_BUSY = 10, PTE_INVALID = 11, LINK = 12, ERR_RSP = 13
+- `noc_type`: RD_REQ = 0, RD_RSP = 1, WR = 2, WR_ACK = 3, SEM = 4, MC_WR = 5, ERR = 6

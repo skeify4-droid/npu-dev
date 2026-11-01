@@ -13,6 +13,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OPCODE = (127, 120)
 TILE_OPERANDS = (90, 0)
+# Bit layouts other than instructions and the TD, generated the same way: {bits, [select], fields}.
+LAYOUTS = ("paged_ptr", "noc_header", "dma_list_entry")
 
 
 class IsaError(Exception):
@@ -62,6 +64,58 @@ def _enum_fits(isa, ename, bits, what):
         raise IsaError(f"{what}: enum {ename} needs more than {bits} bits")
     if len(set(vals)) != len(vals):
         raise IsaError(f"enum {ename} has duplicate values")
+
+
+def layout_fields(isa, name):
+    """Fields of a layout section as {field: {"bits": (msb, lsb), "types": set of type names or None, "enum": str or None}}."""
+    out = {}
+    for k, v in isa[name]["fields"].items():
+        if isinstance(v, dict):
+            out[k] = {"bits": tuple(v["bits"]), "types": set(v["types"]) if "types" in v else None, "enum": v.get("enum")}
+        else:
+            out[k] = {"bits": tuple(v), "types": None, "enum": None}
+    return out
+
+
+def layout_types(isa, name):
+    """Type names of a layout with a `select` field (from that field's enum), else None."""
+    sel = isa[name].get("select")
+    if not sel:
+        return None
+    return list(isa["enums"][layout_fields(isa, name)[sel]["enum"]])
+
+
+def _validate_layout(isa, name):
+    lay = isa[name]
+    bits = lay["bits"]
+    fields = layout_fields(isa, name)
+    types = layout_types(isa, name)
+    sel = lay.get("select")
+    if sel and (sel not in fields or not fields[sel]["enum"] or fields[sel]["types"] is not None):
+        raise IsaError(f"{name}: select field {sel} must exist, be an enum and be valid for every type")
+    for k, f in fields.items():
+        m, l = f["bits"]
+        if m < l or l < 0:
+            raise IsaError(f"{name}: field {k} has a bad range")
+        if m >= bits:
+            raise IsaError(f"{name}: field {k} beyond bit {bits - 1}")
+        if f["types"] is not None:
+            if types is None:
+                raise IsaError(f"{name}: field {k} lists types but the layout has no select field")
+            bad = f["types"] - set(types)
+            if bad:
+                raise IsaError(f"{name}: field {k} names unknown types {sorted(bad)}")
+        if f["enum"]:
+            _enum_fits(isa, f["enum"], width(f["bits"]), f"{name} field {k}")
+    every = set(types or ["*"])
+    names = list(fields)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            (ma, la), (mb, lb) = fields[a]["bits"], fields[b]["bits"]
+            if la <= mb and lb <= ma:                     # the bit ranges overlap
+                ta, tb = fields[a]["types"] or every, fields[b]["types"] or every
+                if ta & tb:
+                    raise IsaError(f"{name}: fields {a} and {b} overlap for {sorted(ta & tb)}")
 
 
 def validate(isa):
@@ -128,6 +182,9 @@ def validate(isa):
         raise IsaError("td beyond td_bytes")
     _enum_fits(isa, "dtype", width(isa["td"]["fields"]["dtype"]), "td dtype")
     _enum_fits(isa, "space", width(isa["td"]["fields"]["space"]), "td space")
+    for name in LAYOUTS:
+        if name in isa:
+            _validate_layout(isa, name)
     mm = isa.get("memmap")
     if mm:
         regs = sorted((r["base"], r["base"] + r.get("stride", r["size"]) * r.get("count", 1), n) for n, r in mm["regions"].items())
@@ -187,6 +244,53 @@ def decode(isa, word):
             v -= 1 << width(r)
         out[k] = v
     return name, out
+
+
+def pack(isa, name, **vals):
+    """Pack a layout (paged_ptr, noc_header, dma_list_entry). Enum fields take names. With a select field, only fields
+    valid for the selected type may be given."""
+    fields = layout_fields(isa, name)
+    sel = isa[name].get("select")
+    tname = None
+    if sel:
+        t = vals.get(sel, 0)
+        en = isa["enums"][fields[sel]["enum"]]
+        tname = t if isinstance(t, str) else {v: k for k, v in en.items()}[t]
+        vals = dict(vals, **{sel: tname})
+    w = 0
+    for k, v in vals.items():
+        if k not in fields:
+            raise IsaError(f"{name}: no field {k}")
+        f = fields[k]
+        if tname is not None and f["types"] is not None and tname not in f["types"]:
+            raise IsaError(f"{name}: field {k} is not valid for {tname}")
+        if isinstance(v, str):
+            if not f["enum"]:
+                raise IsaError(f"{name}.{k}: symbolic value for a numeric field")
+            v = isa["enums"][f["enum"]][v]
+        if not 0 <= v <= _mask(f["bits"]):
+            raise IsaError(f"{name}.{k}={v} does not fit {width(f['bits'])} bits")
+        w |= v << f["bits"][1]
+    return w
+
+
+def unpack(isa, name, word):
+    """Inverse of pack: the fields valid for the word's type (all fields if the layout has no select field)."""
+    fields = layout_fields(isa, name)
+    sel = isa[name].get("select")
+    tname = None
+    if sel:
+        en = isa["enums"][fields[sel]["enum"]]
+        code = (word >> fields[sel]["bits"][1]) & _mask(fields[sel]["bits"])
+        tname = {v: k for k, v in en.items()}.get(code)
+        if tname is None:
+            raise IsaError(f"{name}: unknown type code {code}")
+    out = {}
+    for k, f in fields.items():
+        if tname is not None and f["types"] is not None and tname not in f["types"]:
+            continue
+        out[k] = (word >> f["bits"][1]) & _mask(f["bits"])
+    return out
 
 
 def queue_of(isa, name, fields):
@@ -274,6 +378,13 @@ def emit_sv(isa):
     for k, (m, l) in isa["td"]["fields"].items():
         L.append(f"  localparam int TD_{_id(k)}_MSB = {m};")
         L.append(f"  localparam int TD_{_id(k)}_LSB = {l};")
+    for lay in LAYOUTS:
+        if lay in isa:
+            L.append(f"  // {lay}")
+            L.append(f"  localparam int {_id(lay)}_BITS = {isa[lay]['bits']};")
+            for k, f in layout_fields(isa, lay).items():
+                L.append(f"  localparam int {_id(lay)}_{_id(k)}_MSB = {f['bits'][0]};")
+                L.append(f"  localparam int {_id(lay)}_{_id(k)}_LSB = {f['bits'][1]};")
     L.append("  // enums")
     for e, vals in isa["enums"].items():
         bits = max(1, max(vals.values()).bit_length())
@@ -328,6 +439,12 @@ def emit_h(isa):
             L.append(f"constexpr Field k{fmt}_{k}{{{m}, {l}}};")
     for k, (m, l) in isa["td"]["fields"].items():
         L.append(f"constexpr Field kTd_{k}{{{m}, {l}}};")
+    for lay in LAYOUTS:
+        if lay in isa:
+            cam = "".join(p.capitalize() for p in lay.split("_"))
+            L.append(f"constexpr int k{cam}Bits = {isa[lay]['bits']};")
+            for k, f in layout_fields(isa, lay).items():
+                L.append(f"constexpr Field k{cam}_{k}{{{f['bits'][0]}, {f['bits'][1]}}};")
     for e, vals in isa["enums"].items():
         L.append(f"enum class {''.join(p.capitalize() for p in e.split('_'))} : uint16_t {{")
         for n, v in vals.items():
@@ -362,6 +479,10 @@ def emit_py(isa):
             "SYNC": {k: list(v) for k, v in isa["sync"].items()},
             "FORMATS": {fmt: {k: list(v) for k, v in fmt_fields(isa, fmt).items()} for fmt in isa["formats"]},
             "TD_FIELDS": {k: list(v) for k, v in isa["td"]["fields"].items()},
+            "LAYOUTS": {lay: {"bits": isa[lay]["bits"], "select": isa[lay].get("select"),
+                              "fields": {k: {"bits": list(f["bits"]), "types": sorted(f["types"]) if f["types"] else None,
+                                             "enum": f["enum"]} for k, f in layout_fields(isa, lay).items()}}
+                        for lay in LAYOUTS if lay in isa},
             "ENUMS": isa["enums"], "MEMMAP": isa.get("memmap", {})}
     L = [f"# {HDR}", f'"""ISA v{isa['version']} constants generated from isa/isa.yaml (docs/spec/isa_ref.md)."""', ""]
     for k, v in pick.items():
@@ -397,6 +518,26 @@ def emit_md(isa):
     L += ["", "## Tile descriptor (DTAB entry, 256 bits)", "", "| Field | Bits |", "|---|---|"]
     for k, (m, l) in isa["td"]["fields"].items():
         L.append(f"| `{k}` | [{m}:{l}] |")
+    titles = {"paged_ptr": "Paged pointer (base register of a PAGED operand, memmap.md section 6)",
+              "noc_header": "NoC packet header (head-flit sideband, noc.md section 2)",
+              "dma_list_entry": "DMA_LIST entry (32 B in SPM, isa.md section 5)"}
+    for lay in LAYOUTS:
+        if lay not in isa:
+            continue
+        fields = layout_fields(isa, lay)
+        sel = isa[lay].get("select")
+        L += ["", f"## {titles.get(lay, lay)}, {isa[lay]['bits']} bits", ""]
+        if sel:
+            L += [f"`{sel}` selects the layout; a field marked with types is valid only for those types, so fields of disjoint "
+                  "type sets share bits.", "", "| Field | Bits | Valid for |", "|---|---|---|"]
+        else:
+            L += ["| Field | Bits |", "|---|---|"]
+        for k, f in sorted(fields.items(), key=lambda x: (x[1]["bits"][1], x[0])):
+            ext = f" (`{f['enum']}`)" if f["enum"] else ""
+            if sel:
+                L.append(f"| `{k}`{ext} | [{f['bits'][0]}:{f['bits'][1]}] | {', '.join(sorted(f['types'])) if f['types'] else 'all'} |")
+            else:
+                L.append(f"| `{k}`{ext} | [{f['bits'][0]}:{f['bits'][1]}] |")
     L += ["", "## Enumerations", ""]
     for e, vals in isa["enums"].items():
         L.append(f"- `{e}`: " + ", ".join(f"{n} = {v}" for n, v in vals.items()))
