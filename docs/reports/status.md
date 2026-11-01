@@ -374,3 +374,43 @@ finding (status, group, what was done); the reviewer's tables are unchanged.
   checker's rule-removal test; the Phase 7 / golden-model deadlock detector (X-6); vendor PHY latencies; the DeepSeek `hc_fn` check
   for numerics D2.
 
+
+## Phase 2: fixes for the verification findings (2026-11-01)
+
+### Changes
+The verification session (312f927) confirmed the first fix session and found V-1 to V-11 (spec_review.md, Verification). This
+session fixed all eleven on branch `spec-verification-fixes`, one commit per group, with `make pytest` green before each. The
+"Resolutions (verification fixes)" section of `docs/reports/spec_review.md` has one row per finding. The reviewer's and the
+verifier's tables are unchanged.
+- **Group 1 (7575888), `core/dma`:**
+  - V-1: block scales are staged in an SPM ring (CSR `DMA_STAGE`) before their data, and split units are staged raw, so `ni_rsp`
+    never waits on the network. `noc.py` has the old rule as a rejected variant.
+  - V-3: the four DQs are served independently.
+  - V-4: the scale address uses the whole in-row offset (`isa.paged_addr`).
+  - V-5: write packets merge adjacent rows. memmap.md §6 has a worked DeepSeek index-key and MiniMax KV append.
+- **Group 2 (2bd39fa), `core/seq`:** V-2, the user's decision. No kernel barrier: the L-6 parity and consumer credits carry across
+  kernels. isa.md §3 (I-4 and I-5 text) was made consistent with it.
+- **Group 3 (eb1f153), low severity:**
+  - V-6: list entries are checked like their instructions.
+  - V-7: replay-buffer requests get `ERR` (`LINK`), and the test accepts `TIMEOUT`. A faulted core's NI keeps sinking.
+  - V-8: padded W tiles are 2 KiB aligned.
+  - V-9: `dtab_rd` is request/grant.
+  - V-10: `ERR` gains `err_wr`, and a write burst has one target.
+  - V-11: both directions of the serial window.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 for NVFP4 → BF16 is now 1.60x at 0.85 share (was 1.65x), because the
+  staged scales share the DMA's SPM write port. A dedicated scale SRAM would have changed the frozen SRAM row, so the ring is in SPM.
+- Regenerated: `make numerics` (D1 table only) and `make isa`. `make hbm` and `make links` inputs are unchanged.
+- V-2 cost (asked before choosing): a barrier per kernel would cost 0.4-2.7% of a DeepSeek decode step at one kernel per layer.
+  Credits cost 0 extra sync points and 0 semaphores.
+
+### Tests
+- `make pytest`: 197 passed (190 before). `test_isa.py` 18 → 23, `test_noc.py` 17 → 19.
+- `make isa` (Verilator lint of `isa_pkg`) clean. No RTL changed.
+
+### Next
+- A verification pass on these fixes (check-first list at the end of spec_review.md), then Phase 3 RTL on `core/dma` and
+  `core/seq`. `hbm`, `common` and `arith` can start now.
+- Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7), the golden-model checks (X-6 detector, V-2
+  credits), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.

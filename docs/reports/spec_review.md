@@ -414,3 +414,74 @@ below as V-n); **not resolved**.
 - the L7 inputs (lookups per token, table dimensions) beyond regenerating the table;
 - X-4 against an executable model (checked by argument; the tests are in Phase 4).
 
+
+# Resolutions (verification fixes, 2026-11-01)
+
+**Who:** a second fix session (Opus 5.5). It is not the author, the reviewer, the first fix session or the verifier. Each suggested
+resolution was checked against the specs and then taken, changed or rejected; each row says which and why. The reviewer's and the
+verifier's tables above are unchanged. Branch `spec-verification-fixes` from 312f927, one commit per group, `make pytest` green
+before each.
+
+| Group | Commit | Findings |
+|---|---|---|
+| 1 | 7575888 | V-1, V-3, V-4, V-5 (`core/dma`) |
+| 2 | 2bd39fa | V-2 (`core/seq`, decided by the user) |
+| 3 | eb1f153 | V-6 to V-11 |
+
+| # | Status | Group | What was done |
+|---|---|---|---|
+| V-1 | fixed | 1 | Took the first option ("scales are local before the data"), changed where they land, and extended it to every split unit. Out-of-line scales (`scale_reg`, page scale region) are read into an SPM staging ring (CSR `DMA_STAGE`, runtime-reserved, 16 KiB = two round trips of NVFP4 scales) before any data read that needs them. A conversion unit whose bytes span responses (a `SCALE_INLINE` row such as a 264 B Engram row, or a fold tile across a 256 B granule) gets a staging slot when its reads are issued and is converted from SPM. Rejected a scale SRAM inside the DMA: 16 KiB per core adds 512 KiB per die to the frozen SRAM row. Rejected converting all data from SPM (the second option): raw plus converted bytes on the 512 B/cycle write port would cut NVFP4 → BF16 to 1.29x. Cost: the staged scales share the write port, so D1 for NVFP4 → BF16 is now 1.60x at 0.85 share (was 1.65x; fold margins unchanged; `make numerics` regenerated, only the D1 table changed), and the first data of a converting transfer arrives one round trip later. microarch.md §2.5 and `core/dma` table, noc.md §4 rule 2, isa.md §5, numerics.md D1, arch.md change log. `noc.build_cdg(scales_after_data=True)` is the old rule: a cycle on the response route into a core (`test_noc.py`). Left as a Phase 3 option: choosing the fold exponent from the block scales alone, which removes the split-tile case but changes N-2. |
+| V-3 | fixed | 1 | Took it. Each DQ has its own sequencer (head, its wait, address-generator state). Tags, staging ring, SPM ports and NI injection are taken per packet, round-robin over the DQs that have a packet ready, and only after the head's wait is satisfied. microarch.md §2.5 and the `core/dma` `q_pop` row, isa.md §3, d2d_c2c.md L-7 rule 2. A Phase 3 test is listed in PLAN. |
+| V-4 | fixed | 1 | Took the formula: the scale comes from the whole in-row offset `o`. Added that `byte`, `s2` and `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`), so every dim-0 run starts on a block. Rejected forbidding n2, n3 > 1: the MiniMax 4-group KV read needs n2 = 4. The same rule is now stated for non-paged operands (`scale_reg` = the scale of the base element's block). `isa.paged_addr` is the reference, with `isa.yaml` `dtype_info` (element bits, block, scale dtype). `test_paged_scale_uses_whole_in_row_offset` shows that the old formula gives groups 1-3 group 0's scales. |
+| V-5 | fixed | 1 | Took the first option, generalized: a write packet holds contiguous destination bytes. Adjacent runs merge, consecutive paged rows of one page included, up to a 256 B granule, and `HBM_ALIGN` is checked per packet. Rejected a whole-block `SCALE_REGION` mode: it is a second addressing mode for what merging already gives. Also stated that `cvt = NONE` moves no scales, which the two-transfer append assumed. memmap.md §6 worked example: DeepSeek MXFP4 index key (1,024-row pages = 17 frames; a 64 B data packet and 8 scale rows merged into one 32 B packet) and MiniMax NVFP4 KV (128-row pages = 9 frames; 256 B + 32 B packets, no tail block needed), with the `T_DMA` fields and the read-back scale addresses. `test_paged_append_walk` computes the example from packed TD and `paged_ptr` fields, including MiniMax's 8 B index-key rows. PLAN Phase 3 `core/dma` lists the tests. |
+| V-2 | fixed (decided by the user: credit) | 2 | Costed the three options and asked. (a) Barrier per kernel: +1 system-wide sync per boundary, about 0.6-4.5 µs across 8 dies, which is 0.4-2.7% of a DeepSeek decode step at one kernel per layer, and 0 semaphores. (b1) The L-6 parity plus consumer credit, carried across kernels: 0 extra sync points and 0 extra semaphores. (b2) Kernel-parity sets: twice the network-facing semaphores, and kernel k + 2 still needs a credit or a lagged barrier. Chosen: (b1). isa.md §3 now says there is no kernel barrier, that every network-facing semaphore follows L-6, and that parities, credits and bases carry over. The I-5 text now says the CP waits for halts before it reads results, not before a core's next kernel. d2d_c2c.md L-6 "Across kernels"; PLAN: the `core/seq` row and the golden-model check. |
+| V-6 | fixed | 3 | Took it: list entries are checked like the instruction they encode (`TD_SPACE`, `rsem` rules). Added that `FAULT_ADDR` holds the entry's SPM offset. isa.md §5, `isa.yaml` `DMA_LIST` and `dma_list_entry`. |
+| V-7 | fixed | 3 | Took both halves, with a change. A down bridge answers the request heads in its replay buffer with `ERR` (`LINK`) before it discards the buffer. Requests the far side had already accepted cannot get an `ERR`, because bridges keep no table of outstanding requests. They fault with `TIMEOUT`, and the Phase 4 test accepts `LINK` or `TIMEOUT`. isa.md §8: a fault stops the front end and the engines, not the NI (responses are sunk and dropped, and targets keep serving). d2d_c2c.md L-4, L-11, noc.md §7, PLAN Phase 4. |
+| V-8 | fixed | 3 | Took the alignment option: padded stationary-load tiles start on a 2 KiB boundary. Rejected padding 8 KiB by 1 KiB. Measured over every base below 128 KiB: it fixes the 256 B-aligned bases, but at bases that are only 64 B aligned (which memmap.md §4 allows) most padded pitches collide anyway. So an alignment rule is needed either way, and 2 KiB alone covers every pitch. `test_spm_bank_strides_over_tile_bases`: every padded pitch is conflict-free at all 2 KiB-aligned bases, and at all 256 B-aligned bases except 8 KiB + 512 B, where 256 of 512 collide (0x200 is one). |
+| V-9 | fixed | 3 | Took it: the DMA, MXU and VPU `dtab_rd` rows and the `core/dtab` `rd` row are request/grant, with data 1 cycle after the grant. microarch.md §5. |
+| V-10 | fixed | 3 | (a) Took the bit: `noc_header` `err_wr` (bit 58, `ERR` only) says whether `tag` is a read tag or a write burst id. Rejected one shared tag space, which would tie the sizes of the two tables. The field is generated, and the header test checks it. (b) Took it: a write burst stays inside one 2 KiB-aligned block, so it has one target, as reads do. noc.md §2, microarch.md §2.6, memmap.md §4. |
+| V-11 | fixed | 3 | Took it: isa.md §3 states `|value - target| < 2^31` in both directions, and that the carried base and the credits bound the stale side. |
+
+**Proposals not taken as written** (the row says why): V-1 (an SPM ring instead of a buffer in the DMA, extended to inline scales
+and split fold tiles), V-4 (formula plus block alignment, n2 > 1 kept), V-5 (a general merge rule instead of a block mode), V-7
+(`TIMEOUT` accepted for requests the far side had accepted), V-8 (alignment instead of a 1 KiB pad), V-10 (a) (a bit, not a shared
+tag space).
+
+**Regenerated:**
+- `make numerics`: D1 feed table only. NVFP4 → BF16 1.65x → 1.60x; the fold rows' SPM write column is now 482-496 B/cycle, margins
+  unchanged.
+- `make isa`: CSR `DMA_STAGE`, `noc_header.err_wr`, and the `dtype_info` table, which is validated.
+- `make hbm` and `make links`: their inputs did not change (text only in hbm.md and d2d_c2c.md), so they were not rerun.
+
+**Frozen numbers:** none changed. arch.md has a change-log row. A dedicated scale SRAM would have changed the SRAM row, and V-1
+avoids it.
+
+**Tests:** `make pytest` 197 passed (190 before). `test_isa.py` 18 → 23: three append walks, the in-row scale offset, SPM banks over
+tile bases. `test_noc.py` 17 → 19: the V-1 rejected variant and its cycle's location.
+
+## Before Phase 3, after the verification fixes
+
+| Block | Still open |
+|---|---|
+| `core/dma` | none at the spec level (V-1, V-3, V-4, V-5, V-6, V-9, V-10 fixed); the Phase 3 tests are listed in PLAN |
+| `core/seq` | none (V-2 decided: credit) |
+| `hbm` | none; X-2 (a), (c)-(e) stay on the H-9 checklist |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | V-7: text fixed, test in Phase 4 |
+| compiler / runtime | rules to implement: V-2 (credits across kernels, golden-model check), V-8 (2 KiB-aligned padded W tiles) |
+
+**For the verification pass, check first:**
+1. **V-1 end to end.** A paged NVFP4 KV gather and a weight stream through `scale_reg`: every response must convert from ring-local
+   state only. Then the ring itself: space is allocated at read issue and freed at conversion, and a split unit's reads are issued
+   together. Can the ring fill with scales whose data can never be issued?
+2. **V-1 with V-3.** The ring is shared by the four DQs. Check that no DQ can hold ring space while its head waits, and that X-6
+   rule 2 still holds.
+3. **V-7 duplicates.** A request in a down D2D sub-link's replay buffer may have reached the far side, and its response may come
+   back over another sub-link. Then the initiator gets both the response and an `ERR` (`LINK`), possibly for a reused tag. The core
+   faults either way, but `FAULT_ADDR` may be wrong. Is that acceptable?
+4. **V-2.** The credit rule must cover every network-facing semaphore: collectives, pipeline hand-off, HBM `SIGNAL` buffers,
+   multicast destinations. The I-5 text must no longer imply a barrier. Check V-11's stale bound under the carried base.
+5. **V-4 / V-5 worked example** against `isa.paged_addr` and `test_paged_append_walk`. A tail block never crosses a page (rows per
+   block divides rows per page). Check how the merge rule interacts with HBM write merging (H-2) when the block is rewritten every
+   step.
+6. **D1 consistency.** Nothing outside the arch.md history row should still quote 1.65x for NVFP4 → BF16.

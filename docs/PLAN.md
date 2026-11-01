@@ -220,9 +220,13 @@ session checks the fixes next.
   and a fix session ([spec_review.md](reports/spec_review.md), Resolutions).
   - **Gating findings closed (2026-11-01, fix session).** The findings the review's "Before Phase 3" table lists for `core/dma`
     (I-1, I-2, I-3, I-5, I-12(a), X-3), `core/seq` (I-4, I-11) and `hbm` (I-9, I-10, I-12(b), X-1, X-2(b), X-3) are fixed at the
-    spec level; see the Resolutions section of [spec_review.md](reports/spec_review.md). Phase 3 RTL on those blocks may start once
-    a verification session has checked the fixes. X-2 (a), (c)-(e) stay on the hbm.md H-9 JESD238 checklist as timing-table
-    parameters.
+    spec level; see the Resolutions section of [spec_review.md](reports/spec_review.md). X-2 (a), (c)-(e) stay on the hbm.md H-9
+    JESD238 checklist as timing-table parameters.
+  - **Verified, then fixed again (2026-11-01).** The verification session (312f927) confirmed the fixes and found V-1 to V-11.
+    `hbm` had no new finding. The second fix session resolved all eleven on branch `spec-verification-fixes` (7575888, 2bd39fa,
+    eb1f153; spec_review.md "Resolutions (verification fixes)"). V-2 was decided by the user: consumer credits across kernels,
+    no kernel barrier. Phase 3 RTL on `hbm` may start now. On `core/dma` and `core/seq` it starts after a verification pass of
+    these fixes.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)
