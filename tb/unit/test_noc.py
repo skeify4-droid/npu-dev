@@ -29,6 +29,19 @@ def test_peak_loads():
     assert N.d2d_max_bpc() * N.CLOCK >= 1.4e12
 
 
+def test_gather_leaf_load():
+    """X-9: 8 cores of a stack on the paged NVFP4 KV gather (a 32 B scale read and a 256 B row per row) at the 0.85 share.
+    With every RD_RSP 2 flits the busiest HBM leaf -> mesh link is at 1.21 (4 RSP flits per 288 B, against 0.68 for 2 KiB
+    reads at the same rate); a 1-flit response for valid bytes inside one 128 B half brings it to 0.91."""
+    sc = N.scenarios()
+    assert abs(sc["hbm_read_affine_0.85"][0] - 0.68) < 0.005
+    assert abs(sc["kv_gather_stack_2flit"][0] - 1.21) < 0.005 and N.is_leaf(sc["kv_gather_stack_2flit"][1][0])
+    assert abs(sc["kv_gather_stack"][0] - 0.91) < 0.005
+    assert sc["engram_gather_stack"][0] < 1.0
+    assert [N.rsp_flits(a, n, True) for a, n in ((96, 32), (0, 256), (120, 16), (64, 1024))] == [1, 2, 2, 9]
+    assert N.rsp_flits(96, 32) == 2
+
+
 @pytest.mark.parametrize("packages", [2, 4])
 def test_baseline_deadlock_free(packages):
     assert N.find_cycle(N.build_cdg(packages=packages)) is None

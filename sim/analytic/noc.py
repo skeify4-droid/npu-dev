@@ -110,6 +110,32 @@ def hbm_read(load, affine=True, frac=1.0):
             read_traffic(load, c, l, per_core / len(leaves))
 
 
+def rsp_flits(addr, nbytes, one_flit=False):
+    """Flits of the RD_RSPs of one read request (noc.md section 2): one response per 256 B granule it touches, 2 flits
+    each; with one_flit (review X-9 option) a response whose valid bytes lie in one 128 B half of its granule is 1 flit."""
+    n, lo, hi = 0, addr, addr + nbytes
+    while lo < hi:
+        g = lo // GRANULE
+        b = min(hi, (g + 1) * GRANULE)
+        n += 1 if one_flit and (lo % GRANULE) // FLIT_B == ((b - 1) % GRANULE) // FLIT_B else 2
+        lo = b
+    return n
+
+
+def gather_read(load, stack=0, frac=0.85, reads=((0, 32), (0, 256)), one_flit=False):
+    """The cores of one stack's quadrant gather rows at frac of their HBM share (review finding X-9). A row is the read
+    requests `reads` = ((offset in its granule, bytes), ...), each one header-only REQ flit and rsp_flits() RSP flits,
+    spread evenly over the stack's 4 leaves. Default: the paged NVFP4 KV gather (a 32 B scale read and a 256 B row)."""
+    row_b = sum(n for _, n in reads)
+    rflits = sum(rsp_flits(a, n, one_flit) for a, n in reads)
+    cores = [c for c in CORES if stack_of_core(c) == stack]
+    rows = STACKS * STACK_BPC * frac / len(CORES) / row_b          # rows per cycle per core
+    for c in cores:
+        for l in hbm_leaves(stack):
+            _add(load, route(l, c, ORDER["RSP"]), rows / 4 * rflits * FLIT_B)
+            _add(load, route(c, l, ORDER["REQ"]), rows / 4 * len(reads) * FLIT_B)
+
+
 def d2d_bidir(load, die_bpc):
     """Every core sends and receives die_bpc / 32 to / from the other die through the D2D sub-link of its own row."""
     per = die_bpc / len(CORES)
@@ -150,6 +176,10 @@ def scenarios():
         ("c2c_0.8TBs", lambda L: c2c_bidir(L, 0.8e12 / CLOCK)),
         ("d2d_1.4TBs", lambda L: d2d_bidir(L, 1.4e12 / CLOCK)),
         ("hbm_affine+d2d_1.5TBs", lambda L: (hbm_read(L, True), d2d_bidir(L, 1.5e12 / CLOCK))),
+        ("hbm_read_affine_0.85", lambda L: hbm_read(L, True, 0.85)),
+        ("kv_gather_stack", lambda L: gather_read(L, one_flit=True)),          # review X-9: 1-flit scale responses
+        ("kv_gather_stack_2flit", lambda L: gather_read(L)),                   # every RD_RSP 2 flits (before X-9)
+        ("engram_gather_stack", lambda L: gather_read(L, reads=((0, 8), (0, 256)), one_flit=True)),
     ]:
         load = defaultdict(float)
         fn(load)

@@ -122,14 +122,15 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
       nothing**: it may name a tag that a newer request now holds. Other `ERR` causes come from the target itself and free
       their tag;
     - **(b)** a response or write ack for a tag or burst id that is not outstanding is dropped (after a fault every response
-      is dropped, isa.md §8);
+      is dropped, isa.md §8), and so is one whose `epoch` differs from the core's `NI_EPOCH` (f);
     - **(c)** during a link-down event `FAULT_ADDR` is advisory. The CP restarts every core of the step, whichever cores
       faulted and with whatever address;
     - **(d)** a faulted core's tags and burst ids are freed only by their responses or acks (dropped) or by the per-request
       timeout. `STATUS` shows the DMA busy until all are free, and the CP restarts a core only after that: at most one timeout
-      (100 µs by default) after the fault, added to a recovery that already includes a link retrain. So no late response of
-      the old step matches a tag of the new one. The same holds for a core the CP stopped without a fault: it stops like a
-      faulted core (isa.md §8), and its tags drain the same way.
+      (100 µs by default) after the fault, added to a recovery that already includes a link retrain. A late response or
+      ack of the old step that arrives after the restart and names a reused tag or burst id carries the old `epoch` and is
+      dropped (f, review finding X-13), so this no longer rests on the timeout alone. The same holds for a core the CP
+      stopped without a fault: it stops like a faulted core (isa.md §8), and its tags drain the same way.
     - **(e) Restart condition *(review finding Z-7)*.** The CP restarts the step only when:
       1. `STATUS` shows the DMA idle on **every core of the step**, faulted or stopped by the CP;
       2. every down bridge reports `err_done` in its link-state CSR (L-9): it has injected the `ERR` for every request head
@@ -140,19 +141,25 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
         that its real response already freed can still be on the mesh when the last tag of a core is freed. Arriving after
         the restart, it would fault the new step by (a), and the recovery would start again. Requests that reach the down
         bridge later get their `ERR` at once, and after condition 1 no core of the step sends any.
-    - **(f) Epoch *(review finding Y-10; taken by the user, 2026-11-01)*.** Every request header carries a 1-bit `epoch`
-      (`noc_header`), which the core copies from its CSR `NI_EPOCH`. The CP toggles `NI_EPOCH` on every core of the step
-      while they are stopped, before it restarts the step. A bridge that answers a request (arriving or in its replay
-      buffer) with `ERR` copies the request's `epoch` into it. A core drops an `ERR` (`LINK`) whose `epoch` differs from its
-      `NI_EPOCH`, without a fault.
-      - So a stale `ERR` cannot fault the restarted step, however long it stays on the mesh. 10 µs was about 16x the
-        estimated worst transit, but that estimate assumed every sink keeps draining, and SPM-port arbitration against the
-        DMA is not bounded in the spec.
-      - One bit suffices: two restarts are separated by conditions 1-3 and a link retrain, and an `ERR` two epochs old would
-        have to outlive all of them.
-      - Conditions 1-3 stay, as a backstop that costs nothing at a failure. Other `ERR` causes come from targets and free their
-        tag (a), and condition 1 waits for them, so only `LINK` needs the epoch.
-      - Cost: one header bit (of the 6 reserved), one CSR bit, a compare in `core/ni`, and a bit copied in the bridge.
+    - **(f) Epoch *(review findings Y-10, X-13; taken by the user, 2026-11-01)*.** Every request header carries a 1-bit
+      `epoch` (`noc_header`), which the core copies from its CSR `NI_EPOCH`. The CP toggles `NI_EPOCH` on every core of the
+      step while they are stopped, before it restarts the step. Every target copies the request's `epoch` into its
+      `RD_RSP` and `WR_ACK` (the HBM controller, the SPM, GSRAM and CORECTL targets; acks are coalesced per epoch, noc.md
+      §2), and a bridge that answers a request (arriving or in its replay buffer) with `ERR` copies it into the `ERR`. A
+      core drops a response, ack or `ERR` (`LINK`) whose `epoch` differs from its `NI_EPOCH`, without a fault and without
+      freeing anything.
+      - So a stale `ERR`, response or ack of the step before a restart cannot fault or corrupt the restarted step,
+        whatever its age. 10 µs was about 16x the estimated worst transit, but that estimate assumed every sink keeps
+        draining, and SPM-port arbitration against the DMA is not bounded in the spec.
+      - **One bit covers one restart, not two in a row *(X-13 (a))*.** After two restarts the epoch has its old value
+        again, so a packet from two restarts ago is kept out only by the time argument: it would have to outlive
+        conditions 1-3 of both restarts (two `STATUS`-idle waits, two `err_done` reports, two `T_DRAIN` waits) and two link
+        retrains. If the link fails again at once after a restart, the CP waits the second `T_DRAIN` as for the first.
+        Phase 4 tests this case (PLAN).
+      - Conditions 1-3 stay, as a backstop that costs nothing at a failure. Other `ERR` causes come from targets and free
+        their tag (a), and condition 1 waits for them.
+      - Cost: one header bit (of the 6 reserved), one CSR bit, a compare in `core/ni`, and a bit copied in every target's
+        response path and in the bridge.
     - The data outcome is unchanged: the step restarts, and the CP zeroes the network-facing semaphores at the quiescent
       restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive.
   - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface

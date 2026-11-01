@@ -29,9 +29,9 @@ Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../report
 | Type | VN | Payload | Flits | Notes |
 |---|---|---|---|---|
 | RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target); `len` in bytes, so it may start and end inside a granule (a cut read, microarch.md §2.5) |
-| RD_RSP | RSP | 256 B | 2 | one per 256 B granule the request touches: tag + granule index; the payload is that granule, aligned (partial granules below); destination space reserved at request time |
+| RD_RSP | RSP | ≤ 256 B | 1-2 | one per 256 B granule the request touches: tag + granule index + epoch; the payload is that granule, aligned (partial granules below), 2 flits, or 1 flit when the request's bytes in the granule lie in one 128 B half (review X-9); destination space reserved at request time |
 | WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id and the burst's total bytes (`blen`); a burst is ≤ 2 KiB and inside one 2 KiB-aligned block, so it has one target (the DMA splits there, as for reads; review V-10) |
-| WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target (rules below) |
+| WR_ACK | RSP | none | 1 | burst id + byte count + epoch; coalesced per write burst (≤ 2 KiB) at the target (rules below) |
 | SEM | REQ | 8 B | 1 | `SIGNAL`: add or set at a semaphore address (a WR to the add window) |
 | MC_WR | REQ (MC VC) | ≤ 256 B | ≤ 2 | intra-die multicast to a mesh rectangle; posted, no ack; `rsem` applies at each destination |
 | ERR | RSP | none | 1 | address fault / unsupported operation; `err_wr` says whether `tag` is a read tag or a write burst id (review V-10) |
@@ -46,9 +46,10 @@ A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on 
 - `tag` (9 bits: a read tag, or a write burst id), `len` (12 bits, bytes), `addr` (49 bits, requests only).
 - Type-specific fields share bits: `gidx` (granule index, `RD_RSP`), `cause` and `err_wr` (`ERR`), `wop` and `rsem` (`WR`, `MC_WR`), `blen`
   (total bytes of the burst, `WR`, `SEM`), and the multicast rectangle (`MC_WR`).
-- `epoch` (1 bit, `RD_REQ`, `WR`, `SEM` and `ERR`): the requesting core's CSR `NI_EPOCH`, echoed in a bridge's `ERR`, so a
-  core can drop a stale `ERR` (`LINK`) of the step before a restart (d2d_c2c.md L-4 (f), review finding Y-10). 5 bits stay
-  reserved.
+- `epoch` (1 bit, `RD_REQ`, `WR`, `SEM`, and the responses `RD_RSP`, `WR_ACK` and `ERR`): the requesting core's CSR
+  `NI_EPOCH`. Every target copies the request's bit into its response, ack or `ERR` (a bridge into its `ERR`), so a core
+  drops a stale response, ack or `ERR` (`LINK`) of the step before a restart (d2d_c2c.md L-4 (f), review findings Y-10,
+  X-13). 5 bits stay reserved.
 
 Header in the sideband means a 256 B write is 2 flits, not 3.
 
@@ -61,12 +62,27 @@ and may start or end inside a granule (the DMA cuts a granule that two ring entr
   request's first byte would shift the second half of a cut granule by its offset, silently.
 - A target reads only what the range touches: the HBM controller only the 32 B bursts (hbm.md H-2), an SRAM target only
   the bytes. A granule cut inside a burst has that burst read twice, once per half.
-- `isa.rd_rsp_layout` is the reference (valid range, SPM destination and bursts of each response), tested in `test_isa.py`
-  (`test_rd_rsp_layout`): a granule cut at byte 128 into two requests, a 264 B row from byte 8, contiguous 264 B rows that
-  share a burst, and random requests reassembled in SPM.
+- **One flit for a range inside one half *(review finding X-9; taken by the user, 2026-11-01)*.** When the valid bytes of
+  a response lie in one 128 B half of its granule, the response is 1 flit, carrying that half aligned (flit byte j is
+  the granule's byte 128 x h + j). It needs no header field: both ends know the range (the target from the request, the
+  initiator from its tag table), and `flit_t` marks head and tail, as for a 1-flit `WR`. A KV row's 32 B scale read and
+  an Engram row's 8 B scale read are 1 flit; a 256 B row is 2. Without it a stack's busiest HBM leaf link is at 1.21
+  when its 8 cores gather KV rows (§5).
+- **One destination run per request *(review finding X-12)*.** A read request's bytes go to one contiguous run of SPM
+  (for a converting read, of converted output), the run that starts at its tag-table destination. The DMA cuts a
+  request where its destination run ends, as it cuts write packets, and at the 2 KiB block. Two adjacent 512 B HBM rows
+  read into SPM rows padded to 576 B are two requests; merged, the second row would land 64 B early, silently.
+- `isa.rd_rsp_layout` is the reference (valid range, flits, SPM destination and bursts of each response, and with a ring
+  entry's units the pieces of a converting response, microarch.md §2.5), with `isa.read_requests` for the cut at
+  destination runs. Tested in `test_isa.py` (`test_rd_rsp_layout`, `test_rd_rsp_pieces_and_destination_runs`): a granule
+  cut at byte 128 into two requests, a 264 B row from byte 8, contiguous 264 B rows that share a burst, random requests
+  reassembled in SPM from 1- and 2-flit responses, fold tiles from byte 64 (each granule: a raw-slot tail, a whole tile,
+  a raw-slot head), random entries of 128, 256 and 264 B units in any response order, and padded SPM rows.
 
 **Write acknowledgements** (reviews R-3, X-3). A target keeps a small coalescing table with one entry per (initiator, burst id):
-1. Every accepted `WR` or `SEM` adds its `len` to its entry. The packets of a burst arrive in any order.
+1. Every accepted `WR` or `SEM` adds its `len` to its entry. The packets of a burst arrive in any order. The entry is
+   per (initiator, burst id, epoch), so packets of the step before a restart never count toward a reused burst id, and
+   the ack carries that epoch (review finding X-13; `noc.ack_coalescer`'s source stands for initiator and epoch).
 2. When the count reaches the packet's `blen`, the target sends one `WR_ACK` with the count.
 3. When the table is full and a new burst arrives, the oldest entry is acked early with its partial count. Accepting a write never
    waits for ack state.
@@ -187,6 +203,9 @@ across both planes (`noc.scenarios()`).
 | D2D 1.4 TB/s per direction, both directions, from all cores | D2D leaf link | **0.97** |
 | C2C 0.8 TB/s per direction per die | C2C leaf link | **0.55** |
 | Stack-affine HBM at full rate + D2D 1.5 TB/s at the same time | row 1 near the D2D edge | 1.23 (cannot be sustained together) |
+| Stack-affine 2 KiB reads at the 0.85 share | HBM leaf -> mesh | 0.68 |
+| The 8 cores of a stack gather paged NVFP4 KV rows at the 0.85 share (32 B scale read + 256 B row per row; review X-9) | HBM leaf -> mesh | **0.91** (1.21 with 2-flit scale responses; 1.07 at the full share) |
+| The same with Engram rows (8 B scale read + 256 B row) | HBM leaf -> mesh | 0.99 |
 
 - **D2D ceiling:** 4 leaves x 2 planes x 128 B/cycle = 1,024 B/cycle raw. After acks that is **964 B/cycle = 1.45 TB/s per direction**.
   The D2D link is sized to that, at 1.4 TB/s payload *(P2)*. A 5 TB/s link could not be fed: reaching it would need about 26
@@ -199,6 +218,12 @@ across both planes (`noc.scenarios()`).
     cycle.
   - 2 KiB requests and per-burst acks bring the overhead to 1/16. That is why read requests may span 2 KiB, and why the HBM map keeps
     a 2 KiB block on one leaf.
+- **Gathers *(review finding X-9)*.** A row gather sends two requests per row, a scale read and the row, and its responses
+  are small. Per 288 B of a KV row the leaf link carries 3 RSP flits (a 1-flit scale response and the 2-flit row) and the
+  REQ direction 2 flits (0.60 at the 0.85 share), against 16 + 1 flits per 2 KiB for plain reads. The 1-flit response is
+  what keeps a stack's 8 gathering cores below 1.0; with 2 flits the gather would get at most about 0.83 of its share on
+  the mesh (about 128 elements/cycle). `noc.gather_read`, `test_noc.py` `test_gather_leaf_load`; Phase 7 measures it
+  with per-PC queues (PLAN).
 - **Concurrent streams:** HBM streaming and D2D traffic share row links near the east edge. At full rate together they exceed 1.0.
   The roofline already serializes communication with compute. The perf simulator (Phase 7) measures the real overlap.
 
@@ -230,8 +255,8 @@ across both planes (`noc.scenarios()`).
   the cores with transfers through it fault, with `LINK` or, for requests the far side had accepted, `TIMEOUT` (review findings
   X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8). A replay-buffer `ERR` can be stale, so
   it may also fault a core whose transfer completed; it frees no tag, and the CP restarts the whole step (W-2), once every
-  core of the step is idle, the bridge has sent its last `ERR` and a drain time has passed (Z-7). The `ERR` carries the
-  request's `epoch`, and a restarted core drops a `LINK` `ERR` of the previous epoch (Y-10).
+  core of the step is idle, the bridge has sent its last `ERR` and a drain time has passed (Z-7). Responses, acks and the
+  bridge's `ERR` carry the request's `epoch`, and a restarted core drops any of the previous epoch (Y-10, X-13).
 
 ## 8. Open items
 

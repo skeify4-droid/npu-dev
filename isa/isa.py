@@ -408,24 +408,78 @@ def inline_addr(isa, td, base, i0=0, i1=0, gather=False):
     return row + i0 * info["bits"] // 8, row + td["n0"] * info["bits"] // 8 + i0 // info["block"]
 
 
-def rd_rsp_layout(addr, nbytes, dst, granule=256, burst=32):
-    """Reference for the responses of one read request (noc.md section 2, review finding Y-5). The request covers
+def rd_rsp_layout(addr, nbytes, dst, granule=256, burst=32, unit=None, half=128):
+    """Reference for the responses of one read request (noc.md section 2, review findings Y-5, X-9, X-12). The request covers
     [addr, addr + nbytes), at most 2 KiB inside one 2 KiB block; its bytes may start and end inside a granule (a cut
     read, Z-1). It gets one RD_RSP per granule it touches. Returns one dict per response:
       gidx      granule index, counted from the granule that holds addr (0 for the first);
       lo, hi    the valid payload bytes [lo, hi): the payload is the whole granule, aligned (payload byte j is HBM byte
                 granule base + j), and only the request's range inside it is valid; the initiator takes lo and hi from
                 its tag-table entry (addr and len), since RD_RSP has no len;
-      spm       SPM destination of payload byte lo: dst is the destination of the request's first byte (addr);
-      bursts    the 32 B bursts of that granule the target reads (only those the range touches)."""
+      flits     1 when [lo, hi) lies in one 128 B half of the granule, else 2 (X-9); a 1-flit response carries that half,
+                aligned (flit byte j is payload byte 128 x part + j), and both ends know which from the request's range;
+      part      the half a 1-flit response carries (0 or 1), None for 2 flits;
+      spm       SPM destination of payload byte lo: dst is the destination of the request's first byte (addr), and the
+                request's bytes go to one contiguous SPM run (read_requests);
+      bursts    the 32 B bursts of that granule the target reads (only those the range touches).
+    unit (X-12): (u0, size, raw) = the HBM address of the first conversion unit of the request's ring entry, the unit's
+    bytes and the ring offset of the entry's raw slots (16 B aligned, one slot per split unit, in unit order). Each
+    response then also has `pieces`, its valid range cut at unit boundaries: dict(unit, lo, hi, off, raw), with unit the
+    index in the entry, off the offset of lo in the unit, and raw None for a unit inside one granule (it converts from
+    this response) or the ring offset of lo in the unit's raw slot (raw + slot x the slot pitch + off; slot = the number
+    of split units of the entry before it). So the placement needs the entry's u0, size and raw base, not a raw offset per
+    tag: a granule of fold tiles from byte 64 feeds two raw slots and the converter."""
     if not 0 < nbytes <= 2048 or addr // 2048 != (addr + nbytes - 1) // 2048:
         raise IsaError("RD_REQ: 1..2048 bytes inside one 2 KiB block")
     g0 = addr // granule
     out = []
     for g in range(g0, (addr + nbytes - 1) // granule + 1):
         a, b = max(addr, g * granule), min(addr + nbytes, (g + 1) * granule)
-        out.append(dict(gidx=g - g0, lo=a - g * granule, hi=b - g * granule, spm=dst + (a - addr),
-                        bursts=list(range((a % granule) // burst, (b - 1) % granule // burst + 1))))
+        lo, hi = a - g * granule, b - g * granule
+        one = lo // half == (hi - 1) // half
+        r = dict(gidx=g - g0, lo=lo, hi=hi, flits=1 if one else 2, part=lo // half if one else None,
+                 spm=dst + (a - addr), bursts=list(range((a % granule) // burst, (b - 1) % granule // burst + 1)))
+        if unit is not None:
+            u0, size, raw = unit
+            if a < u0:
+                raise IsaError("unit: the request starts before its entry's first unit")
+            pitch = -(-size // 16) * 16
+
+            def split(u):
+                return (u0 + u * size) // granule != (u0 + (u + 1) * size - 1) // granule
+
+            pcs, x = [], a
+            while x < b:
+                u = (x - u0) // size
+                y = min(b, u0 + (u + 1) * size)
+                off = x - (u0 + u * size)
+                slot = sum(split(v) for v in range(u))
+                pcs.append(dict(unit=u, lo=x - g * granule, hi=y - g * granule, off=off,
+                                raw=raw + slot * pitch + off if split(u) else None))
+                x = y
+            r["pieces"] = pcs
+        out.append(r)
+    return out
+
+
+def read_requests(runs, block=2048):
+    """Reference for how the DMA forms read requests (review finding X-12): runs are (HBM address, SPM destination, bytes)
+    in the TD's order. Adjacent runs merge only when both their HBM bytes and their SPM destinations are contiguous, and
+    a request never crosses a 2 KiB block: a request is cut where its source block or its destination run ends, as a
+    write packet is cut where its destination run ends (write_packets). Returns (address, bytes, destination); each
+    request's tag-table entry holds one destination (rd_rsp_layout)."""
+    merged = []
+    for a, d, n in runs:
+        if merged and merged[-1][0] + merged[-1][2] == a and merged[-1][1] + merged[-1][2] == d:
+            merged[-1][2] += n
+        else:
+            merged.append([a, d, n])
+    out = []
+    for a, d, n in merged:
+        while n:
+            k = min(n, block - a % block)
+            out.append((a, k, d))
+            a, d, n = a + k, d + k, n - k
     return out
 
 

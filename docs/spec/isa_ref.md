@@ -158,7 +158,7 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 | `mc_x1` | [115:112] | MC_WR |
 | `mc_y0` | [118:116] | MC_WR |
 | `mc_y1` | [121:119] | MC_WR |
-| `epoch` | [122:122] | ERR, RD_REQ, SEM, WR |
+| `epoch` | [122:122] | ERR, RD_REQ, RD_RSP, SEM, WR, WR_ACK |
 | `rsv` | [127:123] | all |
 
 ## DMA_LIST entry (32 B in SPM, isa.md section 5), 256 bits

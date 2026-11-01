@@ -282,17 +282,32 @@ isa.md §5) a cheap multiply at the ACC input.
       0.291). By entry shape both get the flat rates, the MX weight streams keep 164 / 84 to 1,200 cycles, and NVFP4 and
       the NVFP4 KV gather are unchanged (`test_staging_ring_pace_hold_and_formats`). No surveyed model has an MX row gather
       on a critical path (Engram is hidden, G-1); this keeps one from losing about a third.
-- Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
-  and granule index, and its destination SPM address is held in the tag table. Response data therefore needs no staging buffer: the
-  SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
-  - **Tag-table entry *(review finding Y-5)*:** the SPM destination of the request's first byte, the byte offset of that
-    byte in its granule, `len`, the granules still outstanding (an 8-bit mask), the DQ, and for a converting read its
-    format (pace weight), its ring entry (the ring offset of its scales or raw slot) and the element offset of its first
-    byte in its conversion unit. Byte 128 of an NVFP4 granule is element 256, so the second half of a cut granule converts
-    from element 256 into its own entry. About 80 bits, 5 KiB for 512 tags.
+- Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return one response packet per 256 B granule: 2 flits,
+  or 1 flit when the request's bytes in the granule lie in one 128 B half (review finding X-9, noc.md §2). Each response carries a
+  tag, a granule index and the request's epoch, and its destination SPM address is held in the tag table. Response data therefore
+  needs no staging buffer: the SPM space is reserved when the request is issued, which is what keeps the response network
+  deadlock-free (noc.md §4).
+  - **One destination run per request *(review finding X-12)*.** The DMA cuts a read request where its SPM destination run
+    ends (for a converting read, the run of converted output), as it cuts write packets, and at the 2 KiB block: two
+    adjacent 512 B HBM rows read into SPM rows padded to 576 B are two requests (`isa.read_requests`).
+  - **Tag-table entry *(review findings Y-5, X-12)*:** the SPM destination of the request's first byte, the byte offset of
+    that byte in its granule, `len`, the granules still outstanding (an 8-bit mask), the DQ, the epoch, and for a
+    converting read its format and entry shape (pace weight), its ring entry (the ring offsets of its scales and of its
+    raw slots), the unit size, the offset of its first byte in its conversion unit (the element offset) and the raw-slot
+    index of that unit. Byte 128 of an NVFP4 granule is element 256, so the second half of a cut granule converts from
+    element 256 into its own entry. About 95 bits, 6 KiB for 512 tags.
   - Response `gidx` g lands at the destination + (g x 256 - the first byte's offset), except g = 0, which lands at the
     destination. Its valid bytes are the request's range within the granule (noc.md §2, partial granules;
     `isa.rd_rsp_layout`).
+  - **Pieces of a converting response *(X-12)*.** The NI cuts the valid range at conversion-unit boundaries. A unit that
+    lies inside the granule converts from this response, at its element offset. A piece of a split unit is written to the
+    unit's raw slot, at the raw-slot base + slot x the slot pitch (the unit size in 16 B units) + its offset in the unit;
+    slot counts the entry's split units before it, so it is the first unit's raw-slot index plus the split units between.
+    For power-of-two units of at most 256 B, every granule boundary falls at the same offset in a unit, so either every
+    boundary inside the request splits a unit or none does, and the count is the number of boundaries crossed. A granule
+    of contiguous MXFP4 fold tiles from byte 64 therefore feeds two raw slots and the converter: the 64 B tail of one split
+    tile (its raw slot), a whole tile, and the 64 B head of the next split tile (the next raw slot). One ring offset per
+    tag, as the text before X-12 had it, could place only one of them. `isa.rd_rsp_layout(..., unit=)`, `test_rd_rsp_pieces_and_destination_runs`.
 - **Read data always sinks in local SPM** (or DTAB / IMEM). A DMA never forwards read data as a write, so one of its two operands is
   local (`TD_SPACE` otherwise; review finding I-1). Global-to-global moves are two transfers through an SPM buffer.
 - **Inbound rate *(review findings I-3, V-1)*:** the converter produces 256 elements per cycle and the SPM write port takes
@@ -412,7 +427,9 @@ isa.md §5) a cheap multiply at the ACC input.
       capped at 4.5 x the ring; above) the queue model gives the paced rates back. Elements/cycle at L = 500 / 700 / 845 /
       1,000 / 1,200 (`isa.staging_ring`, `hbm="server"`; weights in entries of one 2 KiB request; "all" means the full rate
       at every L). These are **single-FIFO results for one core** (review finding Y-4): the KV-gather column in particular
-      is optimistic with real per-PC queues and other cores' traffic (below), and Phase 7 checks every column:
+      is optimistic with real per-PC queues and other cores' traffic (below). On the mesh, the 8 cores of a stack on the
+      KV gather load its busiest leaf link to 0.91 with 1-flit scale responses (1.21 with 2-flit ones; noc.md §5, review
+      finding X-9). Phase 7 checks every column:
 
       | | NVFP4 → BF16 weights | MXFP4 weights | MXFP8 weights | paged NVFP4 KV gather |
       |---|---|---|---|---|
@@ -496,10 +513,16 @@ isa.md §5) a cheap multiply at the ACC input.
 ### 2.6 Network interface and semaphores
 - The interface is an initiator for the DMA and a target for SPM, GSRAM and CORECTL (IMEM, DTAB, semaphores, CSRs).
 - Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
+  - A read response is 1 flit when the request's bytes in its granule lie in one 128 B half, else 2 (noc.md §2, review
+    finding X-9); the target picks the half from the request.
+  - Every response and ack copies the request's `epoch` (review finding X-13).
+- As an initiator, the interface drops a response, ack or `ERR` (`LINK`) whose `epoch` differs from `NI_EPOCH` (d2d_c2c.md
+  L-4 (f)), and places a 1-flit response's half from the tag table's range.
 - Plane choice is per packet: round-robin over planes with credits. No ordering is needed (noc.md §7).
 - Write acknowledgements carry a byte count and are coalesced per 2 KiB burst (noc.md §2, hbm.md H-2):
   - every `WR` carries its burst's total bytes (`blen`), and the target acks when it has accepted them all. A burst stays inside
-    one 2 KiB-aligned block, so it has one target (review finding V-10);
+    one 2 KiB-aligned block, so it has one target (review finding V-10). The coalescing entry is per (initiator, burst id,
+    epoch) (X-13);
   - a full table acks its oldest entry early with a partial count, so accepting a write never waits for ack state (review finding R-3);
   - an entry idle for `ACK_FLUSH` cycles (CSR, default 64) is acked with its partial count, which completes bursts whose entry was
     evicted (review finding X-3);

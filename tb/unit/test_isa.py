@@ -181,10 +181,10 @@ def test_noc_header_widths(isa):
     assert 1 << f["gidx"] >= 2048 // 256                                 # granules of one 2 KiB read
     err = I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type="ERR", tag=0x1FF, err_wr=1, cause="LINK"))
     assert err["err_wr"] == 1 and err["tag"] == 0x1FF                     # V-10: ERR says which tag space its tag is in
-    for t in ("RD_REQ", "WR", "SEM", "ERR"):                             # Y-10: requests carry the epoch, the bridge's ERR echoes it
-        assert I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type=t, epoch=1))["epoch"] == 1
+    for t in ("RD_REQ", "RD_RSP", "WR", "WR_ACK", "SEM", "ERR"):         # Y-10, X-13: requests carry the epoch, and every
+        assert I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type=t, epoch=1))["epoch"] == 1   # response echoes it
     with pytest.raises(I.IsaError):
-        I.pack(isa, "noc_header", type="RD_RSP", epoch=1)                # a response carries no epoch
+        I.pack(isa, "noc_header", type="MC_WR", epoch=1)                 # posted multicast: no response, no epoch
 
 
 def test_layout_validator_rejects(isa):
@@ -795,8 +795,8 @@ def test_rd_rsp_layout():
     The target reads only the 32 B bursts the range touches. Random requests reassemble exactly in SPM."""
     G = 0x1234_5000                                     # a 2 KiB-aligned HBM address
     a, b = I.rd_rsp_layout(G, 128, 0x100), I.rd_rsp_layout(G + 128, 128, 0x900)   # one granule cut at byte 128
-    assert a == [dict(gidx=0, lo=0, hi=128, spm=0x100, bursts=[0, 1, 2, 3])]
-    assert b == [dict(gidx=0, lo=128, hi=256, spm=0x900, bursts=[4, 5, 6, 7])]
+    assert a == [dict(gidx=0, lo=0, hi=128, flits=1, part=0, spm=0x100, bursts=[0, 1, 2, 3])]
+    assert b == [dict(gidx=0, lo=128, hi=256, flits=1, part=1, spm=0x900, bursts=[4, 5, 6, 7])]
     assert b[0]["lo"] * 8 // 4 == 256                   # the second half's first NVFP4 element (tag-table element offset)
     r = I.rd_rsp_layout(G + 8, 264, 0x2000)             # an Engram row from byte 8: two granules
     assert [(x["gidx"], x["lo"], x["hi"], x["spm"], x["bursts"]) for x in r] == \
@@ -815,10 +815,83 @@ def test_rd_rsp_layout():
         spm = bytearray(4096)
         for x in I.rd_rsp_layout(lo, n, 1000):
             gb = (lo // 256 + x["gidx"]) * 256         # the granule the payload holds
-            payload = hbm[gb:gb + 256]
+            if x["flits"] == 1:                         # X-9: one flit, the half that holds the valid bytes
+                assert x["lo"] // 128 == (x["hi"] - 1) // 128 == x["part"]
+                flit = hbm[gb + 128 * x["part"]:gb + 128 * x["part"] + 128]
+                payload = bytes(128 * x["part"]) + flit + bytes(128 - 128 * x["part"])
+            else:
+                assert x["lo"] // 128 != (x["hi"] - 1) // 128 and x["part"] is None
+                payload = hbm[gb:gb + 256]
             spm[x["spm"]:x["spm"] + x["hi"] - x["lo"]] = payload[x["lo"]:x["hi"]]
             assert all(gb + 32 * k < lo + n and gb + 32 * k + 32 > lo for k in x["bursts"])
         assert bytes(spm[1000:1000 + n]) == hbm[lo:lo + n]
+    # X-9: a KV row's 32 B scale read and an Engram row's 8 B scale read are 1 flit; the 256 B row is 2
+    assert [x["flits"] for x in I.rd_rsp_layout(G + 3 * 32, 32, 0) + I.rd_rsp_layout(G + 5 * 8, 8, 0)] == [1, 1]
+    assert [x["flits"] for x in I.rd_rsp_layout(G + 256, 256, 0)] == [2]
+    assert I.rd_rsp_layout(G + 120, 16, 0)[0]["flits"] == 2              # 16 B across the halves: 2 flits
+
+
+def test_rd_rsp_pieces_and_destination_runs():
+    """X-12 (b): a response's valid range is cut at conversion-unit boundaries, and each piece is placed from its ring
+    entry (first unit, unit size, raw-slot base), not from one ring offset per tag. Contiguous MXFP4 fold tiles (128 B)
+    from byte 64: every granule after the first carries the 64 B tail of a split tile (raw slot k), a whole tile (it
+    converts from this response) and the 64 B head of the next split tile (raw slot k + 1). Random entries of 128, 256 or
+    264 B units, cut into requests at 2 KiB blocks, in any response order, fill every raw slot with exactly its unit.
+    X-12 (a): a read request is cut where its SPM destination run ends. Two adjacent 512 B HBM rows read into SPM rows
+    padded to 576 B: merged into one 1 KiB request, row 1 would land at dst + 512 instead of dst + 576, silently."""
+    G = 0x1234_5000
+    tiles = 6
+    reqs = I.rd_rsp_layout(G + 64, 128 * tiles, 0, unit=(G + 64, 128, 0x400))
+    got = [[(p["unit"], p["lo"], p["hi"], p["raw"]) for p in r["pieces"]] for r in reqs]
+    assert got == [[(0, 64, 192, None), (1, 192, 256, 0x400)],
+                   [(1, 0, 64, 0x440), (2, 64, 192, None), (3, 192, 256, 0x480)],
+                   [(3, 0, 64, 0x4C0), (4, 64, 192, None), (5, 192, 256, 0x500)],
+                   [(5, 0, 64, 0x540)]]
+    rng = random.Random(9)
+    hbm = bytes(rng.randrange(256) for _ in range(1 << 15))
+    for _ in range(150):
+        size = rng.choice((128, 256, 264))
+        u0 = rng.randrange(0, 1 << 14, 8)
+        nu = rng.randint(1, 12)
+        raw, ring = 0x100, bytearray(1 << 14)
+        split = [(u0 + u * size) // 256 != (u0 + (u + 1) * size - 1) // 256 for u in range(nu)]
+        whole = {}
+        a, end = u0, u0 + nu * size
+        resp = []
+        while a < end:                                  # requests of the entry, cut at 2 KiB blocks
+            n = min(end - a, 2048 - a % 2048)
+            resp += [(a, r) for r in I.rd_rsp_layout(a, n, 0, unit=(u0, size, raw))]
+            a += n
+        rng.shuffle(resp)                               # responses of one request arrive in any order
+        for a, r in resp:
+            gb = (a // 256 + r["gidx"]) * 256
+            for p in r["pieces"]:
+                if p["raw"] is None:                    # a whole unit: one piece, inside this granule
+                    assert not split[p["unit"]] and p["off"] == 0 and p["hi"] - p["lo"] == size
+                    whole[p["unit"]] = hbm[gb + p["lo"]:gb + p["hi"]]
+                else:
+                    ring[p["raw"]:p["raw"] + p["hi"] - p["lo"]] = hbm[gb + p["lo"]:gb + p["hi"]]
+        pitch = -(-size // 16) * 16
+        for u in range(nu):
+            src = hbm[u0 + u * size:u0 + (u + 1) * size]
+            if split[u]:
+                k = sum(split[:u])
+                assert bytes(ring[raw + k * pitch:raw + k * pitch + size]) == src, (size, u0, u)
+            else:
+                assert whole[u] == src
+    H = 0x2000                                                        # HBM rows at offset H of the random image
+    rows = [(H + 512 * i, 0x2000 + 576 * i, 512) for i in range(4)]    # s1 = 512 into SPM rows of pitch 576
+    reqs = I.read_requests(rows)
+    assert reqs == [(H + 512 * i, 512, 0x2000 + 576 * i) for i in range(4)]
+    assert I.read_requests([(H + 512 * i, 0x2000 + 512 * i, 512) for i in range(4)]) == [(H, 2048, 0x2000)]
+    spm = bytearray(1 << 14)
+    for a, n, d in reqs:
+        for x in I.rd_rsp_layout(a, n, d):
+            gb = (a // 256 + x["gidx"]) * 256
+            spm[x["spm"]:x["spm"] + x["hi"] - x["lo"]] = hbm[gb + x["lo"]:gb + x["hi"]]
+    assert all(bytes(spm[0x2000 + 576 * i:0x2000 + 576 * i + 512]) == hbm[H + 512 * i:H + 512 * i + 512] for i in range(4))
+    bad = I.rd_rsp_layout(H, 1024, 0x2000)                            # the merged request the rule forbids
+    assert bad[2]["spm"] == 0x2000 + 512 != 0x2000 + 576
 
 
 # ---------------------------------------------------------------- non-paged block operands (memmap.md section 6, review W-5)

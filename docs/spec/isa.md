@@ -363,8 +363,9 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
   After a link-down event the CP restarts the step only once every core of the step is idle, faulted or stopped, every down
   bridge reports `err_done` and the drain time `T_DRAIN` has passed, so no stale `ERR` (`LINK`) reaches the new step
   (d2d_c2c.md L-4 (e), review finding Z-7). Before the restart the CP toggles each core's CSR `NI_EPOCH`, which every
-  request header carries, and a core drops an `ERR` (`LINK`) of the other epoch, so a stale one cannot fault the new step
-  even if it outlives `T_DRAIN` (L-4 (f), review finding Y-10). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  request header carries and every target echoes in its response, ack or `ERR`, and a core drops a response, ack or `ERR`
+  (`LINK`) of the other epoch, so a stale one cannot fault or reach the new step even if it outlives `T_DRAIN` (L-4 (f),
+  review findings Y-10, X-13). One bit covers one restart; after two in a row the drain conditions are the guard. So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
   recovery accesses rely on.
 
 Causes:

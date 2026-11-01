@@ -71,9 +71,9 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
 | Packet | Controller action |
 |---|---|
 | `RD_REQ` (≤ 2 KiB, one leaf) | Decode the granules. They fall on 8 different PCs of this port. Push one read descriptor (bank, row, column-high, first burst, burst count) into each PC's read queue: only the bursts the request's byte range touches, so a request that starts or ends inside a granule reads part of it (review finding Y-5). The request leaves the input only when every granule has been queued. |
-| `RD_RSP` (to the core) | One per granule touched, 2 flits, tag + granule index (counted from the granule of the request's first byte). The payload is the granule, aligned; bursts not read are undefined (noc.md §2, partial granules). Sent when all of its bursts are in the read return buffer. Granules of one request return in any order. |
+| `RD_RSP` (to the core) | One per granule touched: tag, granule index (counted from the granule of the request's first byte) and the request's `epoch`. The payload is the granule, aligned; bursts not read are undefined (noc.md §2, partial granules). 2 flits, or 1 flit carrying the 128 B half that holds the request's bytes when they lie in one half (review finding X-9): a 32 B KV scale read is 1 flit. Sent when all of its bursts are in the read return buffer. Granules of one request return in any order. |
 | `WR` (≤ 256 B, inside one granule) | Write the bursts into a write queue entry (burst mask). It is **posted**: acknowledged once it is in the write queue. |
-| `WR_ACK` (to the core) | Carries the burst id and a **byte count**. Coalesced per (source, burst id): sent when the count reaches the burst total `blen` carried by every `WR`, early with a partial count when the table is full, or after `ACK_FLUSH` idle cycles (see below). |
+| `WR_ACK` (to the core) | Carries the burst id, a **byte count** and the `epoch` of its packets (review finding X-13). Coalesced per (source, burst id, epoch): sent when the count reaches the burst total `blen` carried by every `WR`, early with a partial count when the table is full, or after `ACK_FLUSH` idle cycles (see below). |
 | anything else | `ERR`: write-add or max to HBM (`HBM_WADD`), a misaligned write (`HBM_ALIGN`), or an address in reserved HBM. |
 
 **Write alignment *(P2)*:**
