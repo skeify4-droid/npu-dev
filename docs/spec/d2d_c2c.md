@@ -199,8 +199,8 @@ Collectives use only the following, all existing in ISA v0.1.
     parity** as well *(review finding Z-6)*: a credit for use u needs only the write of u, which waited for the credits of
     u - 2, so a shared credit semaphore with several consumers could complete a wait with credits of the wrong use.
     Monotonic semaphores mean no reset and no handshake per call (isa.md §3: network-facing semaphores are never reset).
-  - A ready flag with several adders, reused every step, follows the same parity-and-credit rule; credits and single-adder
-    flags need no credit of their own (isa.md §3).
+  - A ready flag with several adders, reused every step, follows the same parity-and-credit rule; credits and flags with one
+    adder whose adds are `SIGNAL`s from one DQ need no credit of their own (isa.md §3, review finding Y-9).
   - The producer's credit wait is normally already satisfied, so it is off the critical path.
   - **Across kernels** *(review finding V-2)*: parities, credit counts and semaphore bases carry over, and there is no barrier
     between kernels. Every receive buffer follows this discipline, including pipeline hand-offs and HBM buffers that
@@ -210,7 +210,9 @@ Collectives use only the following, all existing in ISA v0.1.
     point, or after its owner's drain wait at the old one, for every add the old call site will ever receive (for a credit
     semaphore that includes the credits of its parity's last use; review finding Z-5), with a final credit from the owner to each
     new adder. The new base is the drain wait's target. Data-dependent
-    bases (the all-to-all's byte totals, L-7) are carried by the program in an SPM base table, not by the CP.
+    bases (the all-to-all's byte totals, L-7) are carried by the program in an SPM base table, not by the CP. A credit
+    semaphore's entry is the credits expected so far (the sum of each use's consumers, which may vary per use), so it is
+    also the drain target; consumers credit every use, the last included (review finding Y-8).
   - **Multicast and many-to-one buffers:** the producer waits for one credit per consumer of a use, n for a `DMA_MCAST` to n
     cores.
 - **SRAM destinations only for `rsem`** *(review finding I-6 b)*. An HBM write has no owning core, so `rsem` with an HBM destination

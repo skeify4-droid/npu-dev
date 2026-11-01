@@ -254,7 +254,7 @@ isa.md §5) a cheap multiply at the ACC input.
     transfer starts one round trip later (the second verifier's estimate: about 0.33 µs per dependent converting transfer,
     at most about 2% of a batch-1 DeepSeek or MiniMax decode step).
   - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: an
-    inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row: 256 B of elements, then their 8 B of scales; memmap.md
+    inline-scaled row (`SCALE_INLINE`, such as a 264 B MXFP8 row of a repacked table: 256 B of elements, then their 8 B of scales; memmap.md
     §6), or a fold tile that is not inside one 256 B granule (a fold
     weight row that is not a whole number of 256-element tiles, or a K slice that does not start on one). Its responses are
     written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add to the DMA's SPM write
@@ -286,7 +286,7 @@ isa.md §5) a cheap multiply at the ACC input.
       need only tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the
       oldest one frees its space, and the ring always drains.
     - **Inline entries *(review finding Z-3)*.** An entry of `SCALE_INLINE` rows (memmap.md §6) has no scale read. It holds
-      whole rows, each with all its reads: a 264 B Engram row that crosses a 2 KiB block is two reads, both in the row's
+      whole rows, each with all its reads: a 264 B inline row that crosses a 2 KiB block is two reads, both in the row's
       entry. Its raw slot holds the rows, 272 B per row in 16 B units.
     - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
       beginning) and is freed when all its data has been converted. Space comes back in allocation order.
@@ -303,7 +303,7 @@ isa.md §5) a cheap multiply at the ACC input.
         data request, about one per 27 cycles at the share.
       - **An entry with raw slots is at most a quarter of the ring.** Split units and inline rows hold their data in the
         ring, so those streams are ring-bound anyway (below); the quarter keeps one entry from taking the ring.
-      - No single unit's entry is larger than 272 B (an Engram row; a split MXFP8 fold tile is 256 + 8 B, a split 4-bit
+      - No single unit's entry is larger than 272 B (a 264 B inline row; a split MXFP8 fold tile is 256 + 8 B, a split 4-bit
         tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, and a non-split unit lies inside one granule, so
         inside one request. The DMA can therefore always meet both rules. A ring below the 16 KiB default lowers the rate
         (below), never liveness.
@@ -395,11 +395,15 @@ isa.md §5) a cheap multiply at the ACC input.
       boundaries. Padding is in the pitch only; the TD's n0 still covers the real K, and the last tile of a row is short but
       inside one granule. Every surveyed model already has K a multiple of 256 (expert K 2,048-6,144 and 2,304), so it costs
       nothing there. A layout that cannot be padded is legal and converts at the ring-limited rate.
-    - Inline-scaled rows stay split, because a 264 B Engram row always spans two granules. The ring carries about 62 of them
-      per round trip, 0.12 rows/cycle per core at 500 cycles. A DeepSeek batch-256 decode step gathers 12,288 rows (24 per
-      token in each of 2 layers); even if one die's 32 cores gather all of them, that takes about 2 µs, issued at the start
-      of the step and hidden (hyper_connections.md G-1). A remote row's longer round trip lowers the rate in proportion,
-      still hidden. Rows staged through the sibling arrive unconverted and convert SPM to SPM, with a short round trip.
+    - **Engram rows *(review finding Y-7; layout chosen by the user, 2026-11-01)*.** The table keeps its published separate
+      scale array, so a row is one aligned 256 B granule plus an 8 B scale read: not split, one ring entry of 16 B. The
+      gather is tag-bound like the KV gather: about 0.27 rows/cycle per core at 500 cycles and 0.22 at 845. A DeepSeek
+      batch-256 decode step gathers 12,288 rows (24 per token in each of 2 layers); even if one die's 32 cores gather all
+      of them, that takes about 1 µs, issued at the start of the step and hidden (hyper_connections.md G-1). A remote
+      row's longer round trip lowers the rate in proportion, still hidden. Rows staged through the sibling arrive with
+      their scale rows unconverted and convert SPM to SPM, with a short round trip.
+    - Inline-scaled rows (a repacked table) stay split, because a 264 B row always spans two granules. The ring carries
+      about 62 of them per round trip, 0.12 rows/cycle per core at 500 cycles.
   - Ready therefore depends only on the converter and the local SPM ports, which drain at a fixed rate without waiting for the
     network. A response is still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.
   - Not taken: choosing the fold's power of two from the block scales alone. That would make every granule convertible on its

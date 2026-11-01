@@ -75,8 +75,11 @@ Rules:
   - **Credits and flags** *(review finding Z-6)*. Two kinds need no credit of their own:
     - a credit semaphore (per parity): a consumer's credit for use u + 2 needs the producer's write of u + 2, which waited
       for every credit of use u;
-    - a flag with one adder whose adds come from one DQ: each `SIGNAL` waits for the acks of the earlier ones, so the adds
-      arrive in order.
+    - a flag with one adder whose adds are `SIGNAL`s from one DQ *(review finding Y-9)*: each `SIGNAL` waits for the acks
+      of the earlier ones, so the adds arrive in order. `rsem` byte adds do not qualify, because the packets of transfers
+      that overlap in one queue interleave, and neither do `SIGNAL`s from several DQs, since a `SIGNAL` releases only its
+      own queue. Such a flag follows the general rule: each add causally after the owner's wait for the previous use (the
+      multi-adder bullet below).
     - A flag with several adders, reused every step (a ready flag from 8 dies), can pass early: a fast adder's add for step
       s + 1 can land before a slow adder's add for step s, and the owner's step-s wait then completes with 7 step-s adds.
       Such a flag follows the parity-and-credit rule like a buffer semaphore: two flags used alternately, and an adder adds to
@@ -92,8 +95,16 @@ Rules:
         before. The credits of the last use (n for n consumers) arrive whenever that buffer is consumed, so the producer
         adds a wait for them. (With one credit semaphore for both parities, which Z-6 rules out, the credits of the last
         two uses would be late.)
+      - **The drain target of a credit semaphore is its base-table entry *(review finding Y-8)*,** the credits expected so
+        far (carried base, below), which already includes the last use's n. The last wait target plus a static n would be
+        wrong when the consumer set varies per use (only the destinations that received data), and too early or a hang.
+      - **Every use is credited, the last included.** A consumer credits each buffer it consumes even when no later write
+        waits for that credit: the producer's drain wait counts it. A compiler that drops the last credit as dead code
+        makes the drain wait hang, a program deadlock that only the X-6 detector reports.
       - Adds from other cores wait for a **final credit**: a `SIGNAL` from the owner to each of Y's adders, sent after the
-        drain wait, which Y's first add waits for like any later credit. A credit semaphore's adds are caused by its owner's
+        drain wait, which Y's first add waits for like any later credit. On the adder's credit semaphore for that parity of
+        Y, the final credit counts as the credit of use -2: the adder's first write waits for its credits expected so far
+        plus 1, and its base-table entry includes that 1 *(review finding Y-8)*. A credit semaphore's adds are caused by its owner's
         own buffer writes, so the owner issues Y's first write after the drain wait, in the same DQ or behind a local
         semaphore.
     - Y's base is X's full count, the drain wait's target. The extra cost is the drain wait (normally satisfied long before
@@ -113,6 +124,11 @@ Rules:
     MoE all-to-all's byte totals come from all-gathered counts, which the CP never sees. So each core keeps a **base table** in a
     runtime-reserved SPM region (64 x 4 B), updated by the program after each wait. It persists across kernels, and the CP zeroes
     it with the semaphores at a quiescent point.
+    - **A credit semaphore's entry is the credits expected so far *(review finding Y-8)*:** the producer adds n_u, the
+      consumers of use u (data-dependent, for example the destinations that received data), when it writes use u, plus 1
+      for a final credit. Its wait before writing a use of that parity has the entry as target, read before the add, which
+      covers the uses up to u - 2; the drain wait at a move has the entry as target, which covers all of them. A buffer
+      semaphore's entry stays the previous use's final wait target.
   - **A credit wait counts one credit per consumer**: a buffer read by n consumers (a `DMA_MCAST` destination set, or an owner
     with 32 contributors that each credit their own buffer) is free again at `base + n` credits for that use.
   - Example (V-2): 32 contributors write-add into an owner's buffer with `rsem`. Contributor A halts kernel k and starts k + 1. Its
@@ -121,9 +137,11 @@ Rules:
   - The golden model checks:
     - every add to a network-facing semaphore (a buffer semaphore, a credit semaphore or a multi-adder flag, one per parity)
       is causally after its owner's wait for that semaphore's previous use, whichever call site the use belonged to (the
-      credit for a buffer parity, or the final credit after a reassignment). The one exception is a single-adder flag, whose
-      adds must instead come from one DQ;
-    - no add of X arrives after the semaphore moved to Y: the owner's drain wait covered X's full count (Z-5);
+      credit for a buffer parity, or the final credit after a reassignment). The one exception is a flag with one adder
+      whose adds are `SIGNAL`s from one DQ; any other single-adder flag (`rsem` adds, or `SIGNAL`s from several DQs) is
+      checked by this general rule, not reported as a violation (Y-9);
+    - no add of X arrives after the semaphore moved to Y: the owner's drain wait covered X's full count (Z-5), for a credit
+      semaphore the credits expected so far (Y-8);
     - every wait target equals the carried base plus the use's total.
   - Rejected:
     - A barrier per kernel (start kernel k + 1 only after every core that shares a network-facing semaphore has halted k). It puts
@@ -256,7 +274,7 @@ Rules:
   entry without raw slots covers at most one data request, which is what keeps the rate at long round trips (Y-1).
 - **Scale location and write packets** (review findings V-4, V-5, W-5): an element's block scale is found from its row and its
   whole in-row offset (dims 0, 2, 3). Every dim-0 run starts on a block: the base (or the paged pointer's `byte`), `s1`, `s2` and
-  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` rows (Engram) are exempt: each row is its elements
+  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` rows (a repacked table; the Engram table keeps its separate scale array, Y-7) are exempt: each row is its elements
   followed by their scales, so any base and `s1` work (memmap.md §6, review finding Z-4). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
   32 B block of 4 B or 8 B scale rows is one aligned write. memmap.md §6 walks two KV appends field by field, and the batched
   (`DMA_SCATTER`) form (review finding W-4).

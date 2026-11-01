@@ -182,13 +182,15 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
       inside a block can also split a conversion unit across granules, and no layout needs it.
     - Reference: `isa.block_addr`, tested in `test_isa.py` (`test_block_addr_requires_block_aligned_base`).
   - **Inline scales (`SCALE_INLINE`) *(review finding Z-4)*.** A row holds its n0 elements and then their n0 / block one-byte
-    scales, so an Engram MXFP8 row is 256 B + 8 B = 264 B. The scale of element i0 is at the row start + n0 * esize +
+    scales, so an MXFP8 row of 256 elements is 256 B + 8 B = 264 B. No surveyed table is stored this way: the Engram table
+    keeps its published separate scale array (256 B rows, `aux0` = 8; hyper_connections.md G-3, review finding Y-7), and
+    `SCALE_INLINE` serves a table a runtime repacks. The scale of element i0 is at the row start + n0 * esize +
     floor(i0 / block). The row starts at the base + i1 * `s1` (`DMA_COPY`) or the base + index[i] * `s1` (`DMA_GATHER`).
     - The base and `s1` need no block alignment: every row starts its own first block, so the block rule above (written for
       a separate scale array) does not apply. Applied to `s1` = 264 it would fault every n-gram gather (W-5 had done that).
     - `ILLEGAL_FIELD` otherwise: a `SCALE_INLINE` operand is non-paged and in a block format; a row is one dim-0 run of
       whole blocks (n2 = n3 = 1, n0 a multiple of the block); `s1` is at least the row's size; a gather's `row_bytes` is
-      the row's size (264). `scale_reg` is unused.
+      the row's size (264; 0 included, review finding Y-7: `DMA_COPY` ignores `row_bytes`). `scale_reg` is unused.
     - Reference: `isa.inline_addr` (`isa.block_addr` uses it for a `SCALE_INLINE` TD), tested in `test_isa.py`
       (`test_engram_inline_gather`). The DMA stages each row raw and converts it whole (microarch.md §2.5, inline entries).
 - **Writing scale rows *(review finding V-5)*.** A DMA write packet holds contiguous destination bytes. Adjacent runs merge,

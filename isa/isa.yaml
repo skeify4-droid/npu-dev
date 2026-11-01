@@ -59,7 +59,7 @@ enums:
     PAGED: 0         # dim 1 (the row) is translated through a page table (DMA pt_reg; memmap.md section 6)
     IDX64: 1         # index lists are int64 (default int32)
     WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
-    SCALE_INLINE: 3  # block scales follow each row's n0 elements instead of a separate array (Engram MXFP8 rows, 256 + 8 B); non-paged; base and s1 need no block alignment (memmap.md section 6, isa.inline_addr, review Z-4)
+    SCALE_INLINE: 3  # block scales follow each row's n0 elements instead of a separate array (MXFP8 rows of 256 + 8 B, for a table a runtime repacks; the Engram table as published keeps a separate scale array, review Y-7); non-paged; base and s1 need no block alignment; a gather's row_bytes must be the row's size, 0 included (memmap.md section 6, isa.inline_addr, review Z-4, Y-7)
     SCALE_REGION: 4  # PAGED: address the scale region of each page (offset sc_off, row stride aux0) instead of its data
   cvt:               # DMA conversion on the way into the destination (source format -> destination format)
     NONE: 0
@@ -496,8 +496,10 @@ instructions:
       IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination =
       source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a
       logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page.
-      Operand spaces, conversions and scale operands as DMA_COPY. MXFP8 rows with SCALE_INLINE (Engram): row_bytes =
-      n0 elements + n0 / 32 scales (264 B), s1 any pitch of at least that; each row is staged raw and converted whole.
+      Operand spaces, conversions and scale operands as DMA_COPY. Engram rows as published (review Y-7): MXFP8, s1 =
+      row_bytes = 256, scales at scale_reg with aux0 = 8. MXFP8 rows with SCALE_INLINE (a repacked table): row_bytes =
+      n0 elements + n0 / 32 scales (264 B; 0 is ILLEGAL_FIELD), s1 any pitch of at least that; each row is staged raw and
+      converted whole.
       Keeps up to dma_outstanding_reads granules in flight.
   DMA_SCATTER:
     op: 0x42

@@ -356,14 +356,14 @@ def paged_addr(isa, td, ptr, frames, r_off, i0=0, i2=0, i3=0):
     return start + q * td["s1"] + o_bits // 8, sc_base + o_bits // blk_bits
 
 
-def block_addr(isa, td, base, scale, i0=0, i1=0, i2=0, i3=0):
+def block_addr(isa, td, base, scale, i0=0, i1=0, i2=0, i3=0, gather=False):
     """Reference for a non-paged operand (memmap.md section 6, review findings V-4, W-5): (byte address, scale byte address
     or None) of element (i0, i1, i2, i3). base = R[src_reg] or R[dst_reg], scale = R[scale_reg], the address of the scale
     of the base element's block in the operand's scale array (row stride TD aux0). Block formats need base, s1, s2 and s3
     to be multiples of the block's bytes (ILLEGAL_FIELD), so the base element starts a block and o has no in-block part.
     SCALE_INLINE operands keep their scales in the row and have no such rule: see inline_addr (review Z-4)."""
     if td["flags"] >> isa["enums"]["td_flags"]["SCALE_INLINE"] & 1:
-        return inline_addr(isa, td, base, i0, i1)                     # review Z-4: no block-aligned base or s1
+        return inline_addr(isa, td, base, i0, i1, gather)             # review Z-4: no block-aligned base or s1
     dt = {v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]
     info = isa["dtype_info"][dt]
     o_bits = 8 * (i2 * td["s2"] + i3 * td["s3"]) + i0 * info["bits"]
@@ -382,13 +382,16 @@ def inline_row_bytes(isa, td):
     return td["n0"] * info["bits"] // 8 + td["n0"] // info["block"]
 
 
-def inline_addr(isa, td, base, i0=0, i1=0):
+def inline_addr(isa, td, base, i0=0, i1=0, gather=False):
     """Reference for a SCALE_INLINE operand (memmap.md section 6, review finding Z-4): (byte address, scale byte address)
-    of element i0 of row i1. A row is n0 elements followed by their n0 / block one-byte scales (an Engram MXFP8 row:
+    of element i0 of row i1. A row is n0 elements followed by their n0 / block one-byte scales (an inline MXFP8 row:
     256 B + 8 B = 264 B), so element i0's scale is at the row start + n0 * esize + floor(i0 / block). The row starts at
     base + i1 * s1 (DMA_COPY) or base + index[i] * s1 (gather; pass i1 = index[i]); base and s1 need no alignment, because
     every row starts its own first block. ILLEGAL_FIELD: not a block format, PAGED, n2 or n3 > 1 (a row is one dim-0 run),
-    n0 not whole blocks, s1 shorter than the row, or a nonzero row_bytes other than the row's size."""
+    n0 not whole blocks, s1 shorter than the row, or row_bytes other than the row's size (gather=True: DMA_GATHER /
+    DMA_SCATTER, where 0 is ILLEGAL_FIELD too, review Y-7; DMA_COPY ignores row_bytes and allows 0).
+    No surveyed table is stored this way: the Engram table keeps its published separate scale array (review Y-7), and
+    SCALE_INLINE serves a table a runtime repacks."""
     dt = {v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]
     info = isa["dtype_info"][dt]
     fl = isa["enums"]["td_flags"]
@@ -397,7 +400,7 @@ def inline_addr(isa, td, base, i0=0, i1=0):
     if max(td["n2"], 1) > 1 or max(td["n3"], 1) > 1 or not td["n0"] or td["n0"] % info["block"]:
         raise IsaError("ILLEGAL_FIELD: a SCALE_INLINE row is one dim-0 run of whole blocks")
     rb = inline_row_bytes(isa, td)
-    if td["s1"] < rb or td["row_bytes"] not in (0, rb):
+    if td["s1"] < rb or td["row_bytes"] not in ((rb,) if gather else (0, rb)):
         raise IsaError("ILLEGAL_FIELD: s1 and row_bytes must fit the inline row (n0 elements + n0 / block scales)")
     if not 0 <= i0 < td["n0"]:
         raise IsaError("RANGE: i0 outside the row")

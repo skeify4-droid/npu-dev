@@ -704,8 +704,8 @@ def test_block_addr_requires_block_aligned_base(isa):
 
 
 def test_engram_inline_gather(isa):
-    """Z-4: a DMA_GATHER of DeepSeek Engram rows (MXFP8, SCALE_INLINE: 256 B of elements, then 8 B of scales, 264 B per
-    row). The base and the row pitch s1 = 264 need no block alignment, because every row starts its own first block; the
+    """Z-4: a DMA_GATHER of inline-scaled MXFP8 rows (SCALE_INLINE: 256 B of elements, then 8 B of scales, 264 B per row;
+    a table a runtime repacks, since the Engram table as published keeps a separate scale array, review Y-7). The base and the row pitch s1 = 264 need no block alignment, because every row starts its own first block; the
     scale of element i0 is at the row start + 256 + floor(i0 / 32). Before Z-4, isa.block_addr faulted ILLEGAL_FIELD at row 0.
     A row that crosses a 2 KiB block is two reads, both in the row's inline entry (no scale read; 264 B raw slot)."""
     td = _td(isa, dtype="MXFP8", space="GLOBAL", flags=("SCALE_INLINE",), n0=256, n1=1, s1=264, row_bytes=264)
@@ -722,6 +722,9 @@ def test_engram_inline_gather(isa):
     for bad in (dict(s1=256), dict(row_bytes=256), dict(n0=250, s1=264, row_bytes=0), dict(n2=2)):
         with pytest.raises(I.IsaError):
             I.inline_addr(isa, dict(td, **bad), table, 0, 0)
+    assert I.inline_addr(isa, dict(td, row_bytes=0), table, 0, 1)[0] == table + 264         # DMA_COPY: row_bytes unused
+    with pytest.raises(I.IsaError):                                          # Y-7: a gather's row_bytes is the row's size
+        I.block_addr(isa, dict(td, row_bytes=0), table, 0, 0, 1, gather=True)
     with pytest.raises(I.IsaError):                                          # PAGED keeps scales in the page's region
         I.inline_addr(isa, dict(td, flags=td["flags"] | 1 << isa["enums"]["td_flags"]["PAGED"]), table, 0, 0)
     # Ring entries of the gather: one row each, staged raw (inline scales are part of the row's bytes).
@@ -733,6 +736,33 @@ def test_engram_inline_gather(isa):
     assert len(plan) == 2 and len({r[0] // 8 for r in plan}) == 2 and all(r[2][0][0] == len(rows) - 1 for r in plan)
     assert I.staging_ring([stream], ring=2048)["done"]                       # the minimum ring: live, about 7 rows held
     assert 0.10 < I.staging_ring([stream])["rate"] / 256 < 0.15               # 16 KiB: about 0.12 rows per cycle
+
+
+def test_engram_separate_array_gather(isa):
+    """Y-7: the Engram table as published (DeepSeek: about 384 M rows x 256 FP8 per layer, an E8M0 scale per 32) is stored as
+    is: 256 B rows and a separate scale array of 8 B rows (s1 = 256, aux0 = 8), so no load-time repack. A gather row is one
+    aligned granule plus an 8 B scale read (one 32 B burst): 288 B of HBM per row, 13.8 KB per token for 48 rows (two
+    layers x 24), the same bytes as 264 B inline rows at 8 B-aligned offsets (9 bursts). The rows are not split, so they
+    are not staged raw, and the gather runs at more than twice the inline rate (about 0.27 against 0.12 rows/cycle at L =
+    500)."""
+    td = _td(isa, dtype="MXFP8", space="GLOBAL", n0=256, n1=1, s1=256, aux0=8, row_bytes=256)
+    table, scales = 0x40_0000_0000, 0x50_0000_0000
+    for idx in (0, 1, 12345, (1 << 20) + 3):
+        for i0 in (0, 31, 32, 255):
+            assert I.block_addr(isa, td, table, scales, i0, idx, gather=True) == \
+                (table + idx * 256 + i0, scales + idx * 8 + i0 // 32)
+    row = I.rd_rsp_layout(table + 12345 * 256, 256, 0)
+    sc = I.rd_rsp_layout(scales + 12345 * 8, 8, 0)
+    per_row = 32 * (len(row[0]["bursts"]) + len(sc[0]["bursts"]))
+    assert per_row == 288 and 48 * per_row == 13824
+    inline = [I.rd_rsp_layout(8 + i * 264, 264, 0) for i in range(4)]       # inline rows from an 8 B-aligned base
+    assert all(32 * sum(len(x["bursts"]) for x in r) == 288 for r in inline)
+    idx = random.Random(4).sample(range(1 << 20), 1500)
+    stream = [(8, 0, 1, 256, 256, table + i * 256) for i in idx]
+    eng = [(0, 264, 0, 264, 256, table + 8 + i * 264) for i in idx]
+    run = dict(hbm="server", inflight=I.PACE_DEFAULT, fmt=["MXFP8"], rt=500)
+    sep, inl = I.staging_ring([stream], **run)["rate"] / 256, I.staging_ring([eng], **run)["rate"] / 256
+    assert sep > 2 * inl and 0.10 < inl < 0.15, (sep, inl)
 
 
 # ---------------------------------------------------------------- batched append and page bounds (memmap.md section 6, W-4)

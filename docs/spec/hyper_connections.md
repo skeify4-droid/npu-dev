@@ -78,9 +78,9 @@ then multicast; d2d_c2c.md L-7) does it in about 0.1 µs intra-die, and about 0.
 |---|---|---|
 | Layers | 1 and 14 | 1 |
 | Table | 2 x ~384 M rows x 256 FP8 (+ scale per 32) = 197 G elements | ~320 M rows x 160 BF16 = 51 G elements |
-| Rows gathered per token per layer | 24 (3 n-gram sizes x 8 heads), 264 B each | 16 (2 x 8), 320 B each |
+| Rows gathered per token per layer | 24 (3 n-gram sizes x 8 heads), 256 B each plus 8 B of scales from the separate scale array | 16 (2 x 8), 320 B each |
 | Projection after the gather | `[6144 -> 25600]` = 157 M MACs per layer | `[2560 -> 10240]` + `[2560 -> 2560]` = 33 M MACs |
-| Bytes per token (all layers) | ~13 KB (about 18 KB counting burst rounding and the separate scale array) | ~5 KB |
+| Bytes per token (all layers) | ~12.7 KB (13.8 KB of HBM reads: per row one 256 B granule and one 32 B burst of scales; review finding Y-7) | ~5 KB |
 
 **G-1: indices come from token ids only**, never from activations. They can be computed ahead of time and the gather issued at the start of a step (or for a whole prefill chunk),
 completely hidden behind the earlier layers. Remote latency (D2D/C2C) does not matter for throughput.
@@ -90,7 +90,15 @@ vocabulary map (DeepSeek). The result is an int32/int64 index list in HBM, `[tok
 
 **G-3: `DMA_GATHER_ROWS`** *(P1)*: base address, row size (256/320 B), index list pointer and count, optional scale-array base (MXFP8 rows dequantize to BF16 on the way in,
 the same path as the planned MXFP4 decompression), destination scratchpad address. It must keep 64 or more row requests in flight and tolerate rows that are not burst-aligned
-(264 B is 4.1 bursts of 64 B).
+(Qwen's 320 B rows).
+*As built (review findings Z-4, Y-7; layout chosen by the user, 2026-11-01):* `DMA_GATHER` with `cvt` from MXFP8, `s1` = `row_bytes` = 256 and the published
+separate scale array (`scale_reg`, `aux0` = 8 B per row; memmap.md §6). The runtime stores the table as published, so it needs no load-time repack of the 197 G
+elements. Each row is one aligned 256 B granule plus an 8 B scale read in its own ring entry: not split, so not staged raw, at about 0.27 rows/cycle per core
+at a 500-cycle round trip (`test_isa.py` `test_engram_separate_array_gather`). Inline 264 B rows (`SCALE_INLINE`) remain legal for a table a runtime repacks, at
+about 0.12 rows/cycle, with the same 288 B of HBM reads per row. Qwen's BF16 rows are plain (no conversion, no scales).
+- Rejected (Y-7): inline rows built by a runtime repack. No spec or plan item owned the pass over about 203 GB, the gather is slower (raw staging), and it saves
+  no bytes. Before Y-7 the specs described inline rows while the checkpoint has a separate array: a gather with s1 = 256 then faults `ILLEGAL_FIELD`, and one with
+  s1 = 264 reads every row after row 0 from the wrong bytes.
 
 **G-4: tables are sharded by row range** across the HBM of all dies and packages that hold the model (DeepSeek's 197 GB table alone exceeds one die's 144 GB).
 A remote row costs one C2C/D2D round trip of 264 B. Traffic is ~3 MB per decode step at batch 256: negligible bandwidth, so only the memory map and the address
@@ -101,8 +109,9 @@ translation need to handle it. Capacity is the real impact; it goes into the Pha
   (4 packages), 1/4 for Qwen (2 packages).
 - **Those rows are staged through the requester's sibling die.** The sibling, which is on the owner's rail, gathers them over C2C
   into a staging buffer in its own SPM, then pushes them over D2D into the requester's SPM with `rsem`. These are two DMA operations
-  through SRAM, as for the rail-staged all-to-all (d2d_c2c.md L-7, noc.md §4 rule 4). The rows arrive as stored (MXFP8 with inline
-  scales), and the requester converts them with a local SPM-to-SPM `DMA_COPY`, as its direct rows are converted on the way in.
+  through SRAM, as for the rail-staged all-to-all (d2d_c2c.md L-7, noc.md §4 rule 4). The rows arrive as stored: the sibling gathers
+  the 256 B MXFP8 rows and their 8 B scale rows into two SPM buffers and pushes both (review finding Y-7), and the requester converts
+  them with a local SPM-to-SPM `DMA_COPY` whose `scale_reg` points at the staged scales, as its direct rows are converted on the way in.
 - **One gather per owner node.** A `DMA_GATHER` has one base, so the CP (G-2) buckets each step's index list by owner node: own die,
   sibling, each same-rail package, and one staged list per other-rail package, handed to the sibling.
 - **Cost** (links_experiments.md L7): no capacity change and no arch.md change. DeepSeek: +38 KB of D2D per die per decode step
