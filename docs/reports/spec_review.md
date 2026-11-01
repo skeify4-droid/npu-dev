@@ -485,3 +485,92 @@ tile bases. `test_noc.py` 17 → 19: the V-1 rejected variant and its cycle's lo
    block divides rows per page). Check how the merge rule interacts with HBM write merging (H-2) when the block is rewritten every
    step.
 6. **D1 consistency.** Nothing outside the arch.md history row should still quote 1.65x for NVFP4 → BF16.
+
+
+# Verification 2 (2026-11-01)
+
+**Who:** a second verification session (Opus 5.5). It is not the author, the reviewer, either fix session or the first verifier. No
+spec, model or test was changed; this section is the only edit.
+
+**Method:**
+- Read the four commits of the second fix session (7575888, 2bd39fa, eb1f153, a95d18f). For each V-n: does the new text close the
+  verifier's failure scenario, and does it open a new one? The six "check first" items above were walked. Group 1 was also checked
+  against what was verified before (I-1, I-2, I-3, X-3, X-6 rule 2, D1).
+- Executable checks:
+  - `make pytest`: 197 passed (rc 0, 20.5 s, 67 MB peak).
+  - `numerics_exp.main()`, `hbm.report()` and `links.report()` regenerated into a scratch directory: all three identical to the
+    committed reports (144 s, 394 MB peak). `isa/isa.py` rerun: `git status` clean afterwards, and `verilator --lint-only -Wall`
+    on `isa_pkg.sv` passes.
+- Probes (scratch, not committed):
+  - `noc.build_cdg(scales_after_data=True)`: the cycle `find_cycle` returns is a self-loop on one RSP channel (the variant adds 784).
+    Without self-loops a 3-channel cycle remains on one RSP route in die (0, 0). So the rejected-variant test does not rest on the
+    self-loop alone. Baseline: acyclic, 1,872 channels.
+  - Staging ring, a cycle model of microarch.md §2.5. Scale reads run ahead as far as the ring allows, the data read waits for its
+    scales, round trip L, HBM share 87 B/cycle, converter 256 elements/cycle. "As written": scale space is taken at scale-read
+    issue and the raw slot at data-read issue. "Atomic": both are taken at scale-read issue.
+
+    | stream | as written | atomic |
+    |---|---|---|
+    | NVFP4 → BF16 weights (32 B of scales per 256 B granule), L = 500 / 800 / 1,000 | 151 / 149 / 125 elements/cycle | same |
+    | MXFP4 fold, every 128 B tile split (8 B of scales each), L = 500 | **deadlock at cycle 687**: 16 KiB of scales for 2,048 tiles whose data is not issued | 30 elements/cycle |
+
+    The need at 0.85 share is 155 elements/cycle. With an 8 KiB ring the NVFP4 stream drops to 75 at L = 845.
+  - `isa.paged_addr` and `isa.write_packets` against memmap.md §6 by hand (DeepSeek index key, t = 6027, q = 907; MiniMax KV,
+    t = 300). Data `0x12345e2c0` and one 32 B scale packet at `0x123460e20`, both equal to the hand values. The DeepSeek read-back
+    formula and the MiniMax gather formula (all g, i0) match `paged_addr`. A `DMA_SCATTER` append of 4 sequences with one index
+    each gives four 4 B packets (`HBM_ALIGN`). With 8 consecutive indices per sequence it gives four aligned 32 B packets. 8 scale
+    rows from q = 1020 give two 16 B packets, one per page. With `page_shift` 2 and `aux0` 4, every block spans two pages.
+  - `isa.spm_bank` over all 64 B-, 256 B- and 2 KiB-aligned bases below 128 KiB, every padded pitch: no 2 KiB-aligned base
+    collides. Every pitch has 64 B-aligned bases that collide (384-1,536 of 2,048).
+  - `grep 1.65`: the only NVFP4 → BF16 quotes are the arch.md history row and status.md's dated first-fix entry. numerics.md D1
+    and numerics_experiments.md still give 1.65x, but for the NVFP4 → E4M3 fold, which is unchanged and correct.
+
+| # | Verdict | Notes |
+|---|---|---|
+| V-1 | resolved, gap | Check-first item 1. A paged NVFP4 KV gather (page table, then the page's 32 B scale row, then the 256 B data row once the scale has landed) and a `scale_reg` weight stream (the scales of each ≤ 2 KiB data read first) convert every response from the ring, registers (`ts_reg`) and the response itself. That closes the scenario. The 16 KiB ring fits the stated rate: 16,384 / 16 B = 1,024 cycles at the converter's rate, and at the 0.85 need (9.7 B/cycle of scales) it covers round trips up to about 845 cycles (probe). The ring can deadlock, though. A split unit with out-of-line scales takes ring space twice, and greedy scale read-ahead can fill the ring before any raw slot is taken (W-1). A split unit's own remaining reads always issue: they need only tags, and tags are freed by responses that sink unconditionally. The cost of "first data one round trip later" was not costed. It is about 0.33 µs per dependent converting transfer (index scan, then top-k, then KV gather), at most about 2% of a batch-1 decode step for DeepSeek or MiniMax. noc.py: see W-1. |
+| V-2 | resolved, gap | Check-first item 4. Under the credit, the reduce-scatter scenario is closed: a parity's semaphore can never hold another use's bytes. Collectives, pipeline hand-offs and HBM `SIGNAL` buffers are named. Multicast destinations are covered once the source counts one credit per destination, which the text does not say. No remaining text implies a barrier: isa.md §3 (I-5), d2d_c2c.md L-6 and PLAN were checked. V-11's stale bound holds: a parity's semaphore never passes its current target before the wait, because the next add to it needs this wait's credit, and a credit semaphore is at most one use ahead. Gaps: semaphores without a buffer (credits, SIGNAL-only handshakes), reuse of a semaphore index by another call site, and data-dependent totals (W-3). |
+| V-3 | resolved | Check-first item 2. Tags, ring, SPM ports and injection are taken per packet, and only after the head's wait is satisfied. What a started transfer holds is freed by sinking, which is core-local. So a waiting head holds none of them. L-7 rule 2 holds independently of the ring: `DMA_LIST` entries carry no conversion (isa.md §5), so forwards never use it. Even the W-1 deadlock stops only its own DQ (it holds ring space, no tags), not the forwards. |
+| V-4 | resolved, gap | The paged formula and the `byte`/`s2`/`s3` alignment rule are correct (probe, test). The non-paged formula leaves out the base element's position inside its block, and nothing requires the base to be block-aligned (W-5). |
+| V-5 | resolved, gap | The merge rule makes the DeepSeek and MiniMax appends one aligned packet each (probe = memmap.md table = test). Not covered: the batched append (`DMA_SCATTER`), blocks that span a page, and the H-2 safety argument for rewriting a block every step (W-4). |
+| V-6 | resolved | isa.md §5, the `DMA_LIST` description and the `dma_list_entry` comment agree. The comment also lists `HBM_ALIGN`. |
+| V-7 | resolved, gap | Check-first item 3. The replay-buffer `ERR` closes the drain. It can be stale, though, and it can arrive after the real response, with the tag already reused (W-2). The fault outcome is acceptable, but the DMA's handling of an `ERR` for a tag that is not outstanding is unspecified. |
+| V-8 | resolved | The rule and the test match the probe. The claim about 64 B-aligned bases holds (every padded pitch has some that collide). |
+| V-9 | resolved | All three `dtab_rd` rows and `core/dtab` `rd` are request/grant. |
+| V-10 | resolved | `err_wr` is bit 58, `ERR` only. The validator and the header test pass. The burst rule is in noc.md §2, microarch.md §2.6 and memmap.md §4. |
+| V-11 | resolved | The text matches `isa.sem_ready`. For the bound under the carried base, see V-2. |
+
+**Earlier verdicts, re-checked after group 1:** I-1 (the ring is local SPM, so scale reads keep one local operand), I-2 (the new
+`ILLEGAL_FIELD` rule accepts every worked example: `byte` 0, s2 = 64 B), I-3 (rate 1.60x; sink: V-1 above), X-3 (merged packets stay
+inside a burst and a granule), X-6 rule 2 (V-3 above) and D1 (1.60x = 512 / (2 + 1/16) / 155; 1.36x at peak) are not reopened.
+
+## Verification 2 findings
+
+| # | Sev | From | Finding | Failure scenario | Suggested resolution |
+|---|---|---|---|---|---|
+| W-1 | M | V-1 | **The staging ring can fill with scales whose data can never be issued.** Space is "allocated when a read is issued". So a split unit with out-of-line scales (a fold tile across a granule from `scale_reg`) takes scale space at its scale read and its raw slot later, at its data read. Nothing bounds the scale read-ahead except ring space. | A 4-bit weight stream whose rows are not a multiple of 128 B, folded to E4M3. The read-ahead fills 16 KiB with the scales of 2,048 tiles. No data read can get its 128 B raw slot, nothing is converted, and nothing is freed (probe: deadlock at cycle 687). The DQ hangs. No surveyed model has such rows (expert K = 2,048-6,144 and 2,304: multiples of 256), so it is reachable only through other shapes or an unaligned K slice. When all tiles are split, the atomic rule still limits the ring to 30 elements/cycle, against a need of 164. | Reserve a unit's raw slot together with its scales at scale-read issue (or cap scale read-ahead so that the largest raw unit always fits). State that 16 KiB is sized for scales only, so the compiler pads 4-bit rows to 128 B, or accepts the rate. noc.py works at channel level and cannot see ring allocation. It can model scales-first as a `req_out(core) → rsp_in(core)` edge, which must stay acyclic. The allocation rule belongs in a DMA-level reference model (like `isa.write_packets`) with a mixed split / non-split stream and greedy read-ahead, plus a `core/dma` formal property: every allocated ring entry needs only tags to complete. |
+| W-2 | L | V-7 | **A replay-buffer `ERR` can be stale and can follow the real response.** When the reverse path fails, the far side has accepted every flit still in the replay buffer, because only the ACKs are lost. Link-down then needs more than 8 timeout-driven replays at 64 cycles each, about 576 cycles. The far side's response returns by another sub-link (any sub-link may be used, noc.md §6) in roughly 100-300 cycles, and the tag is freed and can be reused before the `ERR` arrives. | A core's read completes normally and its tag is reused by a request to local HBM. The bridge's `ERR` (`LINK`) then hits the new request, and the core faults with `LINK` and a `FAULT_ADDR` that names a request that never used the link. Or the tag is free, and the DMA's behavior is unspecified. The Phase 4 test as written ("every core with a transfer through the link faults with `LINK` or `TIMEOUT`") misses these spurious faults. The data outcome is acceptable: a link-down restarts the step, and the CP zeroes network-facing semaphores at the quiescent restart (isa.md §3). So executed-but-`ERR`'d writes and their `rsem` counts do not survive. | State three things. (a) An `ERR` (`LINK`) always faults the core, whether or not its tag is outstanding. (b) A response for a tag that is not outstanding is dropped. (c) During a link-down event `FAULT_ADDR` is advisory, and the CP restarts every core of the step regardless of which cores faulted. Let the Phase 4 test allow `LINK` on cores whose transfers completed. |
+| W-3 | M | V-2 | **The credit rule covers semaphores that belong to a buffer, and not all network-facing semaphores do.** Credit semaphores and SIGNAL-only handshakes (count exchanges, ready flags) have no receive buffer. The rule also does not say what happens when a semaphore index serves another call site in a later kernel. With 63 semaphores per core and many call sites per step, indices will be reused. "Totals per use are fixed at compile time" is false for the MoE all-to-all: its byte totals come from all-gathered counts, so the CP cannot carry them with the launch arguments. A multicast buffer needs one credit from each destination. | Kernel k uses S20 for a SIGNAL-only "counts ready" handshake from 8 dies. Kernel k + 1 (another binary) maps S20 to a pipeline hand-off. A fast producer that has already halted k adds to S20 before the consumer's kernel-k wait. The wait passes early and reads stale counts. Nothing in isa.md §3 forbids this. | State that every network-facing semaphore, credits and handshakes included, is allocated to one call site for the whole program, like the buffers. It moves to another call site only at a quiescent point, or after a final credit from its last consumer. The program, not the CP, carries data-dependent bases (in SPM). A credit wait counts one credit per consumer (n for a multicast). Have the golden-model check cover the reassignment case. |
+| W-4 | L | V-5, I-14 | **Rewriting a tail block: ordering, batching and page bounds.** (a) hbm.md H-2 says the rewrite "is safe because" writes merge in the queue. Merging keeps arrival order, but the network does not keep issue order: planes are chosen per packet. Decode is safe only because the next step's rewrite depends on this step's attention, which waited for this write's ack. (b) The batched append is a `DMA_SCATTER`, and one index per sequence gives sub-32 B packets. It needs 32 / `aux0` consecutive indices per sequence, which no text or test shows. (c) Nothing requires rows per page ≥ 32 / `aux0`, so a block can span two pages. | (a) MTP or chunked prefill appends two tokens of one block in one step as two transfers. The older block lands last and loses a token's scales, silently. (b) A batch-64 decode append written as in the worked example faults `HBM_ALIGN` (probe: four 4 B packets). (c) `page_shift` 2 with 4 B rows: every block is two 16 B packets (probe). | (a) Correct the H-2 reason. Two writes to one block need the first one's ack before the second is issued, or must be one write. Name the cases (several tokens in one step, more than one writing core). (b) Add the scatter form to memmap.md §6 and to the PLAN `core/dma` tests. (c) Require `page_shift` ≥ log2(32 / `aux0`) for block-format pages (`ILLEGAL_FIELD`). |
+| W-5 | L | V-4 | **The non-paged scale formula assumes a block-aligned base.** `R[scale_reg]` is "the scale of the base element's block", and `o` leaves out the base's offset inside that block. The block-multiple rule names `byte`, s2 and s3 only. | An NVFP4 weight slice that starts at element 8 of a row: its element 8 is element 16 of the row (block 1), but it is converted with block 0's scale. The data is wrong and nothing faults. | Require the base address and s1 of a non-paged block-format operand to be multiples of `block_bytes` (`ILLEGAL_FIELD`), as for `byte`/s2/s3. Or add the base's in-block offset to `o`. Add a non-paged reference next to `isa.paged_addr`. |
+| W-6 | L | V-1, V-3 | Text. (a) noc.md §4 rule 2: the I-1 paragraph ("In particular a DMA never sends read data on...") now reads as a continuation of the new V-1 sub-bullet. (b) microarch.md §2.5 says a started transfer holds ring slots "only until its responses sink". A split unit's slot and its scales are held until conversion. | A reader takes I-1's rule for part of V-1. RTL frees a raw slot at the first response. | (a) Make it its own bullet. (b) Say "until its data has been converted", as the ring bullet does. |
+
+## Before Phase 3, after verification 2
+
+| Block | Still open |
+|---|---|
+| `core/dma` | W-1 (the ring allocation rule; one sentence plus a reference model); text only: W-4 (b), (c), W-5, W-6 |
+| `core/seq` | none. W-3 is a compiler and runtime rule; the semaphore hardware (serial compare, never-reset rule) is unchanged |
+| `hbm` | none; W-4 (a) corrects H-2's wording, not the controller. X-2 (a), (c)-(e) stay on the H-9 checklist |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | W-2 (text and test expectation) |
+| compiler / runtime | W-3, W-4 (a), (b); V-2 credits and V-8 alignment as before |
+
+**Not checked:**
+- the JESD238 items (still unavailable);
+- the generated SV and C++ beyond the lint in `make isa`;
+- X-4 against an executable model (Phase 4);
+- the V-2 barrier cost (0.6-4.5 µs), which was not recomputed;
+- step-restart semantics after a link-down beyond the semaphore zeroing (for example, re-zeroing write-add buffers);
+- the ring's allocation granularity (CSR fields are 64 B aligned): if slots are 64 B, a KV gather's 32 B scale rows use half the
+  ring;
+- `SCALE_INLINE` scale location (Engram rows), which memmap.md does not define and V-4 did not touch.
