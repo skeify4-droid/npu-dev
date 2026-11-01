@@ -65,13 +65,13 @@
 
 | Criterion | Status |
 |---|---|
-| Spec reviewed | done, as a self-review (this document). The independent review is still open |
+| Spec reviewed | done, as a self-review (this document), and an independent review (below). The independent review's findings are open |
 | `isa.yaml` generator emits SV / C++ / Python | done (R-6) |
 | Every block has an interface table | done (R-13) |
 
 ## Not done
 
-- **Independent review.** Recommended before Phase 3 RTL starts on `core/dma`, `core/seq` and `hbm`; `common` and `arith` do not
+- **Independent review** (done 2026-11-01, see below; its findings are open). Recommended before Phase 3 RTL starts on `core/dma`, `core/seq` and `hbm`; `common` and `arith` do not
   depend on it.
   - **Why:** the session that wrote the specs also built the models that check them and reviewed them. Both serious findings above
     (R-3 between noc.md and hbm.md, the PC fold between memmap.md and microarch.md) sat at seams between specs, so the review
@@ -91,3 +91,179 @@
     reference for the Phase 4 timing checker), and the deadlock paths (R-3 partial acks, staged all-to-all) against noc.md §4.
 - **Real device numbers.** No JESD238 / vendor HBM3e timing, UCIe PHY latency, or SerDes latency was available. The model tables are
   the inputs to replace: `make hbm` and `make links` regenerate everything from them.
+
+# Independent review (2026-11-01)
+
+**Who reviewed:** a fresh Opus 5.5 session, not the authoring one. It started from `CLAUDE.md` and this file, read every spec in the
+scope above plus `isa/isa.yaml`, and ran `sim/analytic/hbm.py` on probe inputs. No spec was changed. Fixes are left for a later session,
+as the Not-done section asks.
+
+**Method:**
+- Same four checks as the self-review, at the depths in its table.
+- Weighted toward the seams between specs: ISA ↔ memmap ↔ DMA, the DMA ↔ NoC sink rules, links ↔ noc.md §4, and HBM map ↔ configs.
+- The two xhigh items: `hbm.rules()` coverage, and the deadlock paths.
+- Probes (scratch scripts, not committed):
+  - the reduced-config PC fold run through `hbm.simulate()`;
+  - hand-made command sequences against `hbm.Dram`;
+  - the SPM bank hash over power-of-two strides.
+- `make pytest` passes (rc 0, 19 s, 65 MB peak).
+
+## Findings
+
+Severity: **H** = blocks or changes Phase 3 RTL of a gated block (`core/dma`, `core/seq`, `hbm`), or a deadlock; **M** = a gap or error to fix
+before the block that uses it; **L** = text, consistency, or a cheap improvement.
+
+| # | Sev | Kind | Finding | Suggested resolution | Where |
+|---|---|---|---|---|---|
+| I-1 | H | deadlock hazard | `DMA_COPY` is "between any spaces", so both ends can be network addresses (HBM → HBM page moves, HBM → another core's SPM). The response then has no reserved SPM sink. The DMA must hold it until its write can go out, so if REQ is blocked, RSP waits on REQ. That breaks the sink guarantee of noc.md §4 rule 2 and microarch.md §2.5 ("no staging buffer"). `noc.build_cdg` has no edge for it (its only protocol edges are request ejection → response injection). | Route GLOBAL → GLOBAL copies through a local-SPM bounce buffer reserved when the read is issued: the response sinks there, and the write is a separate later step. Or forbid the pair (`TD_SPACE`). Add the case to `test_noc.py`. | isa.md §5; microarch.md §2.5; noc.md §4 |
+| I-2 | H | ISA gap | Block-scaled data under paging has no complete operand set. This is the KV and index-key path of DeepSeek (NVFP4 KV, MXFP4 index keys) and MiniMax (NVFP4 KV and index keys). (a) TD `aux0` is both `page_shift` and the scale-array row stride. (b) `DMA_GATHER` PAGED takes its page table from `scale_reg`, which leaves no operand for a separate scale array. (c) Scale arrays are never translated through a page table. (d) memmap.md §6 puts one KV group in a page, but hbm.md H-2 stores the scales of all KV heads of a token together, so data and scales sit in different pages. (e) The NVFP4 FP32 tensor scale has no operand anywhere, yet the fold (N-2 step 4) and `NVFP4_BF16` both multiply it into the column scales. (f) PAGED is defined as "translates its outermost dimension" but the page size is in bytes. Nothing says whether a row may straddle a page, and MLA 576 B tokens do not divide 4 KiB. | Give each page its own scale region (data, then the scales of the same tokens), so one PTE translates both. Move the scale layout out of `aux0` (the `rsv` bits [255:240], or a second TD). Add a tensor-scale register to T_DMA (bits [28:0] are free). Define PAGED as: logical byte offset `>> page_shift` → frame, with rows not crossing a page, or with the DMA splitting at page boundaries. | isa.yaml `td`, T_DMA, `cvt`; memmap.md §6; hbm.md H-2; numerics.md N-1, N-2 |
+| I-3 | H | bandwidth | Decision D1 (decode NVFP4 uses exact `NVFP4_BF16`) checks only the 512 B/cycle stationary-load port. The DMA writes SPM at 256 B/cycle (microarch.md §2.3, §5). A core's HBM share at 0.85 (87 B/cycle) of NVFP4 expands to 309 B/cycle of BF16 (364 at peak). So the exact path caps NVFP4 streaming at 72 B/cycle per core, 0.83x the rate the roofline assumes, on MiniMax's experts and DeepSeek's NVFP4 KV. The DMA's `ni_rsp` "always accepted" contract also cannot hold under a 3.6x expansion. MXFP4/NVFP4 → E4M3 (about 193 B/cycle) fits. | Widen the DMA SPM write to 512 B/cycle (the SPM write side peaks at 768 of 2,048 B/cycle), or convert in the MXU weight-load path. Give `ni_rsp` a bounded inbound buffer with ready, or size the converter for 256 B/cycle in. Re-check D1's margin. | numerics.md D1; microarch.md §2.3, §2.5, §5 |
+| I-4 | M | ISA semantics | Semaphores that receive network adds cannot be reset safely. `SSET` checks only local queued references (`SEM_BUSY`), while `rsem` / `SIGNAL` adds from other cores may be in flight, and no protocol is given for kernel boundaries. The `>=` compare is unsigned 32-bit and `rsem` counts bytes, so 4 GiB per kernel wraps. A kernel spanning a long prefill gets close: about 2.6 GB of all-reduce bytes per core over a 32K-token DeepSeek prompt (estimated). | Use a serial-number compare (`(int32)(sem - target) >= 0`) and never reset network-facing semaphores, which is what d2d_c2c.md L-6's "monotonic, no reset" needs. Or define a kernel-boundary barrier before `SSET`. | isa.md §3; isa.yaml `SSET`, `SWAIT`, sync block |
+| I-5 | M | ordering gap | `DMA_MCAST` completion is undefined. MC_WR is posted with no ack (noc.md §2), but isa.md §3 defines DMA completion as "every write acknowledged", and `SIGNAL`, `FENCE` and `HALT` promise that. So `HALT`, then the CP reading the results, can miss multicast data, and a `SIGNAL` after a multicast gives no release. | Define multicast completion as "injected", and state that only destination `rsem` orders multicast data. Or count per-destination acks (the NI knows the rectangle size). | isa.md §3, §5; memmap.md §9; noc.md §2 |
+| I-6 | M | protocol (program level) | **The rail-staged all-to-all is network-safe but can deadlock at the program level.** (a) Each destination waits for the byte total before consuming. If the buffer receiving forwarded data is smaller than that total and recycled by credits, the forwarder waits for credits that come only after the total arrives: a cycle. (b) Prefill volumes do not fit SPM. For example, 2048 tokens x top-8 x d = 5120 in FP8 is 84 MB per die, 2.6 MB per core, so buffers go to HBM, where `rsem` is undefined (no owning core). (c) One byte-counting semaphore over both buffers of L-6's ping-pong is unsafe: a producer running ahead into buffer B completes the count for buffer A early. | State that destination buffers are sized for the whole exchange (from the counts). Define `rsem` on HBM writes, or a separate completion step for HBM buffers. Require one semaphore per buffer parity, or per chunk slot when forwarding. | d2d_c2c.md L-6, L-7; isa.yaml `DMA_COPY` rsem |
+| I-7 | M | deadlock hazard | The link receive buffer must be dequeued per VN. L-3 gives a shared pool plus 4 reserved flits per VN, and in-order lanes. If the bridge moves packets into the leaf in arrival order, a REQ blocked on a full class-X REQ VC blocks the RSP behind it, and the reserved RSP slots do not help. `noc.py` models a separate link channel per VN (`_chan(..., vn, ...)`), so it assumes per-VN queues the spec never requires. | Require per-VN queues over the shared pool on RX, and per-VN arbitration on TX. Name it in L-9 (`ll_rx`). | d2d_c2c.md L-3, L-9; noc.md §4 rule 3 |
+| I-8 | M | cross-spec conflict | hyper_connections.md G-4 shards the Engram / n-gram tables over every die and package, with direct remote row gathers. memmap.md §1 faults cross-rail accesses (`RAIL`). On DeepSeek's 4 packages, 3 of 8 dies are on the other rail of another package, so 3/8 of uniformly sharded rows are unreachable. Also, one `DMA_GATHER` has one base and PTE frames are die-local, so a sharded table needs one gather per node. | Decide: replicate the tables per rail (+197 GB on DeepSeek; re-check the arch.md §3 row with `make sweep`), or stage gathers through the sibling die (G-1 makes the latency hideable). The CP buckets index lists per node (G-2). Update G-4. | hyper_connections.md G-4; memmap.md §1; arch.md §3 |
+| I-9 | M | checker coverage (xhigh item) | `hbm.rules()` / `Dram` accept three illegal sequences (probed): (a) `PREA` is a DFI `row_cmd` (H-5), but no rule or state handles it. `ACT`, `PREA` one cycle later, then `RD` to the row is accepted: no tRAS check, and nothing closes. (b) REFpb → ACT to a bank in another bank group or SID has no gap; only same-BG RRDL exists, so ACT one cycle after REFpb passes. (c) REFpb → REFpb to the same bank across a round boundary is limited only by RREFD (10 cycles), not RFCPB (264). No tRAS max either (refresh bounds it in practice). This model is the reference for the Phase 4 checker. | Add `PREA` (per-bank RAS/RTP/WRP to all banks, RP to the next ACT, and the state change), REFpb → ACT any other bank (tRREFD; confirm against JESD238), and REFpb → REFpb same bank = RFCPB. Add the three sequences to `test_hbm.py`. | sim/analytic/hbm.py `rules`, `Dram`; hbm.md H-4, H-5 |
+| I-10 | M | config error | The R-11 fold for `TINY` / `MID` moves the unused PC bits into the row's low bits and leaves the bank unchanged. So the granules of a 2 KiB block that share a PC are row conflicts in one bank. Measured with `hbm.simulate()` on 8 sequential streams: `FULL` 0.99, `MID` (8 PCs) 0.68-0.72, `TINY` 0.56. `MID` is the "performance windows, calibration" config. The DFI `row_addr` is also fixed at 15 bits, but the extended row needs 17 bits (`MID`, 8 PCs) or 18 (`TINY`). | Also XOR the folded bits into `bg` / `ba`. It stays one-to-one because the bits are kept in the row, and measured it restores 0.99 for both configs. Parameterize the `row_addr` width. | hbm.md H-1, H-5; memmap.md §3; `hbm.fold_pc` |
+| I-11 | M | interface tables (`core/seq`, `core/mxu`) | (a) `q_push` carries 6 x 64 captured registers, but T_DMA, T_MXU and T_VPU use 6 operand registers plus `wreg`, which is captured at issue (isa.md §3): 6 x 64 + 32 bits. (b) The MXU has no `dtab_rd` port, though `MXU_MM` takes `a_td` / `w_td`, and no other block resolves TDs for it. The SPM client list also omits the MXU's `scale_rd`. (c) TD contents are not captured at issue. A DMA write to DTAB (space `DTAB`) races queued instructions that name the entry, and there is no rule for it (IMEM has one: `FENCE`). | Widen `q_push`. Add `dtab_rd` to the MXU (or resolve TDs in the front end and queue them). Add the scale-read client. State that DTAB updates are ordered like IMEM overlays. | microarch.md §2.1, §5; isa.md §3, §4 |
+| I-12 | M | missing encodings | (a) The `DMA_LIST` 32 B entry has no layout in `isa.yaml` or isa_ref.md, though collectives and the MoE all-to-all are built from it. Nothing says whether an entry can wait on a semaphore, which L-7's per-chunk forward ("as soon as each chunk's rsem count completes") needs. (b) The 128-bit NoC header has a field list but no bit layout. The NI, router, HBM controller and bridges all parse it. The burst id width is not given. Partial-ack coalescing (R-3) needs the burst's total length in every packet, because packets arrive unordered, so the target knows when a burst is complete. | Add `dma_list_entry` and `noc_header` sections to `isa.yaml`, generated like the TD, with a test that every field fits. Decide whether list entries carry a wait. | isa.yaml; noc.md §2; d2d_c2c.md L-7 |
+| I-13 | L | SPM banking | (a) "Power-of-two row strides of 2 KiB-64 KiB still spread over the banks" is not true. Over 64 rows the hash gives 32, 16, 8, 4, 2 and 1 distinct banks for 2, 4, 8, 16, 32 and 64 KiB, so a 2-rows-per-cycle stationary load at 64 KiB stride hits one bank set. (b) The read budget leaves out the NI target (128 B/cycle, including write-add read-modify-write) and the MXU scale reads, so "the sum equals the port capacity" is over capacity. | Correct the text. Optionally fold `addr[20:16]` into the hash. Add the missing clients to the table. | microarch.md §2.3; memmap.md §4 |
+| I-14 | L | layout cost | The 32 B HBM-write rule (R-4) applied to single-head per-token appends: a DeepSeek MXFP4 index key is 64 B of elements plus 4 B of scales. Padding the separate scale array to 32 B per token adds 41% to index-scan bytes, and the index scan is up to 12% of a step (arch.md §4). | Prescribe a tail-block rewrite instead: the compiler keeps the current 32 B scale block in SPM and rewrites it each step. | hbm.md H-2; memmap.md §8 |
+| I-15 | L | stale / inconsistent text | (a) PLAN Phase 3 table: `core/mxu` "output- or weight-stationary (Phase 2 decides)", `core/seq` "scoreboard" (rejected in isa.md §10), `core/dma` "MXFP4 decompress" only. There are no `core/acc` or `core/ni` rows, though both have interface tables. (b) isa.md §7 converts Y to BF16, then scatters with `wop = ADD_F32`. (c) microarch.md §2.4 says top-k k ≤ 4096, but the VTOPK `k` field is 12 bits (max 4095); the models need ≤ 2048. (d) Subnormals in block → BF16 conversions: "kept" (numerics.md principles, N-5) vs "flush" (N-2). (e) DIECTL has one block each for the 4 D2D and 4 C2C bridges, and does not say which of 4 leaves reaches an HBM controller's CSRs. The CP mailbox address and the `START` / `STOP` offsets are missing. (f) The `SEM_ADD` window says "DMA wop ADD", but `ADD_F32` is a float add; state integer semantics. (g) `rsem` on an HBM write is undefined. (h) The DMA timeout reports `LINK` even when the stall is not a link fault. | Text fixes. For (e), add a DIECTL routing table. For (h), consider a `TIMEOUT` cause. | as listed |
+
+## Checked with no change needed
+
+- **Numbers recomputed:**
+  - D2D: 1.87 TB/s raw, 1.45 payload, 91% of 2 UCIe-A x64 modules.
+  - C2C: 150 GB/s raw, 116 GB/s payload per port.
+  - Link flit: 1,248 bits.
+  - Link buffers: 166 KiB and 1.26 MiB. The round trip is scaled by the flit rate: 470 cycles x 0.641 flits/cycle x 1.25 → 512.
+  - Latency sums: 140 and 359 cycles.
+  - Per-leaf HBM: 205 B/cycle.
+  - DMA: 512 granules against the 640-cycle p99 round trip.
+  - Router buffers: 42 KiB.
+  - HBM capacity: 32 x 16 x 3 x 24,576 x 1 KiB = 36 GiB.
+  - D1 stationary-port margins: 1.65x and 3.31x.
+- **HBM map:**
+  - one-to-one;
+  - 2 KiB stays on one leaf;
+  - 8 KiB touches all 32 PCs;
+  - a 64 KiB stride reaches 16 PCs over 32 accesses.
+- **Numerics:**
+  - The FP8 PE adder width (39 bits) is right.
+  - NVFP4 → BF16 is exact (6 significant bits ≤ 8).
+  - The MXFP4 fold is exact within 14 binades.
+- **Deadlock (first pass; the xhigh pass below goes deeper):**
+  - Class X and the one-link rule give an acyclic order.
+  - R-3 partial acks are deadlock-free. Their liveness needs X-3.
+  - HBM port head-of-line blocking cannot deadlock: read and write queues drain to DRAM independently of the network, and RAW
+    promotion only waits on writes already queued.
+  - The staged all-to-all's two hops are independent at the network level (but see I-6).
+  - Multicast with atomic fork allocation waits only forward in XY order.
+- **ISA encoding:**
+  - No overlapping fields in any format.
+  - Opcode ranges are consistent.
+  - The `mc_rect` (14 bits) and `coord` widths match the 10 x 6 router grid.
+  - The PTE frame field covers 4 TiB.
+
+## Before Phase 3
+
+| Block | Findings to resolve first |
+|---|---|
+| `core/dma` | I-1, I-2, I-3, I-5, I-12(a), X-3 |
+| `core/seq` | I-4, I-11 |
+| `hbm` | I-9, I-10, I-12(b), X-1, X-2, X-3 |
+| `common`, `arith` | none (as the self-review said) |
+| Phase 4 `link`, `noc` | I-7, I-12(b), X-4, X-5 |
+| compiler / runtime | I-6, I-8, I-14, X-6 |
+
+**Not checked:**
+- the generated SV / C++ against a compile (`make isa` only);
+- the perf numbers in `phase1_sweeps.md`;
+- the HBM3 items that need JESD238 (X-2).
+
+## Independent review: xhigh checks (2026-11-01)
+
+These are the two items the Not-done section reserves for xhigh. Same reviewer session, now at xhigh effort. Probes are scratch scripts,
+not committed; their results are quoted below.
+
+### A. Does `hbm.rules()` cover every DRAM timing constraint?
+
+**Method:**
+1. Enumerate the constraint classes of an HBM3-style device and look each one up in `rules()` and `Dram`.
+2. **Mutation test:** delete each of the 28 rules in turn and rerun the checker tests of `test_hbm.py`. The scheduler tests cannot
+   catch a missing rule, because they only check that the scheduler never violates the rules that exist.
+3. Hand-made sequences against `Dram` for the gaps.
+
+| Constraint | In `rules()` / `Dram` | Isolating test | Verdict |
+|---|---|---|---|
+| tRC (ACT → ACT, same bank) | yes | no | redundant: implied by tRAS + tRP |
+| tRRD_L, tRRD_S | yes | yes | ok |
+| tFAW (ACT and REFpb) | yes | yes | ok; scope in X-2 |
+| tRCDRD, tRCDWR | yes | yes | ok |
+| tRAS (ACT → PRE, and the auto-precharge point) | yes | yes | ok |
+| tRP (PRE → ACT) | yes | **no**: the test called "PRE -> ACT" issues the ACT inside tRC, so it catches tRC | add a test with PRE later than tRAS |
+| tRP (PRE → REFpb, PRE → REFab) | yes | no | add tests |
+| tRTP (RD → PRE, RD with auto-precharge) | yes | no | add a test |
+| tWR (WR → PRE, WR with auto-precharge) | yes | yes | ok |
+| tCCD_L, tCCD_R (RD → RD) | yes | yes | ok |
+| tCCD_L, tCCD_R (WR → WR) | yes | no | add tests |
+| tCCD_S (gap 1) | yes | n/a | redundant with one column command per cycle |
+| tRTW, tWTR_L, tWTR_S | yes | yes | ok |
+| tRFCpb (REFpb → ACT, same bank) | yes | yes | ok |
+| tRFCpb (REFpb → REFpb, same bank) | **no**: only "once per round", which resets at the round boundary | - | **gap** (I-9 c) |
+| tRREFD (REFpb → REFpb) | yes | yes | ok |
+| REFpb → ACT, other bank | **only** RRD_L inside the bank group; nothing for another BG or SID | - | **gap** (I-9 b); scope in X-2 |
+| ACT → REFpb (RRD_L, RRD_S) | yes | no | add tests |
+| tRFCab (REFab → ACT, REFab → REFpb, REFpb → REFab) | yes | no | add tests: `CTRL` can select all-bank mode, so the RTL has it |
+| tRFCab (REFab → REFab) | **no**: two REFab one cycle apart are accepted | - | **gap** |
+| PREA | **no**: accepted as a no-op that closes nothing | - | **gap** (I-9 a) |
+| any command not in the table | **accepted silently** (as a row command) | - | **gap** |
+| refresh: each bank once per round, at most 8 REFpb behind | yes | yes | ok |
+| tRAS max, refresh pull-in limit | no | - | low: the scheduler bounds both (refresh closes every bank once per round) |
+| power-down, self-refresh, MRS, ZQ, ECS | not modeled (H-5) | - | out of scope; the checker should reject them (row above) |
+| one row and one column command per PC per cycle | yes | yes | ok |
+| row and column buses shared by the two PCs of a channel | **no** | - | X-2 |
+
+The mutation test leaves 15 of 28 rules deletable with no test failing:
+- 3 are redundant: tRC, and tCCD_S for RD and WR.
+- The other 12 have no isolating test: tRP (3 rules), tRTP, the two ACT → REFpb rules, REFpb → ACT in the same bank group, the three
+  REFab rules, and WR → WR tCCD_L and tCCD_R.
+
+H-5 says Phase 4 runs "the same sequences against the SV model", so those 12 rules would go unexercised in RTL too.
+
+| # | Sev | Finding | Suggested resolution |
+|---|---|---|---|
+| X-1 | M | Extends I-9. Beyond PREA, REFpb → ACT in another bank group, and REFpb → REFpb in the same bank: REFab → REFab has no tRFCab gap, unknown commands are accepted, and 12 rules have no isolating test (above). | Add the missing rules. Make `Dram.issue` reject unknown commands. Add one violating sequence and one exact-gap sequence per rule, and make the mutation test a unit test: every non-redundant rule must be caught. This is what the Phase 4 SV checker inherits. |
+| X-2 | M | These need JESD238 or a vendor datasheet; public sources do not settle them. (a) Whether tRREFD also covers REFpb → ACT to any other bank, which the H-4 note "(A) REFpb to REFpb" leaves out. (b) Command-bus sharing: H-1 gives each PC "a fixed DFI phase" on the channel's shared bus. That works only if every command takes one CK; an ACT occupying 2 CK (as in HBM2) leaves room for one ACT per channel per `clk_mc` cycle, not per PC. The per-PC checker and `simulate()` cannot see this. (c) Whether HBM3 has a separate write-to-write same-bank-group gap (DDR5 has tCCD_L_WR because of on-die ECC). (d) The scope of tFAW and tRRD with 3 SIDs. (e) Whether tPPD (PRE → PRE) exists. | Add these to the H-9 JESD238 item as a checklist. For (b), add a channel-scope occupancy rule to the checker (a pair of PCs), and an arbiter between the pair in H-3. The bandwidth cost is small at 1 ACT per 8-29 bursts, but the RTL must not assume independence. |
+
+### B. Deadlock paths against noc.md §4
+
+**Method:**
+- Walked R-3 (partial acks), the rail-staged all-to-all, and the link layer (L-3, L-4) end to end.
+- Ran variants of `noc.build_cdg` (2 packages) for the first pass's hazards:
+
+| Variant | Result |
+|---|---|
+| baseline | acyclic |
+| I-1: the DMA forwards read data as a write (response sink waits on request injection) | **cycle**: RSP-L → REQ-L → D2D → REQ-X → HBM → RSP-L on the sibling → REQ-L → D2D |
+| I-7: link TX/RX shared by REQ and RSP (one FIFO, not per-VN queues) | **cycle** through two C2C links |
+
+Both rejected variants belong in `test_noc.py`, next to the existing four.
+
+**Checked, sound:**
+- **R-3 (network level).** An eviction ack may go to any source, not just the writer of the packet being accepted. That adds REQ → RSP
+  edges between arbitrary channels at the target. They cannot close a cycle, because RSP has no edge back to REQ: the DMA response sink
+  is unconditional, given I-1. The HBM write queue drains to DRAM, independently of the network.
+- **Staged all-to-all (network level).**
+  - The C2C hop sinks into SPM (class X).
+  - The forward is a new local-SPM → D2D transfer (class L → link → class X).
+  - Its acks return on RSP.
+  - No channel of the first hop waits on the second.
+
+| # | Sev | Finding | Suggested resolution |
+|---|---|---|---|
+| X-3 | H | **R-3 has no completion trigger, a liveness bug.** hbm.md H-2 and noc.md §2 coalesce an ack "while the table has room" and ack early only when it is full. Nothing says when a burst's entry is acked otherwise. Packets arrive unordered, so the target cannot tell the last one, and the header carries only the packet length. At low load the table never fills, so a burst's final ack is never sent and the DMA (and `SIGNAL`, `FENCE`, `HALT`) waits forever. That is a hang, not a CDG cycle, so `noc.py` cannot see it. | Every WR carries its burst's total bytes (12 bits). The target acks when its count reaches the total, and also flushes entries idle for N cycles. State that an SRAM target acks only after the write (including write-add) is visible, which `rsem` and `SIGNAL` rely on. |
+| X-4 | M | **Link credits can leak.** (a) Credits are returned as small increments (4 + 4 + 6 bits) on any reverse flit, including idle flits (L-3). An idle flit is not in the replay buffer, so if it fails CRC, its credits are lost for good. Each loss shrinks a VN's credit pool until that VN stalls. At 1e-15 BER that is rare but cumulative over a long run. (b) No rule says whether a freed slot returns to the shared pool or to a VN's reserve, and the flit has no pool bit. If the receiver attributes it, reserve slots can drift into the shared pool, eroding the "RSP always drains" guarantee L-3 exists for. | Return credits as cumulative counters (absolute mod 2^n, idempotent like `ack_seq`), or only on sequenced flits. Have the receiver return per-VN credits only, and the sender refill its reserve before the shared pool; or add a pool bit (20 bits are reserved). Add a CRC-error-on-idle-flit case to the Phase 4 link tests. |
+| X-5 | M | **Link-down blocks the die.** L-4: on link down "the bridge stops" and transfers wait for the 100 µs DMA timeout. A stopped bridge stops consuming, so packets for that link back up through the mesh REQ-L virtual channels (cut-through holds a buffer per hop). They then block unrelated traffic on those channels: HBM reads of other cores, and the cores' own fault interrupts, which are network writes to the CP (microarch.md §5 `irq`). The CP's recovery accesses can also be blocked. | On link down, the bridge keeps sinking: requests get `ERR` (cause `LINK`), and the replay buffer and arriving packets are discarded, so the mesh drains. The DMA timeout stays as the backstop. Add a `PKG_TINY` test: link down under load, then every core faults and the CP can still reach every core. |
+| X-6 | M | **Program-level deadlock from in-order queues** (extends I-6). A tile instruction waiting on a remote semaphore blocks its queue, and when the queue is full (16 entries) it blocks the in-order front end. With P = 2, take the forwarder (B, 0) (package, die) and the source (A, 0), which is also a forwarder for (B, 0)'s traffic to (A, 1). Suppose each core issues its chunk forwards (each waiting on a chunk `rsem`) before its own puts. Once a core has more than 16 chunks, both front ends block on full queues. Each core's forwards then wait for the other's puts, which are never issued. No network resource is involved. Credit-limited staging rings give the same cycle within a single queue: a source's credit wait sits ahead of its own forwards. | Add a schedule rule to d2d_c2c.md L-7 and the compiler: issue every put that depends only on local data before any instruction that waits on a remote semaphore. Keep remote waits in a queue that does not hold instructions other cores depend on, and never let the front end block behind them. Add a global "every engine blocked on a semaphore" detector to the golden model and the Phase 7 simulator, next to the SPM race checker. |
