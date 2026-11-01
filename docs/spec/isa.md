@@ -374,7 +374,10 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
   (d2d_c2c.md L-4 (e), review finding Z-7). Before the restart the CP toggles each core's CSR `NI_EPOCH`, which every
   request header carries and every target echoes in its response, ack or `ERR`, and a core drops a response, ack or `ERR`
   (`LINK`) of the other epoch, so a stale one cannot fault or reach the new step even if it outlives `T_DRAIN` (L-4 (f),
-  review findings Y-10, X-13). One bit covers one restart; after two in a row the drain conditions are the guard. So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  review findings Y-10, X-13). One bit covers one restart; after two in a row the drain conditions are the guard. Requests
+  are not filtered: a late `WR` or `SEM` of the old step that outlives its initiator's timeout and `T_DRAIN` would still
+  write and count in the restarted step, so for requests too the drain conditions and the timeout are the guard (L-4 (f),
+  review finding U-3). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
   recovery accesses rely on.
 
 Causes:

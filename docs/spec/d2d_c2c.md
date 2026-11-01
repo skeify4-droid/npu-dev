@@ -134,7 +134,8 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
       timeout. `STATUS` shows the DMA busy until all are free, and the CP restarts a core only after that: at most one timeout
       (100 µs by default) after the fault, added to a recovery that already includes a link retrain. A late response or
       ack of the old step that arrives after the restart and names a reused tag or burst id carries the old `epoch` and is
-      dropped (f, review finding X-13), so this no longer rests on the timeout alone. The same holds for a core the CP
+      dropped (f, review finding X-13), so this no longer rests on the timeout alone. A late request of the old step
+      still does (f, review finding U-3). The same holds for a core the CP
       stopped without a fault: it stops like a faulted core (isa.md §8), and its tags drain the same way.
     - **(e) Restart condition *(review finding Z-7)*.** The CP restarts the step only when:
       1. `STATUS` shows the DMA idle on **every core of the step**, faulted or stopped by the CP;
@@ -156,6 +157,17 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
       - So a stale `ERR`, response or ack of the step before a restart cannot fault or corrupt the restarted step,
         whatever its age. 10 µs was about 16x the estimated worst transit, but that estimate assumed every sink keeps
         draining, and SPM-port arbitration against the DMA is not bounded in the spec.
+      - **Late requests are not filtered *(review finding U-3)*.** Targets copy `epoch` but execute every request they
+        accept. A late read is harmless: its response carries the old epoch and is dropped. A late `WR` or `SEM` of the
+        old step (a write-add or `MC_WR` too) writes its bytes and adds to its `rsem` semaphore, which the CP zeroed at
+        the restart, so a consumer of the restarted step can count it and read a buffer the new step has not finished.
+        Such a request is kept out only by the time argument, as a packet two restarts old is: it would have to outlive
+        its initiator's timeout (100 µs; condition 1 waits for the burst id it frees), `err_done` and `T_DRAIN`.
+        Phase 4 tests it (PLAN).
+        - Not taken: SPM and CORECTL targets dropping a `WR` or `SEM` whose `epoch` differs from their own core's
+          `NI_EPOCH`. It needs every writer in the target's step (epochs diverge once one step restarts), an exemption
+          for the CP's own accesses and an epoch on `MC_WR`, which has none, and it still leaves HBM and GSRAM writes,
+          which have no owning core, on the time argument.
       - **One bit covers one restart, not two in a row *(X-13 (a))*.** After two restarts the epoch has its old value
         again, so a packet from two restarts ago is kept out only by the time argument: it would have to outlive
         conditions 1-3 of both restarts (two `STATUS`-idle waits, two `err_done` reports, two `T_DRAIN` waits) and two link
@@ -166,7 +178,8 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
       - Cost: one header bit (of the 6 reserved), one CSR bit, a compare in `core/ni`, and a bit copied in every target's
         response path and in the bridge.
     - The data outcome is unchanged: the step restarts, and the CP zeroes the network-facing semaphores at the quiescent
-      restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive.
+      restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive. A write executed
+      after the restart would (late requests, f).
   - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface
     (isa.md §8).
   - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
@@ -396,4 +409,5 @@ with TP > 2:
   does not fault the restarted step, because the CP waits for every core of the step, `err_done` and `T_DRAIN` (Z-7), and
   one held past `T_DRAIN` is dropped by its epoch (Y-10), as are a late response and ack (X-13); two steps on one die that
   both used the failed link are both restarted, each with its own conditions and epoch toggle, while a step that did not
-  keeps running (X-13 (c)); and a second link failure right after a restart (X-13 (a)).
+  keeps running (X-13 (c)); a second link failure right after a restart (X-13 (a)); and a late `WR` with `rsem` of the old
+  step held past its initiator's timeout and `T_DRAIN`, which only the drain conditions keep out (U-3).

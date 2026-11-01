@@ -304,6 +304,10 @@ session checks the fixes next.
     data; the same for a `WR_ACK` of a reused burst id. A link that fails again at once after a restart, with a late
     `ERR` of the first step still held: the CP waits conditions 1-3 of the second restart, and the test measures whether a
     packet two epochs old can outlive them (one epoch bit covers one restart; L-4 (f)).
+  - a late request of the old step (U-3): a `WR` with `rsem` held at its target past its initiator's timeout and
+    `T_DRAIN` (a stalled SPM port). The test measures whether it can outlive conditions 1-3; with `T_DRAIN` shortened
+    below the hold it lands in the restarted step's SPM and semaphore, which shows that requests rest on the drain
+    conditions, not on the epoch.
   - several steps on one die (X-13 (c)): steps A and B on disjoint cores both have transfers through the failed link,
     and a step C does not; with the reverse path failed, a stale replay-buffer `ERR` faults a core of B whose transfers
     completed. The CP restarts A and B, each after its own conditions 1-3 and with its own `NI_EPOCH` toggle, and C keeps
