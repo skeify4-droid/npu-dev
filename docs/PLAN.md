@@ -196,7 +196,8 @@ SV/C++/Markdown generators: `make isa`), memory map (`docs/spec/memmap.md`), NoC
 `sim/analytic/noc.py`). **Step 2 done (2026-11-01):** numerics (`docs/spec/numerics.md`, golden model `sw/npumodel/numerics.py`,
 experiments `make numerics`). **Step 3 done (2026-11-01):** HBM controller (`docs/spec/hbm.md`, model and timing checker
 `sim/analytic/hbm.py`, `make hbm`), links and collectives (`docs/spec/d2d_c2c.md`, `sim/analytic/links.py`, `make links`), spec review
-(`docs/reports/spec_review.md`, findings R-1 to R-15).
+(`docs/reports/spec_review.md`, findings R-1 to R-15). **Independent review done (2026-11-01):** findings I-1 to I-15 and the xhigh
+checks X-1 to X-6 (HBM timing-rule coverage, deadlock paths) in the same file; all open.
 - **Done (v0.1).** `isa.md` + `isa.yaml`: tile-level macro instructions (DMA_LOAD/STORE with 2D/3D strides, gather, page-indirect;
   MXU_GEMM; VPU ops; SFU; TOPK; SYNC/barrier/semaphore; COLLECTIVE; hyper-connection ops HC_MIX / HC_SINKHORN / HC_PRE / HC_POST /
   HC_GATED_MIX; DMA_GATHER_ROWS with unaligned rows and MXFP8 dequantization). Decoupled access/execute queues per core.
@@ -213,8 +214,11 @@ experiments `make numerics`). **Step 3 done (2026-11-01):** HBM controller (`doc
   As built: CRC-32C + go-back-N on both links (required, not optional); no engine: hierarchical direct all-reduce and rail-staged
   all-to-all as DMA programs.
 - Exit: spec reviewed. `isa.yaml` generator emits SV/C++/Python. Every block has an interface table.
-  **Met (2026-11-01)** as a self-review. An independent review of the whole spec set is still recommended before Phase 3 RTL on
-  `core/dma`, `core/seq` and `hbm` (scope and settings: [spec_review.md](reports/spec_review.md), Not done).
+  **Met (2026-11-01)** as a self-review, followed by an independent review of the whole spec set (findings I-1 to I-15, X-1 to X-6,
+  all open: [spec_review.md](reports/spec_review.md)).
+  - **Before Phase 3 RTL** on `core/dma`, `core/seq` and `hbm`, resolve the findings listed for that block in the review's
+    "Before Phase 3" table. The high-severity ones are I-1 (deadlock), I-2, I-3 and X-3 (hang).
+  - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)
 | Block | Contents | Verification hook |
