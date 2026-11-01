@@ -98,6 +98,11 @@ Four mechanisms remove the four kinds of deadlock:
    - Every response is guaranteed to sink: the requester reserved the destination SPM space (reads) or the ack counter (writes)
      before sending the request.
    - Sinking may take a bounded time (the DMA converter paces `ni_rsp`, microarch.md §2.5), but it never waits for the network.
+     - In particular a response never waits for another response *(review finding V-1)*. Block scales are read into the DMA's
+       staging ring before the data that needs them. A conversion unit whose bytes span several responses (an inline-scaled row,
+       a fold tile across a granule) is received raw into a staging slot reserved when its reads are issued. If the converter
+       waited for scales that arrive as separate responses, a data granule at the head of the RSP channel into a core would wait
+       for its scale queued behind it (tested below).
      In particular a DMA never sends read data on as a write: one operand of every DMA transfer is local (`TD_SPACE` otherwise,
      review finding I-1). If it did, the response channel into a core would wait on that core's request injection, which closes a
      cycle (tested below).
@@ -143,6 +148,7 @@ Four mechanisms remove the four kinds of deadlock:
 | An HBM leaf consumes a request by issuing one to the sibling die | **cycle** (D2D and back) |
 | A DMA forwards read data as a write (global-to-global copy without a local sink, review I-1) | **cycle** (two cores reading each other) |
 | One link queue for REQ and RSP (no per-VN queues in the link layer, review I-7) | **cycle** (through two C2C links) |
+| The converter waits for scale responses that arrive with or after the data (review V-1) | **cycle** (the last RSP channel into a core, waiting on the channels of its own route) |
 
 Each rejected design is a test case (`tb/unit/test_noc.py`), so a change that reintroduces one of them fails `make pytest`.
 - Coverage: the check is at channel-class granularity. More VCs per class with free allocation inside the class keep it valid.

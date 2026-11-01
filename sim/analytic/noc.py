@@ -233,7 +233,7 @@ def endpoints(packages=2, dies=2):
 
 
 def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, multicast=True, hbm_forwards=False,
-              dma_forwards=False, link_vn=True):
+              dma_forwards=False, link_vn=True, scales_after_data=False):
     """Channel dependency graph of the whole system: REQ and RSP routes for every allowed endpoint pair,
     protocol edges (a request is consumed only by emitting its response), and XY-tree multicasts.
 
@@ -242,7 +242,10 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
     dma_forwards=True lets a DMA sink read data only by sending it on as a write (a GLOBAL -> GLOBAL copy with no local
     buffer, review finding I-1): the response channel into a core then waits on that core's request injection.
     link_vn=False gives each D2D / C2C link one queue for both VNs (review finding I-7): the link layer then dequeues in
-    arrival order, so a blocked REQ holds the RSP behind it."""
+    arrival order, so a blocked REQ holds the RSP behind it.
+    scales_after_data=True is the converter rule before review finding V-1: a block-format data response cannot be
+    converted (so cannot eject) until its scale response arrives, and the scale is another response that may be anywhere
+    on a response route into the same core, also behind the data in the same channel."""
     g = defaultdict(set)
     eps = endpoints(packages)
     cores = [e for e in eps if not is_leaf(e[2])]
@@ -268,6 +271,8 @@ def build_cdg(packages=2, classes=True, split_vn=True, allow_cross_rail=False, m
             link(q)
             link(r)
             g[q[-1]].add(r[0])            # protocol edge: consuming the request needs the response channel
+            if scales_after_data:         # rejected (V-1): ejecting the data waits for a scale on this route
+                g[r[-1]].update(r)
             rsp_in[s].add(r[-1])
             req_out[s].add(q[0])
     if dma_forwards:                      # rejected (I-1): read data leaves the core again as a write before it can sink
@@ -377,7 +382,7 @@ if __name__ == "__main__":
         print(f"{k:24s} max link utilization {u:5.2f}  at {link}")
     print(f"D2D max {d2d_max_bpc():.0f} B/cycle = {d2d_max_bpc() * CLOCK / 1e12:.2f} TB/s per direction")
     for kw in [dict(), dict(packages=4), dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
-               dict(hbm_forwards=True), dict(dma_forwards=True), dict(link_vn=False)]:
+               dict(hbm_forwards=True), dict(dma_forwards=True), dict(link_vn=False), dict(scales_after_data=True)]:
         g = build_cdg(**kw)
         c = find_cycle(g)
         print(kw or "baseline", "channels", len(g), "edges", sum(map(len, g.values())), "cycle" if c else "acyclic",

@@ -148,17 +148,29 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 - **Address of element (i0, i1, i2, i3)** of a PAGED TD:
   - logical row `r = row + i1` (`DMA_COPY`), or `r = row + index[i]` (`DMA_GATHER` / `DMA_SCATTER`);
   - page `r >> page_shift`, row in the page `q = r & (2^page_shift - 1)`;
-  - address `= frame * 4 KiB + q * s1 + byte + i0 * esize + i2 * s2 + i3 * s3`.
-  - Dims 0, 2 and 3 address inside one row: their extent plus `byte` must stay within `s1` (`RANGE` otherwise).
+  - in-row offset `o = byte + i0 * esize + i2 * s2 + i3 * s3`, address `= frame * 4 KiB + q * s1 + o`.
+  - Dims 0, 2 and 3 address inside one row: `o` must stay within `s1` (`RANGE` otherwise).
+  - Reference: `isa.paged_addr`, tested in `test_isa.py`.
 - **Scale region** (block formats: NVFP4, MXFP4, MXFP8):
   - Each page holds its rows' data first and then their block scales, at `sc_off * 256 B` from the page start, with scale row
     stride `aux0`. So one PTE translates both, and data and scales never sit in different pages.
-  - The scale byte of element e of row q is at `frame * 4 KiB + sc_off * 256 + q * aux0 + floor(e / block) * scale_bytes`, where e
-    counts from the start of the row (`byte` converted to elements, plus `i0`).
-  - A TD with `SCALE_REGION` addresses the scale rows themselves (row stride `aux0` at `sc_off`). The KV write path uses it: the
-    data rows and the scale rows of a new token are two transfers.
-  - Non-paged block-format operands (weights) keep the published separate scale array `[rows, K / block]` at `R[scale_reg]`, row
-    stride `aux0`.
+  - The scale of an element of row q is the byte at `frame * 4 KiB + sc_off * 256 + q * aux0 + floor(o / block_bytes)`, from
+    the whole in-row offset `o` *(review finding V-4)*. The rule before used `byte` and `i0` only, so a TD with n2 > 1 over the
+    groups of a row converted every group with group 0's scales.
+    - `block_bytes` is a block's size in the row: 8 B (NVFP4), 16 B (MXFP4), 32 B (MXFP8). Every scale is one byte (`isa.yaml`
+      `dtype_info`).
+    - `byte`, `s2` and `s3` must be multiples of `block_bytes` (`ILLEGAL_FIELD` otherwise), so every dim-0 run starts on a block.
+  - A TD with `SCALE_REGION` addresses the scale rows themselves: `frame * 4 KiB + sc_off * 256 + q * aux0 + byte + i0 + i2 * s2 +
+    i3 * s3`, inside `aux0`. Its dtype is `UINT8`. The KV write path uses it: the data rows and the scale rows of a new token are
+    two transfers, and `cvt = NONE` never moves scales on its own.
+  - Non-paged block-format operands (weights) keep the published separate scale array `[rows, K / block]`, row stride `aux0`.
+    `R[scale_reg]` points at the scale of the base element's block. The scale of element (i0, i1, i2, i3) is at
+    `R[scale_reg] + i1 * aux0 + floor(o / block_bytes)`, with `o = i0 * esize + i2 * s2 + i3 * s3`.
+- **Writing scale rows *(review finding V-5)*.** A DMA write packet holds contiguous destination bytes. Adjacent runs merge,
+  including consecutive rows of one page, up to a 256 B granule boundary, and `HBM_ALIGN` is checked per packet (microarch.md
+  §2.5). So a `SCALE_REGION` TD with n1 = 32 / `aux0` rows, starting at a row that is a multiple of that count, writes one aligned
+  32 B block. This is the write that the tail-block rewrite (§8) needs. Before, each 4 B or 8 B row was its own write and faulted
+  `HBM_ALIGN`.
 - The runtime (CP) owns the tables. Kernels see them as SPM arrays loaded by DMA.
 - Layout rule:
   - One page holds a run of consecutive tokens for one layer, with token stride `s1`. A row is one KV group, or all KV groups of the
@@ -166,6 +178,38 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
   - Examples: MiniMax NVFP4 KV, 4 groups of 128 per row: 256 B of elements + 32 B of scales per token, 128 rows per page (vLLM's
     block size) = 32 KiB + 4 KiB = 9 frames. DeepSeek NVFP4 global KV (one 512-wide head): 256 B + 32 B per token.
   - Index keys (MiniMax, DeepSeek, Step region summaries) get their own pages, so the index scan streams contiguous bytes.
+
+**Worked example: appending one token** (review findings V-4, V-5; `test_isa.py` `test_paged_append_walk` and
+`test_paged_scale_uses_whole_in_row_offset` compute every address below from packed TD and `paged_ptr` fields).
+
+| | DeepSeek index key (MXFP4) | MiniMax KV, K or V (NVFP4) |
+|---|---|---|
+| Row | 128 elements: 64 B + 4 B of E8M0 scales | 4 KV groups x 128: 256 B + 32 B of E4M3 scales |
+| Page | 1,024 rows (`page_shift` 10): data 64 KiB, scales at `sc_off` 256 (64 KiB), 4 KiB; 17 frames, none wasted | 128 rows (`page_shift` 7): data 32 KiB, scales at `sc_off` 128 (32 KiB), 4 KiB; 9 frames |
+| Data TD (`KD`) | `GLOBAL`, `PAGED`, `UINT8`, n0 = 64, n1 = 1, s1 = 64 | `GLOBAL`, `PAGED`, `UINT8`, n0 = 256, n1 = 1, s1 = 256 |
+| Scale TD (`KS`) | `PAGED` + `SCALE_REGION`, `UINT8`, n0 = 4, n1 = 8, `aux0` 4; page fields as `KD` | `PAGED` + `SCALE_REGION`, `UINT8`, n0 = 32, n1 = 1, `aux0` 32 |
+| Paged pointers | data `R21 = {0x7F, t, 0}`; scales `R23 = {0x7F, t & ~7, 0}`, the block's first row | `R21 = R23 = {0x7F, t, 0}` |
+| SPM sources | `VQUANT` writes the 64 B of elements; the 4 B of scales go into the SPM copy of the current block at `(t mod 8) * 4` | `VQUANT` writes the 256 B of elements and the 32 B of scales |
+| HBM writes (q = t mod rows per page) | one 64 B packet at `frame * 4 KiB + q * 64`; one 32 B packet at `+ 64 KiB + (q & ~7) * 4` (8 rows merged) | one 256 B packet at `frame * 4 KiB + q * 256`; one 32 B packet at `+ 32 KiB + q * 32` |
+
+```
+    DMA_COPY dq=1 src=R20 td=KD_SPM dst=R21 td=KD cvt=NONE wop=WRITE pt=R24  ssem=S9 sinc=1   # the data row
+    DMA_COPY dq=1 src=R22 td=KS_SPM dst=R23 td=KS cvt=NONE wop=WRITE pt=R24  ssem=S9 sinc=1   # the scale block / scale row
+```
+- `R24` is the SPM offset of the layer's page table. `rsem` is S0, because the destination is HBM (d2d_c2c.md L-6). `scale_reg`,
+  `aux_reg` and `ts_reg` are R0, because `cvt = NONE` moves no scales.
+- Completion: S9 reaches its base + 2 once both writes are acknowledged. A reader on another core waits for a `SIGNAL` sent after
+  them (L-6).
+- The DeepSeek block's later rows are written as their tokens arrive (tail-block rewrite, §8). Each rewrite merges with any queued
+  write to the same granule (hbm.md H-2). MiniMax's own NVFP4 index key (64 B + 8 B per token) is the same case with 4 rows per
+  block.
+- Reading back:
+  - The DeepSeek index scan reads TD `MXFP4`, `PAGED`, n0 = 128, `sc_off` 256, `aux0` 4. Element i0 of row q has its scale at
+    `frame * 4 KiB + 64 KiB + q * 4 + floor(i0 / 32)`.
+  - The MiniMax KV gather (`DMA_GATHER`, `cvt NVFP4_BF16`, `ts_reg` = the layer's FP32 tensor scale) reads all 4 groups with TD
+    `NVFP4`, n0 = 128, n2 = 4, s2 = 64 B. Group g, element i0 has its scale at `+ 32 KiB + q * 32 + 8 g + floor(i0 / 16)`; before
+    V-4, every group got group 0's 8 scales.
+  - Both reads stage the scales before the data (microarch.md §2.5, review finding V-1).
 
 ## 7. Layouts the ISA assumes
 
@@ -193,7 +237,7 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 - HBM writes must be 32 B aligned in address and size, otherwise `HBM_ALIGN` (no write masks; hbm.md H-2). The scale rows of a page
   (§6) can be smaller than 32 B per token (8 B for one 128-wide NVFP4 KV group, 4 B for an MXFP4 index key). They are not padded:
   the compiler rewrites the aligned 32 B block that holds the new token's scales from a copy in SPM (tail-block rewrite, hbm.md H-2,
-  review finding I-14).
+  review finding I-14). That block is one 32 B write packet (§6, review finding V-5).
 - Fault codes: isa.yaml `fault_cause`.
 
 ## 9. Ordering

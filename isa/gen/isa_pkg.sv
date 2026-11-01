@@ -507,6 +507,7 @@ package isa_pkg;
   localparam logic [5:0] CSR_PERF_CNT0 = 6'd17;
   localparam logic [5:0] CSR_PERF_CNT1 = 6'd18;
   localparam logic [5:0] CSR_SEM_BASE_GPA = 6'd32;
+  localparam logic [5:0] CSR_DMA_STAGE = 6'd33;
   localparam logic [3:0] FAULT_CAUSE_NONE = 4'd0;
   localparam logic [3:0] FAULT_CAUSE_ILLEGAL_OP = 4'd1;
   localparam logic [3:0] FAULT_CAUSE_ILLEGAL_FIELD = 4'd2;

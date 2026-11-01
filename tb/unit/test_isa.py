@@ -263,3 +263,84 @@ def test_spm_bank_strides():
     for k in range(11, 18):
         assert pair_ok((1 << k) + (1024 if k == 14 else 512))
     assert all(len({I.spm_bank(b + o) for o in range(0, 2048, 64)}) == 32 for b in range(0, 1 << 22, 2048 * 7))
+
+
+def _td(isa, **f):
+    """Pack a TD from symbolic dtype / space / flag names and return its unpacked fields (what the DMA reads from DTAB)."""
+    en = isa["enums"]
+    flags = sum(1 << en["td_flags"][x] for x in f.pop("flags", ()))
+    w = I.pack(isa, "td", dtype=en["dtype"][f.pop("dtype")], space=en["space"][f.pop("space")], flags=flags, **f)
+    return I.unpack(isa, "td", w)
+
+
+def _append(isa, td, ptr, frames, rows):
+    """Write packets of a paged append: every byte of rows ptr.row .. + rows - 1, in TD order (dim 0 inside dim 1)."""
+    runs = [(I.paged_addr(isa, td, ptr, frames, r, i0)[0], 1) for r in range(rows) for i0 in range(td["n0"])]
+    return I.write_packets(runs)
+
+
+# Worked examples of memmap.md section 6 (review findings V-4, V-5): one token appended per layer and step.
+APPENDS = {
+    # DeepSeek MXFP4 index key: 128 elements = 64 B + 4 B of E8M0 scales; 1024 rows per page = 64 KiB + 4 KiB = 17 frames.
+    "deepseek_index_key": dict(fmt="MXFP4", n=128, s1=64, aux0=4, page_shift=10, sc_off=256, frames=17),
+    # MiniMax NVFP4 KV: 4 groups x 128 = 256 B + 32 B of E4M3 scales; 128 rows per page = 32 KiB + 4 KiB = 9 frames.
+    "minimax_kv": dict(fmt="NVFP4", n=512, s1=256, aux0=32, page_shift=7, sc_off=128, frames=9),
+    # MiniMax NVFP4 index key: 128 elements = 64 B + 8 B; 1024 rows per page = 64 KiB + 8 KiB = 18 frames.
+    "minimax_index_key": dict(fmt="NVFP4", n=128, s1=64, aux0=8, page_shift=10, sc_off=256, frames=18),
+}
+
+
+@pytest.mark.parametrize("name", sorted(APPENDS))
+def test_paged_append_walk(isa, name):
+    """V-5: the data row and the 32 B-aligned block of scale rows of a new token are each written in 32 B-aligned packets
+    (no HBM_ALIGN), through the TD, paged_ptr and T_DMA fields; without merging adjacent rows the scale block would fault."""
+    a = APPENDS[name]
+    rows = 1 << a["page_shift"]
+    row_b = a["n"] * isa["dtype_info"][a["fmt"]]["bits"] // 8
+    assert row_b == a["s1"] and rows * a["s1"] <= a["sc_off"] * 256                      # data rows, then the scale region
+    assert a["sc_off"] * 256 + rows * a["aux0"] <= a["frames"] * 4096
+    assert a["aux0"] == a["n"] // isa["dtype_info"][a["fmt"]]["block"]
+    common = dict(space="GLOBAL", s1=a["s1"], aux0=a["aux0"], page_shift=a["page_shift"], sc_off=a["sc_off"])
+    td_data = _td(isa, dtype="UINT8", flags=("PAGED",), n0=row_b, n1=1, **common)          # raw bytes: cvt NONE moves no scales
+    per_blk = 32 // a["aux0"]                                                               # scale rows per 32 B block
+    td_sc = _td(isa, dtype="UINT8", flags=("PAGED", "SCALE_REGION"), n0=a["aux0"], n1=per_blk, **common)
+    t = 5003 + rows                                                                         # token position (logical row)
+    frames = {t >> a["page_shift"]: 0x123450}
+    ptr = I.unpack(isa, "paged_ptr", I.pack(isa, "paged_ptr", node=0x7F, row=t, byte=0))
+    ptr_blk = I.unpack(isa, "paged_ptr", I.pack(isa, "paged_ptr", node=0x7F, row=t - t % per_blk, byte=0))
+    data = _append(isa, td_data, ptr, frames, 1)
+    sc = _append(isa, td_sc, ptr_blk, frames, per_blk)
+    q = t & (rows - 1)
+    page = 0x123450 * 4096
+    assert data == [(page + q * a["s1"], row_b)]
+    assert sc == [(page + a["sc_off"] * 256 + (q - q % per_blk) * a["aux0"], 32)]
+    assert all(x % 32 == 0 and n % 32 == 0 for x, n in data + sc)                           # HBM_ALIGN holds
+    if per_blk > 1:                                                                         # the old rule: one packet per row
+        assert all(n < 32 for _, n in [(I.paged_addr(isa, td_sc, ptr_blk, frames, r)[0], a["aux0"]) for r in range(per_blk)])
+    # The two T_DMA instructions (SPM -> HBM, cvt NONE, rsem S0 because the destination is HBM, completion on ssem).
+    for dst_td, src_reg, dst_reg in ((7, 20, 21), (8, 22, 23)):
+        w = I.encode(isa, "DMA_COPY", dq=1, src_reg=src_reg, src_td=dst_td + 16, dst_reg=dst_reg, dst_td=dst_td,
+                     cvt="NONE", wop="WRITE", pt_reg=24, ssem=9, sinc=1)
+        name_, f = I.decode(isa, w)
+        assert name_ == "DMA_COPY" and f["pt_reg"] == 24 and f["rsem"] == 0 and f["scale_reg"] == f["ts_reg"] == 0
+
+
+def test_paged_scale_uses_whole_in_row_offset(isa):
+    """V-4: reading the 4 groups of a MiniMax NVFP4 KV row with n0 = 128, n2 = 4, s2 = 64 B gives group g the scales at
+    8 g .. 8 g + 7 of the row's 32 B scale row; the formula before the fix (byte + i0 only) gave every group group 0's."""
+    td = _td(isa, dtype="NVFP4", space="GLOBAL", flags=("PAGED",), n0=128, n1=1, n2=4, s1=256, s2=64, aux0=32,
+             page_shift=7, sc_off=128)
+    ptr = I.unpack(isa, "paged_ptr", I.pack(isa, "paged_ptr", node=0x7F, row=130, byte=0))
+    frames = {1: 0x400}
+    sc0 = 0x400 * 4096 + 128 * 256 + 2 * 32
+    for g in range(4):
+        for i0 in (0, 15, 16, 127):
+            d, s = I.paged_addr(isa, td, ptr, frames, 0, i0, g)
+            assert d == 0x400 * 4096 + 2 * 256 + g * 64 + i0 // 2
+            assert s == sc0 + 8 * g + i0 // 16
+            assert (s == sc0 + i0 // 16) == (g == 0)                                         # the old formula's address
+    bad = dict(td, s2=60)                                                                    # a group not on a block boundary
+    with pytest.raises(I.IsaError):
+        I.paged_addr(isa, bad, ptr, frames, 0, 0, 1)
+    with pytest.raises(I.IsaError):                                                         # dims leave the 256 B row
+        I.paged_addr(isa, dict(td, n2=5), ptr, frames, 0, 0, 4)

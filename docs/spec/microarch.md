@@ -120,7 +120,7 @@ isa.md §5) a cheap multiply at the ACC input.
 | MXU stationary load | 512 |
 | MXU scales (`scale_rd`: rowscale, colscale) | 64 |
 | VPU (two BF16 sources at 256 elements per cycle) | 1,024 |
-| DMA out | 256 |
+| DMA out (also staged scales and raw units for the converter) | 256 |
 | NI target (remote reads, and the read half of write-add) | 128 |
 | **Sum** | **2,240** |
 
@@ -145,7 +145,13 @@ isa.md §5) a cheap multiply at the ACC input.
   - Ties go to the lower index, so results are bit-exact against the golden model.
 
 ### 2.5 DMA
-- Four queues share one engine.
+- Four queues share one engine, which serves them independently *(review finding V-3)*:
+  - Each DQ has its own sequencer: the instruction or `DMA_LIST` entry at its head, the semaphore wait of that head, and the
+    address-generator state of its started transfers.
+  - Shared resources are the tag table, the staging ring (below), the SPM ports and NI injection. They are taken per read or
+    write packet, round-robin over the DQs that have a packet ready, and only after the head's wait is satisfied.
+  - So a DQ whose head waits on a semaphore holds nothing another DQ needs. A started transfer holds its tags and ring slots
+    only until its responses sink, which never waits on another DQ. d2d_c2c.md L-7 issue rule 2 relies on this.
 - It keeps up to 512 read granules (256 B) in flight, 128 KiB. That is about 2x the core's HBM share (102 B/cycle) times a typical
   500-cycle loaded round trip.
 - Read requests cover up to 2 KiB (one HBM leaf or one SRAM target) and return 256 B response packets. Each response carries a tag
@@ -153,21 +159,47 @@ isa.md §5) a cheap multiply at the ACC input.
   SPM space is reserved when the request is issued, which is what keeps the response network deadlock-free (noc.md §4).
 - **Read data always sinks in local SPM** (or DTAB / IMEM). A DMA never forwards read data as a write, so one of its two operands is
   local (`TD_SPACE` otherwise; review finding I-1). Global-to-global moves are two transfers through an SPM buffer.
-- **Inbound rate *(review finding I-3)*:** the converter produces 256 elements per cycle and the SPM write port takes 512 B/cycle,
-  so the exact NVFP4 → BF16 path (3.56 bytes out per byte in) carries 1.65x a core's HBM share at 0.85 (numerics.md D1). The
-  network can deliver up to 256 B/cycle of compressed data, more than the converter takes, so `ni_rsp` has a ready signal and a
-  4-flit inbound buffer.
-  - Ready depends only on the converter and the SPM write port, which drain at a fixed rate without waiting for the network. A
-    response is therefore still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.
+- **Inbound rate *(review findings I-3, V-1)*:** the converter produces 256 elements per cycle and the SPM write port takes
+  512 B/cycle, shared by the converted data and the block scales staged before it. The exact NVFP4 → BF16 path (2 B of data and
+  1/16 B of staged scale written per element) therefore carries 1.60x a core's HBM share at 0.85 (numerics.md D1). The network
+  can deliver up to 256 B/cycle of compressed data, more than the converter takes, so `ni_rsp` has a ready signal and a 4-flit
+  inbound buffer.
+- **Every response converts from local state only *(review finding V-1)*.** A conversion needs the element bytes, their block
+  scales and, for the fold, the whole 256-element K tile of the row (numerics.md N-2). The scales are separate responses, so if the
+  converter waited for them a data granule at the head of `ni_rsp` would wait for a scale queued behind it in the same RSP channel.
+  So the DMA never lets a response wait for another one:
+  - **Scales first.** Out-of-line block scales (the `scale_reg` array, or the page's scale region) are read into the staging ring
+    before the data that uses them. A data read is issued only after the scales of all its granules are in the ring. Scale
+    responses are plain SPM writes. The DMA reads scales a round trip ahead, so the rate is unchanged; the first data of a
+    transfer starts one round trip later.
+  - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a staging slot when its
+    reads are issued: an inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row), or a fold tile that is not inside one 256 B
+    granule (a 4-bit weight row whose length is not a multiple of 128 B). Its responses are written there raw, and the converter
+    takes the unit from SPM once it is complete. These units are rare, and their raw bytes add to the DMA's SPM write and read
+    traffic.
+  - **Staging ring:** an SPM region given by CSR `DMA_STAGE` (base and size), reserved by the runtime and shared by the four DQs.
+    Space is allocated when a read is issued and freed when its data has been converted. 16 KiB holds 1,000 cycles of scales at the
+    converter's NVFP4 rate (16 B/cycle), two loaded round trips. A smaller ring only lowers the rate. Size 0 makes block-format
+    conversion fault (`ILLEGAL_FIELD`).
+  - Ready therefore depends only on the converter and the local SPM ports, which drain at a fixed rate without waiting for the
+    network. A response is still guaranteed to sink (noc.md §4 rule 2); it may wait a bounded time in its RSP virtual channel.
+  - Not taken: choosing the fold's power of two from the block scales alone. That would make every granule convertible on its
+    own and remove the fold buffer, but it changes the fold's numerics (numerics.md N-2), so it is left as a Phase 3 option.
 - Addressing:
   - 4-D strided addressing from tile descriptors.
   - Paged mode, with a page table in SPM (32-bit PTE, 4 KiB frames).
   - Row gather and scatter with arbitrary row size (Engram 264 B rows) and int32/int64 index lists.
   - Descriptor lists (`DMA_LIST`).
 - Conversion on the inbound path: MXFP4/NVFP4/MXFP8 to E4M3 plus FP32 column scales, or to BF16 exactly; E4M3/E5M2 to BF16;
-  BF16 to and from FP32. Outbound data is written as is. Scales come from the operand's scale array (`scale_reg`) or, for paged
-  KV, from the scale region of the same page; the NVFP4 tensor scale from `ts_reg` (isa.md §5, memmap.md §6). Quantization (KV, activations) is a VPU instruction (`VQUANT`), because it needs
-  row maxima.
+  BF16 to and from FP32. Outbound data is written as is.
+  - Scales come from the operand's scale array (`scale_reg`) or, for paged KV, from the scale region of the same page. An
+    element's scale is found from its row and its whole in-row offset (dims 0, 2 and 3; review finding V-4). The NVFP4 tensor
+    scale comes from `ts_reg` (isa.md §5, memmap.md §6).
+  - `cvt = NONE` moves only the bytes the TDs address, never the scales.
+  - Quantization (KV, activations) is a VPU instruction (`VQUANT`), because it needs row maxima.
+- **Write packets *(review finding V-5)*:** a packet holds contiguous destination bytes. Adjacent runs are merged, including
+  consecutive paged rows of one page, up to a 256 B granule boundary. `HBM_ALIGN` is checked per packet. So eight 4 B scale rows
+  that form an aligned 32 B block are one 32 B write (memmap.md §6 worked example).
 - Write operations at the destination: plain write, FP32/BF16 add, FP32 max. SRAM targets have the ALU in their network interface; HBM
   takes plain writes only.
 
@@ -250,11 +282,11 @@ Conventions:
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| q_pop[4] | in | instruction + operands | valid/ready | DQ0-DQ3 |
+| q_pop[4] | in | instruction + operands | valid/ready | DQ0-DQ3; one sequencer per DQ, so a head waiting on a semaphore holds no shared resource (§2.5, review finding V-3) |
 | dtab_rd | out/in | idx 8, data 256 | 1-cycle | tile descriptors |
-| spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales |
+| spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales and raw units in the staging ring (CSR `DMA_STAGE`) |
 | ni_req | out | flit_t | valid/ready | read requests, write packets |
-| ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and `spm_wr` (§2.5) | read data, acks |
+| ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and the SPM ports, because scales are staged before their data (§2.5, review finding V-1) | read data, scales, acks |
 | sem_inc | out | 6 + 4 | pulse | completion signals |
 
 **MXU (`core/mxu`)**
@@ -383,7 +415,7 @@ A leaf never forwards between its mesh ports (noc.md §1). Arrivals from a link 
 |---|---|---|
 | HBM to cores (die) | 3,277 B/cycle at peak | 16 HBM leaves x 2 planes x 128 = 4,096 B/cycle (80% at peak); mesh links at most 80% with stack-affine placement, 85% fully interleaved (noc.md §5) |
 | HBM share to one core | 102 B/cycle | 256 B/cycle per network interface (2 planes) |
-| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85) | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle, stationary load 512 B/cycle: 256 elements/cycle in BF16, more in FP8 (numerics.md D1) |
+| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85) | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle shared with the staged scales, stationary load 512 B/cycle: 248 elements/cycle for NVFP4 → BF16, 256 in FP8 (numerics.md D1) |
 | D2D | collectives; the Phase 1 roofline is insensitive to D2D bandwidth above 1 TB/s | 1.4 TB/s per direction payload |
 | C2C | 0.8 TB/s per die (8 ports) | 4 leaves x 256 B/cycle = 1.5 TB/s (55% at peak) |
 | Prefill MXU feed | A 256 B/cycle + W 16 KiB per 256 A rows | SPM 2 KiB/cycle read |

@@ -317,10 +317,12 @@ def fmt_e(x):
 
 # DMA weight path widths (microarch.md sections 2.2, 2.5; review finding I-3)
 DMA_CVT_ELEMS = 256        # converter output, elements per cycle
-DMA_SPM_WR = 512           # DMA SPM write port, B/cycle
+DMA_SPM_WR = 512           # DMA SPM write port, B/cycle: converted data plus the block scales staged before it (review V-1)
 MXU_WLOAD = 512            # MXU stationary-load port, B/cycle
-FEED_PATHS = [("MXFP4 -> E4M3 (fold)", 0.53125, 1), ("NVFP4 -> E4M3 (fold)", 0.5625, 1),
-              ("NVFP4 -> BF16 (exact, D1)", 0.5625, 2), ("MXFP8 -> E4M3 (fold)", 1.03125, 1), ("FP8, no conversion", 1.0, 1)]
+# (path, source B/element, destination B/element, staged scale B/element)
+FEED_PATHS = [("MXFP4 -> E4M3 (fold)", 0.53125, 1, 1 / 32), ("NVFP4 -> E4M3 (fold)", 0.5625, 1, 1 / 16),
+              ("NVFP4 -> BF16 (exact, D1)", 0.5625, 2, 1 / 16), ("MXFP8 -> E4M3 (fold)", 1.03125, 1, 1 / 32),
+              ("FP8, no conversion", 1.0, 1, 0)]
 
 
 def main():
@@ -351,13 +353,14 @@ def main():
     L += ["", f"Decode feed margin: a core's HBM share is {per_core:.0f} B/cycle at {hw['hbm_eff']:.0%} "
           f"({per_core / hw['hbm_eff']:.0f} at peak). Every stage of the weight path must carry "
           f"that many elements per cycle: the DMA converter ({DMA_CVT_ELEMS} elements/cycle), the DMA SPM write port "
-          f"({DMA_SPM_WR} B/cycle) and the MXU stationary-load port ({MXU_WLOAD} B/cycle). Margin = narrowest stage / need "
-          "(microarch.md section 2.5, review finding I-3).", "",
+          f"({DMA_SPM_WR} B/cycle, which also writes the block scales into the staging ring before the data that uses them, "
+          f"review finding V-1) and the MXU stationary-load port ({MXU_WLOAD} B/cycle). Margin = narrowest stage / need "
+          "(microarch.md section 2.5, review findings I-3, V-1).", "",
           "| path | source B/element | need (elements/cycle) | converter | SPM write | stationary load | margin |",
           "|---|---|---|---|---|---|---|"]
-    for name, src_b, dst_b in FEED_PATHS:
+    for name, src_b, dst_b, sc_b in FEED_PATHS:
         need = per_core / src_b
-        cap = {"wr": DMA_SPM_WR / dst_b, "ld": MXU_WLOAD / dst_b}
+        cap = {"wr": DMA_SPM_WR / (dst_b + sc_b), "ld": MXU_WLOAD / dst_b}
         if "no conversion" not in name:
             cap["cvt"] = DMA_CVT_ELEMS
         L.append(f"| {name} | {src_b:g} | {need:.0f} | {cap['cvt'] if 'cvt' in cap else '-'} | {cap['wr']:.0f} | {cap['ld']:.0f} | "

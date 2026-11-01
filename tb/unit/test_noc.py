@@ -37,9 +37,17 @@ def test_baseline_deadlock_free(packages):
 @pytest.mark.parametrize("kw", [dict(classes=False), dict(split_vn=False), dict(allow_cross_rail=True, packages=4),
                                 dict(hbm_forwards=True),
                                 dict(dma_forwards=True),           # review I-1: GLOBAL -> GLOBAL copy without a local sink
-                                dict(link_vn=False)])              # review I-7: one link queue for REQ and RSP
+                                dict(link_vn=False),               # review I-7: one link queue for REQ and RSP
+                                dict(scales_after_data=True)])     # review V-1: data waits for its scale response
 def test_rejected_designs_deadlock(kw):
     assert N.find_cycle(N.build_cdg(**kw)) is not None
+
+
+def test_scale_wait_cycle_is_on_the_response_route():
+    """Review V-1: with the pre-fix converter rule the cycle runs through RSP channels into one core (the data waits at the
+    last channel for a scale behind it). Scales staged before the data remove those edges: the baseline is acyclic."""
+    c = N.find_cycle(N.build_cdg(scales_after_data=True))
+    assert c and all(ch[3] == "RSP" for ch in c)
 
 
 def _bursts(rng, n_src, bursts_per_src, spread):

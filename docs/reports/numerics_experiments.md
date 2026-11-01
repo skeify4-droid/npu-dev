@@ -20,14 +20,14 @@ Errors are relative Frobenius norms. `fold W`: folded vs exact dequantized weigh
 | MXFP4 | channel-scaled | 0.00% | 1.5e-01 | 0.0e+00 | 0.0e+00 | 2.5e-02 | 2.5e-02 | - | - |
 | MXFP8 | channel-scaled | 0.06% | 3.5e-02 | 8.2e-07 | 8.1e-07 | 2.5e-02 | 2.5e-02 | - | - |
 
-Decode feed margin: a core's HBM share is 87 B/cycle at 85% (102 at peak). Every stage of the weight path must carry that many elements per cycle: the DMA converter (256 elements/cycle), the DMA SPM write port (512 B/cycle) and the MXU stationary-load port (512 B/cycle). Margin = narrowest stage / need (microarch.md section 2.5, review finding I-3).
+Decode feed margin: a core's HBM share is 87 B/cycle at 85% (102 at peak). Every stage of the weight path must carry that many elements per cycle: the DMA converter (256 elements/cycle), the DMA SPM write port (512 B/cycle, which also writes the block scales into the staging ring before the data that uses them, review finding V-1) and the MXU stationary-load port (512 B/cycle). Margin = narrowest stage / need (microarch.md section 2.5, review findings I-3, V-1).
 
 | path | source B/element | need (elements/cycle) | converter | SPM write | stationary load | margin |
 |---|---|---|---|---|---|---|
-| MXFP4 -> E4M3 (fold) | 0.53125 | 164 | 256 | 512 | 512 | 1.56x |
-| NVFP4 -> E4M3 (fold) | 0.5625 | 155 | 256 | 512 | 512 | 1.65x |
-| NVFP4 -> BF16 (exact, D1) | 0.5625 | 155 | 256 | 256 | 256 | 1.65x |
-| MXFP8 -> E4M3 (fold) | 1.03125 | 84 | 256 | 512 | 512 | 3.03x |
+| MXFP4 -> E4M3 (fold) | 0.53125 | 164 | 256 | 496 | 512 | 1.56x |
+| NVFP4 -> E4M3 (fold) | 0.5625 | 155 | 256 | 482 | 512 | 1.65x |
+| NVFP4 -> BF16 (exact, D1) | 0.5625 | 155 | 256 | 248 | 256 | 1.60x |
+| MXFP8 -> E4M3 (fold) | 1.03125 | 84 | 256 | 496 | 512 | 3.03x |
 | FP8, no conversion | 1 | 87 | - | 512 | 512 | 5.88x |
 
 Before the I-3 fix the DMA SPM write port was 256 B/cycle: NVFP4 -> BF16 then carried 0.83x of the need. Decode stays HBM-bound on every path above.

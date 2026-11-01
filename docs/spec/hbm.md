@@ -88,7 +88,8 @@ The unit of work inside the controller is a **granule**: 256 B in one row of one
     and the scan is up to 12% of a step, arch.md §4). The rewrite costs 28 B of extra write per token per step, and no read bytes.
   - It is safe because a write is acked once queued and merges with any queued write to the same granule (write after write,
     below), and the step's readers wait on the write's ack or semaphore anyway.
-- The DMA splits writes at 256 B granule boundaries.
+- The DMA splits writes at 256 B granule boundaries and merges adjacent runs into one packet, including consecutive rows of
+  one page (review finding V-5). So a tail block of 4 or 8 scale rows is one 32 B write (memmap.md §6 worked example).
 
 **Ordering and hazards inside a PC:**
 - **Read after write:** a read descriptor is checked against the write queue (16-entry granule CAM). On a match, the read waits, and

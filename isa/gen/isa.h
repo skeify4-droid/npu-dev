@@ -400,6 +400,7 @@ enum class Csr : uint16_t {
   PERF_CNT0 = 17,
   PERF_CNT1 = 18,
   SEM_BASE_GPA = 32,
+  DMA_STAGE = 33,
 };
 enum class FaultCause : uint16_t {
   NONE = 0,

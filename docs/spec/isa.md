@@ -66,6 +66,8 @@ Rules:
   - DMA instructions in the same queue may overlap. A dependency between two transfers needs a semaphore or a `SIGNAL` between them.
 - **Different queues:** only semaphores order them. The hardware does not check SPM address overlaps between queues; the golden model
   does (a race checker in simulation).
+  - The four DQs progress independently: a DQ whose head instruction or list entry waits on a semaphore holds nothing the others
+    need (microarch.md §2.5, review finding V-3).
 - **Front-end interaction:**
   - `SWAIT` stalls the front end (needed before `LD` reads data produced by an engine, e.g. MoE token counts).
   - `FENCE` waits for selected queues to drain.
@@ -134,7 +136,7 @@ Rules:
   | `src_reg`, `dst_reg` | base addresses; a PAGED operand's base is a paged pointer (`isa.yaml` `paged_ptr`: node, first row, byte in the row) |
   | `idx_reg` | SPM offset of the index list (gather, scatter) |
   | `n_reg` | override of the outermost count (0: from the TD) |
-  | `scale_reg` | address of the scale array of a non-paged block-format operand (row stride TD `aux0`) |
+  | `scale_reg` | address of the scale of the base element's block, in the scale array of a non-paged block-format operand (row stride TD `aux0`; memmap.md §6) |
   | `aux_reg` | SPM offset where the FP8-target conversions and `NVFP4_BF16` write the FP32 column scales (R0: none) |
   | `pt_reg` | SPM offset of the page table of the PAGED operand (at most one operand is PAGED) |
   | `ts_reg` | NVFP4 FP32 tensor scale in bits [31:0] (R0: 1.0) |
@@ -161,8 +163,15 @@ Rules:
   - Converting to BF16 is exact and needs no column scales. The NVFP4 FP32 tensor scale `R[ts_reg]` still goes into `aux_reg` as a
     column scale. For the fold it multiplies `2^c` (numerics.md N-2 step 4).
   - Scales of a paged operand live in the same page as its rows (memmap.md §6), so one page-table entry translates both.
-- **Width of the inbound path** (review finding I-3): the converter produces 256 elements per cycle and the DMA writes SPM at
-  512 B/cycle, so the exact NVFP4 → BF16 path carries 1.65x a core's HBM share (numerics.md D1).
+- **Width of the inbound path** (review findings I-3, V-1): the converter produces 256 elements per cycle and the DMA writes SPM at
+  512 B/cycle, shared with the block scales it stages before the data, so the exact NVFP4 → BF16 path carries 1.60x a core's HBM
+  share (numerics.md D1).
+- **Scales before data** (review finding V-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the data
+  that uses them, and a conversion unit that spans several responses is staged raw there. So a read response never waits for
+  another one (noc.md §4 rule 2, microarch.md §2.5).
+- **Scale location and write packets** (review findings V-4, V-5): an element's block scale is found from its row and its whole
+  in-row offset (dims 0, 2, 3). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
+  32 B block of 4 B or 8 B scale rows is one aligned write. memmap.md §6 walks two KV appends field by field.
 
 **MXU (`MQ`):**
 - `MXU_MM` computes `ACC (+)= A x W` for any M (≤ ACC rows / N tiles), K and N. Inside the instruction the MXU tiles K (256 FP8 or

@@ -275,9 +275,10 @@ Measured (MiniMax expert shape, three weight distributions):
 
 Decision D1:
 - **Decode and other memory-bound GEMMs use the exact path** (`cvt NVFP4_BF16`). Decode is HBM-bound, and every stage of the weight
-  path keeps a 1.65x margin over a core's HBM share at 0.85 with NVFP4 expanded to BF16 (1.41x at peak share): the DMA converter
-  (256 elements/cycle), the DMA SPM write port (512 B/cycle) and the stationary-load port (512 B/cycle) all carry 256 BF16
-  elements per cycle (numerics_experiments.md E1).
+  path keeps a 1.60x margin over a core's HBM share at 0.85 with NVFP4 expanded to BF16 (1.36x at peak share): the DMA converter
+  (256 elements/cycle) and the stationary-load port (512 B/cycle) carry 256 BF16 elements per cycle, and the DMA SPM write port
+  (512 B/cycle) carries 248, because it also writes the block scales into the staging ring before the data (review finding V-1;
+  numerics_experiments.md E1).
   - Review finding I-3: the margin was first checked at the stationary-load port only. The DMA SPM write port was then 256 B/cycle,
     which held the exact path to 0.83x of the HBM share. It is now 512 B/cycle (microarch.md §2.5).
   - The fold paths are also held to 256 elements per cycle by the converter: 1.56x (MXFP4) and 1.65x (NVFP4) over the share.

@@ -208,7 +208,9 @@ That is 4 latency steps for any g > 2. The roofline's ring needs 2(g - 1) steps,
      entries) blocks the in-order front end. So the compiler:
      1. issues every put that depends only on local data **before** any instruction that waits on a remote semaphore;
      2. keeps remote waits (chunk forwards, credit waits) in a queue that holds nothing other cores depend on, and puts each group of
-        forwards in one `DMA_LIST` with per-entry waits, so the front end never fills a queue behind them;
+        forwards in one `DMA_LIST` with per-entry waits, so the front end never fills a queue behind them. This relies on the DMA
+        serving its four queues independently: a waiting head holds no tag, staging slot or port (microarch.md §2.5, review
+        finding V-3);
      3. never puts a credit wait ahead of the same core's forwards in one queue.
      Without rule 1, two forwarders with more than 16 chunks each block on full queues while each one's forwards wait for the
      other's puts: a deadlock with no network resource involved, which `noc.py` cannot see. The golden model and the Phase 7

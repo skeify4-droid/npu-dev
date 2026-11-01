@@ -202,6 +202,12 @@ def validate(isa):
                 raise IsaError(f"memmap corectl: {n0} overlaps {n1}")
         if cc and cc[-1][1] > mm["regions"]["CORECTL"]["size"]:
             raise IsaError("memmap corectl: beyond the CORECTL block")
+        di = isa.get("dtype_info", {})
+        if set(di) != set(isa["enums"]["dtype"]):
+            raise IsaError("dtype_info must list every dtype")
+        for k, d in di.items():
+            if "block" in d and (d.get("scale") not in di or di[d["scale"]]["bits"] != 8):
+                raise IsaError(f"dtype_info {k}: a block format needs a 1-byte scale dtype")
         blocks = [r["block"] for r in mm.get("diectl", {}).values()]
         if len(set(blocks)) != len(blocks) or any(not 0 <= x < mm["regions"]["DIECTL"]["count"] for x in blocks):
             raise IsaError("memmap diectl: block indices must be unique and inside DIECTL")
@@ -312,6 +318,50 @@ def sem_ready(value, target, bits=32):
     (int32)(value - target) >= 0. Correct across wrap-around while |value - target| < 2^31."""
     d = (value - target) & ((1 << bits) - 1)
     return d < 1 << (bits - 1)
+
+
+def paged_addr(isa, td, ptr, frames, r_off, i0=0, i2=0, i3=0):
+    """Reference for memmap.md section 6: (byte address, scale byte address or None) of element (i0, r_off, i2, i3) of a
+    PAGED TD. td and ptr are unpacked TD and paged_ptr fields; frames maps a page number to its PTE frame; r_off is i1
+    (DMA_COPY) or index[i] (gather / scatter). A SCALE_REGION TD addresses the scale rows themselves (no scale address).
+    The scale is located from the whole in-row offset (dims 0, 2, 3 and the pointer's byte; review finding V-4)."""
+    dt = {v: k for k, v in isa["enums"]["dtype"].items()}[td["dtype"]]
+    info = isa["dtype_info"][dt]
+    region = td["flags"] >> isa["enums"]["td_flags"]["SCALE_REGION"] & 1
+    r = ptr["row"] + r_off
+    page, q = r >> td["page_shift"], r & ((1 << td["page_shift"]) - 1)
+    start = frames[page] * 4096
+    sc_base = start + td["sc_off"] * 256 + q * td["aux0"]
+    o_bits = 8 * (ptr["byte"] + i2 * td["s2"] + i3 * td["s3"]) + i0 * info["bits"]
+    row_len = td["aux0"] if region else td["s1"]
+    if o_bits + info["bits"] > 8 * row_len:
+        raise IsaError("RANGE: dims 0, 2, 3 leave the row")
+    if region:
+        return sc_base + o_bits // 8, None
+    if "block" not in info:
+        return start + q * td["s1"] + o_bits // 8, None
+    blk_bits = info["block"] * info["bits"]
+    if (8 * (ptr["byte"] + i2 * td["s2"] + i3 * td["s3"])) % blk_bits:
+        raise IsaError("ILLEGAL_FIELD: byte, s2, s3 must be multiples of the block's bytes")
+    return start + q * td["s1"] + o_bits // 8, sc_base + o_bits // blk_bits
+
+
+def write_packets(runs, granule=256):
+    """Reference for the DMA's write packets (isa.yaml DMA_COPY, review finding V-5): runs are (address, bytes) in the
+    destination TD's order; adjacent runs merge, and packets never cross a `granule` boundary. Returns (address, bytes)."""
+    merged = []
+    for a, n in runs:
+        if merged and merged[-1][0] + merged[-1][1] == a:
+            merged[-1][1] += n
+        else:
+            merged.append([a, n])
+    out = []
+    for a, n in merged:
+        while n:
+            k = min(n, granule - a % granule)
+            out.append((a, k))
+            a, n = a + k, n - k
+    return out
 
 
 def queue_of(isa, name, fields):

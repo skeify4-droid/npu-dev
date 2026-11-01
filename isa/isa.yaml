@@ -181,6 +181,7 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
+    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1): [21:0] base, [53:32] bytes (both 64 B aligned); 0 bytes: block-format conversion faults ILLEGAL_FIELD
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
@@ -211,6 +212,25 @@ enums:
     SEM: 4
     MC_WR: 5
     ERR: 6
+
+# Element size of each dtype, and for block formats the elements per block scale and the scale's dtype (1 byte).
+# Used by the scale address rules of memmap.md section 6 and by the reference functions in isa/isa.py.
+dtype_info:
+  FP32: {bits: 32}
+  BF16: {bits: 16}
+  FP16: {bits: 16}
+  E4M3: {bits: 8}
+  E5M2: {bits: 8}
+  MXFP8: {bits: 8, block: 32, scale: E8M0}
+  MXFP4: {bits: 4, block: 32, scale: E8M0}
+  NVFP4: {bits: 4, block: 16, scale: E4M3}
+  INT8: {bits: 8}
+  UINT8: {bits: 8}
+  INT16: {bits: 16}
+  INT32: {bits: 32}
+  INT64: {bits: 64}
+  UINT32: {bits: 32}
+  E8M0: {bits: 8}
 
 # Tile descriptor (TD): 256 bits in DTAB. Shapes are up to 4-D, innermost dim contiguous.
 # Element (i0, i1, i2, i3) is at base + i0*esize + i1*s1 + i2*s2 + i3*s3. A stride of 0 broadcasts.
@@ -444,8 +464,16 @@ instructions:
       count of both TDs. At most one operand may be GLOBAL (else TD_SPACE): the other is local (SPM, DTAB, IMEM), so read
       data always sinks locally (noc.md section 4 rule 2). At most one TD may be PAGED; its row (dim 1) is translated
       through the page table at SPM[R[pt_reg]] and its base register is a paged pointer (memmap.md section 6).
-      Block formats: scales of a non-paged operand are at R[scale_reg] with row stride TD aux0; a PAGED operand's
-      scales are in the scale region of the same page. ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
+      Block formats: scales of a non-paged operand are at R[scale_reg] (the scale of the base element's block) with row
+      stride TD aux0; a PAGED operand's scales are in the scale region of the same page. Either way the scale of an
+      element is found from its row (dim 1) and its whole in-row offset (dims 0, 2, 3 and the paged pointer's byte;
+      byte, s2 and s3 must be multiples of the block's bytes, else ILLEGAL_FIELD; memmap.md section 6). cvt = NONE
+      moves only the bytes the TDs address, never the scales; a SCALE_REGION TD addresses the scale rows.
+      Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, and a conversion
+      unit split over several responses is staged raw there, so every response sinks without waiting for another
+      (microarch.md section 2.5). ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
+      Write packets hold contiguous destination bytes: adjacent runs, also consecutive paged rows of one page, are
+      merged up to a 256 B granule boundary, and HBM_ALIGN is checked per packet.
       FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
       bytes to sem[rsem] of the core that owns the destination address once the data is written; SRAM destinations
       only (an HBM destination has no owning core: ILLEGAL_FIELD; end the transfer with a SIGNAL instead).
