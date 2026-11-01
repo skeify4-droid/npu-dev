@@ -414,3 +414,40 @@ verifier's tables are unchanged.
   `core/seq`. `hbm`, `common` and `arith` can start now.
 - Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7), the golden-model checks (X-6 detector, V-2
   credits), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fixes for the second verification (2026-11-01)
+
+### Changes
+The second verification (d8f4f23) confirmed V-1 to V-11 and found W-1 to W-6 (spec_review.md, Verification 2). This session
+fixed all six on branch `spec-verification2-fixes`, one commit per group, with `make pytest` green before each. The
+"Resolutions (verification 2 fixes)" section of `docs/reports/spec_review.md` has one row per finding.
+- **Group 1 (b62bbc4), `core/dma`:**
+  - W-1: the staging ring takes an entry's scales and the raw slots of its split units as one allocation at scale-read issue,
+    so every allocated entry needs only tags. `isa.staging_ring` is a cycle model of the ring. The old rule and a capped
+    read-ahead both deadlock in it. 16 KiB is sized for scales, and the compiler pads fold-weight row pitches to whole
+    256-element tiles. `noc.py` baseline gains the scales-first edges, still acyclic.
+  - W-5: non-paged block bases and `s1` are block-aligned (`isa.block_addr`).
+  - W-4 (b, c): the batched `DMA_SCATTER` append, and page scale rows that tile whole 32 B blocks.
+  - W-6: two text fixes.
+- **Group 2 (0e23f87), compiler and runtime rules:**
+  - W-3: one call site per network-facing semaphore, and reassignment after a final credit. Data-dependent bases go in an
+    SPM base table, and a credit wait counts one credit per consumer.
+  - W-4 (a): the H-2 tail-block reasoning is corrected. Two writes of a block are ordered by an ack.
+- **Group 3 (b8b38b8), Phase 4:** W-2. An `ERR` (`LINK`) always faults the core and frees no tag. Responses for tags that are
+  not outstanding are dropped, and `FAULT_ADDR` is advisory. The CP restarts the step once `STATUS` shows no outstanding tags.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 unchanged; `make numerics` not rerun (no input changed).
+- Ring model: NVFP4 → BF16 at the 87 B/cycle share runs at 154.7 / 152.9 / 127 elements/cycle at 500 / 845 / 1,000-cycle
+  round trips with 16 KiB. When every fold tile is split it carries about 28, which is why the compiler pads.
+- W-3 needed no design choice beyond the suggested resolution, so the user was not asked.
+
+### Tests
+- `make pytest`: 212 passed (197 before). `test_isa.py` 23 → 37, `test_noc.py` 19 → 20.
+- `make isa` (Verilator lint of `isa_pkg`) clean. No RTL changed.
+
+### Next
+- A verification pass on these fixes (check-first list at the end of spec_review.md, starting with the ring deadlock probe
+  against the chosen rule), then Phase 3 RTL on `core/dma`. `hbm`, `common`, `arith` and `core/seq` can start now.
+- Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2), the golden-model checks (X-6 detector,
+  V-2 / W-3 semaphore order, W-4 (a) write order), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.

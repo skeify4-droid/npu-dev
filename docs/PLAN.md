@@ -227,6 +227,12 @@ session checks the fixes next.
     eb1f153; spec_review.md "Resolutions (verification fixes)"). V-2 was decided by the user: consumer credits across kernels,
     no kernel barrier. Phase 3 RTL on `hbm` may start now. On `core/dma` and `core/seq` it starts after a verification pass of
     these fixes.
+  - **Verified again, then fixed (2026-11-01).** The second verification (d8f4f23) confirmed V-1 to V-11 and found W-1 to
+    W-6. A third fix session resolved all six on branch `spec-verification2-fixes` (b62bbc4, 0e23f87, b8b38b8;
+    spec_review.md "Resolutions (verification 2 fixes)"). The DMA staging ring takes an entry's scales and raw slots together
+    (`isa.staging_ring`); semaphores belong to one call site and move only after a final credit; a stale link `ERR` frees no
+    tag. No frozen number changed. `core/dma` waits for one more verification pass, which starts with the ring
+    deadlock probe against the chosen rule. `core/seq` has no open item: W-3 is a compiler and runtime rule.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)
