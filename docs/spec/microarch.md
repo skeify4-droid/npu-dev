@@ -178,26 +178,54 @@ isa.md §5) a cheap multiply at the ACC input.
     transfer starts one round trip later (the second verifier's estimate: about 0.33 µs per dependent converting transfer,
     at most about 2% of a batch-1 DeepSeek or MiniMax decode step).
   - **Split units are staged raw.** A conversion unit whose bytes arrive in more than one response gets a raw staging slot: an
-    inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row), or a fold tile that is not inside one 256 B granule (a fold
+    inline-scaled row (`SCALE_INLINE`, such as a 264 B Engram row: 256 B of elements, then their 8 B of scales; memmap.md
+    §6), or a fold tile that is not inside one 256 B granule (a fold
     weight row that is not a whole number of 256-element tiles, or a K slice that does not start on one). Its responses are
     written there raw, and the converter takes the unit from SPM once it is complete. Its raw bytes add to the DMA's SPM write
     and read traffic.
   - **Staging ring:** an SPM region given by CSR `DMA_STAGE` (base and size), reserved by the runtime and shared by the four DQs.
     Size 0 makes block-format conversion fault (`ILLEGAL_FIELD`).
-  - **Ring allocation *(review finding W-1)*.** The ring is allocated in **entries**. An entry is one scale read and the data
-    reads its scales cover; the DMA sizes a scale read on unit boundaries, so every split unit lies in one entry.
-    - **An entry's scales and the raw slots of all its split units are one allocation, taken when its scale read is issued**
-      (when its first data read is issued if it has no scale read, as for an inline-scaled row). Its data reads then need only
-      tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the oldest one
-      frees its space, and the ring always drains.
+  - **Ring allocation *(review findings W-1, Z-1)*.** The ring is allocated in **entries**. An entry is a run of whole
+    conversion units: the scale reads of their out-of-line scales, the raw slots of its split units, and the data reads of
+    those units. It usually has one scale read; it has two when the run's scales cross a 2 KiB block of the scale array
+    (a fold tile's 8 or 16 B of scales at an offset that is not a multiple of their size, as with K not a multiple of 256).
+    - **Every data read and every conversion unit belongs to exactly one entry *(review finding Z-1)*.** An entry boundary is
+      a unit boundary. Where it falls inside a granule, the DMA cuts the read there: that granule is two partial reads (a
+      read request's `len` is in bytes, noc.md §2), one in each entry. So a data read waits only for its own entry's scales.
+      - Why: if the granule were one read, issued once both entries' scales are in the ring, the older entry could complete
+        only after the younger one is allocated. With several DQs the ring's oldest entry can be the only one of its DQ,
+        with the ring full behind it, and in-order reclaim lets nothing past it. Four DQs that stream DeepSeek index-key
+        rows (64 B) from row 2 of a page, with 1 KiB or 2 KiB scale reads, deadlock that way at cycle 1,716 (4 KiB ring) and
+        5,977 (16 KiB); contiguous fold tiles from byte 64 at 1,037 and 1,292 (`isa.staging_ring`, `boundary="shared"`;
+        the third verifier's own model had 1,715 / 5,976 and 1,051 / 1,298). One DQ cannot deadlock this way, because its
+        next entry is the ring's next allocation.
+      - Cost: one more request per entry boundary inside a granule, and at most one 32 B HBM burst read twice. The DMA ends
+        an entry on a granule boundary when a unit boundary falls on one, so aligned streams have no cut.
+    - **An entry's scales and the raw slots of all its split units are one allocation, taken when its first scale read is
+      issued** (when its first data read is issued if it has no scale read, as for inline-scaled rows). Its data reads then
+      need only tags, and tags are freed by responses, which sink unconditionally. So every allocated entry completes, the
+      oldest one frees its space, and the ring always drains.
+    - **Inline entries *(review finding Z-3)*.** An entry of `SCALE_INLINE` rows (memmap.md §6) has no scale read. It holds
+      whole rows, each with all its reads: a 264 B Engram row that crosses a 2 KiB block is two reads, both in the row's
+      entry. Its raw slot holds the rows, 272 B per row in 16 B units.
     - The ring is circular, in 16 B units. An entry is contiguous (if it does not fit before the end it starts at the
-      beginning), at most a quarter of the ring (the DMA shortens the scale read), and freed when all its data has been
-      converted. Space comes back in allocation order.
-    - Scale reads run ahead as far as the ring allows, and go before data reads when their space can be taken. That is
-      what keeps a converting stream at the HBM rate.
-    - Reference: `isa.staging_ring`, a cycle model of the rule. `test_isa.py` runs mixed split and non-split streams, one DQ
-      or four, with greedy read-ahead, and they always complete. Phase 3 adds a `core/dma` formal property: every allocated
-      ring entry needs only tags to complete.
+      beginning) and is freed when all its data has been converted. Space comes back in allocation order.
+    - **Ring and entry size *(review finding Z-3)*.** `DMA_STAGE` must hold at least 2 KiB, or a block-format conversion
+      faults `ILLEGAL_FIELD` (size 0 included). The DMA forms entries of at most a quarter of the ring, shortening the run
+      of units. The quarter is a rate target: four entries in flight let scales run a round trip ahead of their data.
+      Liveness needs only entry ≤ ring. No single unit's entry is larger than 272 B (an Engram row; a split MXFP8 fold
+      tile is 256 + 8 B, a split 4-bit tile 128 + 8 or 16 B), which fits a quarter of the 2 KiB minimum, so the DMA can
+      always meet the target. A ring below the 16 KiB default lowers the rate (below), never liveness.
+    - **Order of reads *(review finding Z-8)*.** Within a DQ, the scale read of its next entry goes before its own data reads
+      whenever that entry's space can be taken (greedy read-ahead). That is what keeps a converting stream at the HBM rate.
+      Across DQs, scale and data reads alike take the shared resources per packet, round-robin (above), so one DQ's scale
+      read does not overtake another DQ's data read; per-DQ order is all the read-ahead needs. A scale read takes
+      ceil(scale bytes / 256) tags, as a data read of that size would.
+    - Reference: `isa.staging_ring`, a cycle model of the rule. Entries can carry HBM byte ranges; their reads are then the
+      granule pieces of the range, cut at entry boundaries and grouped into requests inside one 2 KiB block. `test_isa.py`
+      runs mixed split and non-split streams, one DQ or four, with greedy read-ahead, and they always complete; the
+      shared-granule reading deadlocks with four DQs. Phase 3 adds `core/dma` formal properties: every allocated ring entry
+      needs only tags to complete, and no data read waits for the scales of an entry other than its own.
     - Rejected: taking the raw slot at the unit's first data read (the text before W-1). Read-ahead fills the ring with
       scales whose data can never get a raw slot: the all-split fold stream below deadlocks at cycle 687 (`test_isa.py`).
     - Rejected: capping read-ahead so that the largest raw slot still fits. In a ring it deadlocks too, because a raw slot

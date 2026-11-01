@@ -39,7 +39,7 @@ enums:
     FP16: 2
     E4M3: 3          # FP8 E4M3 (OCP, max 448, NaN = S.1111.111, no Inf)
     E5M2: 4          # FP8 E5M2 (IEEE-like, Inf and NaN)
-    MXFP8: 5         # E4M3 elements + E8M0 scale per 32 (scale array separate)
+    MXFP8: 5         # E4M3 elements + E8M0 scale per 32 (scale array separate, or inline with SCALE_INLINE)
     MXFP4: 6         # E2M1 elements, 2 per byte, + E8M0 scale per 32
     NVFP4: 7         # E2M1 elements + E4M3 scale per 16 + FP32 tensor scale
     INT8: 8
@@ -59,7 +59,7 @@ enums:
     PAGED: 0         # dim 1 (the row) is translated through a page table (DMA pt_reg; memmap.md section 6)
     IDX64: 1         # index lists are int64 (default int32)
     WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
-    SCALE_INLINE: 3  # block scales follow each row instead of a separate array (DMA gather of MXFP8 rows)
+    SCALE_INLINE: 3  # block scales follow each row's n0 elements instead of a separate array (Engram MXFP8 rows, 256 + 8 B); non-paged; base and s1 need no block alignment (memmap.md section 6, isa.inline_addr, review Z-4)
     SCALE_REGION: 4  # PAGED: address the scale region of each page (offset sc_off, row stride aux0) instead of its data
   cvt:               # DMA conversion on the way into the destination (source format -> destination format)
     NONE: 0
@@ -181,7 +181,7 @@ enums:
     PERF_CNT0: 0x011
     PERF_CNT1: 0x012
     SEM_BASE_GPA: 0x020  # read-only: global address of this core's semaphore file
-    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1): [21:0] base, [53:32] bytes (both 64 B aligned); 0 bytes: block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its scale read (isa.staging_ring)
+    DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, and every data read belongs to one entry (isa.staging_ring)
   fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
@@ -471,11 +471,14 @@ instructions:
       stride TD aux0; a PAGED operand's scales are in the scale region of the same page. Either way the scale of an
       element is found from its row (dim 1) and its whole in-row offset (dims 0, 2, 3 and the paged pointer's byte;
       the non-paged base or the byte, s1, s2 and s3 must be multiples of the block's bytes, else ILLEGAL_FIELD;
-      memmap.md section 6, isa.block_addr and isa.paged_addr). cvt = NONE
+      memmap.md section 6, isa.block_addr and isa.paged_addr). A SCALE_INLINE operand (non-paged) keeps each row's
+      scales after its n0 elements, so its base and s1 need no alignment (isa.inline_addr, review Z-4). cvt = NONE
       moves only the bytes the TDs address, never the scales; a SCALE_REGION TD addresses the scale rows.
       Scales are read into the DMA staging ring (CSR DMA_STAGE) before the data that uses them, and a conversion
       unit split over several responses is staged raw there, its slot taken with its scales at the scale read, so
-      every response sinks without waiting for another and every ring entry completes (microarch.md section 2.5). ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
+      every response sinks without waiting for another and every ring entry completes (microarch.md section 2.5); every
+      data read belongs to one entry, so a granule two entries share is two partial reads (review Z-1).
+      ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
       Write packets hold contiguous destination bytes: adjacent runs, also consecutive paged rows of one page, are
       merged up to a 256 B granule boundary, and HBM_ALIGN is checked per packet.
       FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
@@ -490,7 +493,8 @@ instructions:
       IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination =
       source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a
       logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page.
-      Operand spaces, conversions and scale operands as DMA_COPY (MXFP8 rows with SCALE_INLINE).
+      Operand spaces, conversions and scale operands as DMA_COPY. MXFP8 rows with SCALE_INLINE (Engram): row_bytes =
+      n0 elements + n0 / 32 scales (264 B), s1 any pitch of at least that; each row is staged raw and converted whole.
       Keeps up to dma_outstanding_reads granules in flight.
   DMA_SCATTER:
     op: 0x42

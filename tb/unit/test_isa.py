@@ -364,7 +364,8 @@ def test_paged_scale_uses_whole_in_row_offset(isa):
 
 
 # ---------------------------------------------------------------- DMA staging ring (microarch.md section 2.5, review W-1)
-# Entries for isa.staging_ring: (scale bytes, raw bytes, data responses, data bytes, elements).
+# Entries for isa.staging_ring: (scale bytes, raw bytes, data responses, data bytes, elements[, HBM address of the data]).
+# Every entry respects the DMA's sizing rule, at most a quarter of the ring (review Z-3).
 def _nvfp4_bf16(n):           # 2 KiB NVFP4 data reads, 256 B of scales each, every granule converted from its response
     return [(256, 0, 8, 2048, 4096)] * n
 
@@ -373,18 +374,22 @@ def _fold_split(n, tiles=16):  # MXFP4 -> E4M3 fold with every 128 B tile across
     return [(8 * tiles, 128 * tiles, tiles // 2 + 1, 128 * tiles, 256 * tiles)] * n
 
 
+def _fold_tiles(ring):        # fold tiles per entry within a quarter of the ring (136 B per split tile)
+    return min(16, ring // 4 // 136)
+
+
 def _engram(n):               # MXFP8 rows with inline scales (264 B): no scale read, two granules, staged raw
     return [(0, 264, 2, 264, 256)] * n
 
 
-def _mixed(n):
-    return [e for a, b in zip(_nvfp4_bf16(n), _fold_split(n)) for e in (a, b)]
+def _mixed(n, tiles=16):
+    return [e for a, b in zip(_nvfp4_bf16(n), _fold_split(n, tiles)) for e in (a, b)]
 
 
 RING_STREAMS = {
-    "fold_split": [_fold_split(150)],
-    "mixed_one_dq": [_mixed(150)],
-    "mixed_four_dqs": [_nvfp4_bf16(200), _fold_split(80), _mixed(60), _engram(300)],
+    "fold_split": lambda t: [_fold_split(150, t)],
+    "mixed_one_dq": lambda t: [_mixed(150, t)],
+    "mixed_four_dqs": lambda t: [_nvfp4_bf16(200), _fold_split(80, t), _mixed(60, t), _engram(300)],
 }
 
 
@@ -394,24 +399,46 @@ def test_staging_ring_atomic_rule_never_deadlocks(name):
     split / non-split stream always completes, at several ring sizes and round trips, in one DQ or shared by four."""
     for ring in (4096, 16384):
         for rt in (100, 500, 1000):
-            r = I.staging_ring(RING_STREAMS[name], ring=ring, rt=rt)
+            r = I.staging_ring(RING_STREAMS[name](_fold_tiles(ring)), ring=ring, rt=rt)
             assert r["done"] and r["deadlock"] is None and r["peak"] <= ring, (ring, rt, r)
+
+
+def test_staging_ring_size_and_entry_bounds():
+    """Z-3: the ring is at least 2 KiB (below it, block-format conversion faults ILLEGAL_FIELD), and the DMA forms entries
+    of at most a quarter of the ring. The quarter is a rate target, not a liveness condition: entries up to the whole ring
+    still complete (quarter=False), and only an entry larger than the ring can never be allocated."""
+    assert I.RING_MIN == 2048 and 4 * 272 <= I.RING_MIN                     # the largest single unit (an Engram row) fits a quarter
+    with pytest.raises(ValueError):
+        I.staging_ring([_engram(4)], ring=1024)
+    with pytest.raises(ValueError):                                          # 2,176 B entries above a quarter of 4 KiB
+        I.staging_ring([_fold_split(4)], ring=4096)
+    r = I.staging_ring(RING_STREAMS["mixed_four_dqs"](16), ring=4096, quarter=False)
+    assert r["done"], r
     with pytest.raises(ValueError):                                          # an entry the ring can never hold
-        I.staging_ring([_fold_split(2, tiles=32)], ring=4096)
+        I.staging_ring([_fold_split(2, tiles=32)], ring=4096, quarter=False)
+
+
+def test_staging_ring_scale_read_tags():
+    """Z-8: a scale read takes ceil(scale bytes / 256) tags, like a data read of that size: a 2 KiB scale read needs 8."""
+    e = [(2048, 0, 8, 2048, 4096)] * 3
+    assert I.staging_ring([e], tags=8)["done"]
+    assert not I.staging_ring([e], tags=7)["done"]
 
 
 def test_staging_ring_atomic_rule_random_streams():
-    """W-1: random mixes of entry kinds and sizes (each fits the ring), 1-4 DQs, 4-16 KiB rings: never a deadlock."""
+    """W-1: random mixes of entry kinds and sizes (each within a quarter of the ring), 1-4 DQs, 4-16 KiB rings: never a
+    deadlock."""
     rng = random.Random(11)
     for _ in range(25):
+        ring = rng.choice((4096, 8192, 16384))
+        sizes = [t for t in (1, 2, 4, 8, 16) if t <= _fold_tiles(ring)]
         streams = []
         for _ in range(rng.randint(1, 4)):
             s = []
             for _ in range(rng.randint(5, 60)):
-                tiles = rng.choice((1, 2, 4, 8, 16))
+                tiles = rng.choice(sizes)
                 s.append(rng.choice((_nvfp4_bf16(1)[0], _fold_split(1, tiles)[0], _engram(1)[0], (32, 0, 1, 256, 512))))
             streams.append(s)
-        ring = rng.choice((4096, 8192, 16384))
         r = I.staging_ring(streams, ring=ring, rt=rng.choice((50, 300, 800)))
         assert r["done"], r
 
@@ -423,10 +450,54 @@ def test_staging_ring_rejected_rules_deadlock(rule, name):
     never be issued (the verifier's probe: deadlock at cycle 687 for the all-split fold). Capping the read-ahead so that
     the largest raw slot still fits ('capped') also deadlocks in a ring, because a freed raw slot behind newer scale
     entries is reclaimed only in allocation order."""
-    r = I.staging_ring(RING_STREAMS[name], rule=rule)
+    r = I.staging_ring(RING_STREAMS[name](16), rule=rule)
     assert not r["done"] and r["deadlock"] is not None
     if rule == "split" and name == "fold_split":
         assert r["deadlock"] == 687
+
+
+# Entries with HBM byte ranges (review Z-1). Each DQ streams from its own 1 GiB region.
+def _index_key(ring, n=60, base=0, first=2):
+    """DeepSeek MXFP4 index-key rows (64 B, 4 B of scales each) from row `first` of a page, one scale read per entry of up
+    to 2 KiB of scales (512 rows), within a quarter of the ring. Rows are non-split; entries end mid-granule."""
+    rows = min(2048, ring // 4) // 4
+    a = base + 64 * first
+    return [(4 * rows, 0, 0, 64 * rows, 128 * rows, a + i * 64 * rows) for i in range(n)]
+
+
+def _fold_contig(ring, n=60, base=0, start=64):
+    """Contiguous MXFP4 fold tiles (128 B, 8 B of scales) from byte 64: every other tile crosses a granule (staged raw)."""
+    tiles = (ring // 4) // 72 // 2 * 2
+    out = []
+    for i in range(n):
+        a = base + start + i * 128 * tiles
+        split = sum(1 for j in range(tiles) if (a + 128 * j) % 256 + 128 > 256)
+        out.append((8 * tiles, 128 * split, 0, 128 * tiles, 256 * tiles, a))
+    return out
+
+
+@pytest.mark.parametrize("kind", ["index_key", "fold_contig"])
+def test_staging_ring_entry_boundaries(kind):
+    """Z-1: every data read belongs to exactly one entry. With entries that end mid-granule, the rejected reading ('shared':
+    one read of the boundary granule, issued once both entries' scales are in the ring) deadlocks with four DQs: the ring's
+    oldest entry is its DQ's only one and waits for that DQ's next entry, which cannot be allocated, and in-order reclaim
+    lets nothing pass (the verifier's probe: cycle 1,715 / 5,976 for the index key at 4 / 16 KiB). Cutting the read at the
+    entry boundary (two partial reads) always completes. One DQ cannot deadlock this way: its next entry is the next
+    allocation."""
+    mk = _index_key if kind == "index_key" else _fold_contig
+    for ring in (4096, 16384):
+        four = [mk(ring, base=d << 30) for d in range(4)]
+        cut = I.staging_ring(four, ring=ring, boundary="cut")
+        shared = I.staging_ring(four, ring=ring, boundary="shared")
+        assert cut["done"] and cut["peak"] <= ring, (ring, cut)
+        assert not shared["done"] and shared["deadlock"] is not None, (ring, shared)
+        assert I.staging_ring(four[:1], ring=ring, boundary="shared")["done"]
+        plans = I._ring_reads(four[0], "cut")
+        assert all(len(r[2]) == 1 for p in plans for r in p)                       # cut: one entry per read
+        assert any(len(r[2]) == 2 for p in I._ring_reads(four[0], "shared") for r in p)
+    if kind == "index_key":
+        r = I.staging_ring([_index_key(4096, base=d << 30) for d in range(4)], ring=4096, boundary="shared")
+        assert abs(r["deadlock"] - 1715) <= 5                                      # the verifier's number, own model
 
 
 def test_staging_ring_sizing():
@@ -464,6 +535,38 @@ def test_block_addr_requires_block_aligned_base(isa):
         I.block_addr(isa, dict(td, s1=K // 2 + 4), w, sc, 0, 1)                # a row pitch that is not whole blocks
     bf = _td(isa, dtype="BF16", space="GLOBAL", n0=8, n1=1, s1=6)
     assert I.block_addr(isa, bf, 0x100 + 2, 0, 3, 0) == (0x100 + 2 + 6, None)  # no block format, no rule
+
+
+def test_engram_inline_gather(isa):
+    """Z-4: a DMA_GATHER of DeepSeek Engram rows (MXFP8, SCALE_INLINE: 256 B of elements, then 8 B of scales, 264 B per
+    row). The base and the row pitch s1 = 264 need no block alignment, because every row starts its own first block; the
+    scale of element i0 is at the row start + 256 + floor(i0 / 32). Before Z-4, isa.block_addr faulted ILLEGAL_FIELD at row 0.
+    A row that crosses a 2 KiB block is two reads, both in the row's inline entry (no scale read; 264 B raw slot)."""
+    td = _td(isa, dtype="MXFP8", space="GLOBAL", flags=("SCALE_INLINE",), n0=256, n1=1, s1=264, row_bytes=264)
+    assert I.inline_row_bytes(isa, td) == 264
+    table = 0x40_0000_0008                      # any byte address
+    for idx in (0, 1, 7, 12345, (1 << 20) + 3):
+        row = table + idx * 264
+        for i0 in (0, 31, 32, 255):
+            assert I.block_addr(isa, td, table, 0, i0, idx) == (row + i0, row + 256 + i0 // 32)
+            assert I.inline_addr(isa, td, table, i0, idx) == (row + i0, row + 256 + i0 // 32)
+    sep = _td(isa, dtype="MXFP8", space="GLOBAL", n0=256, n1=1, s1=264, aux0=8)   # separate scale array: W-5 still applies
+    with pytest.raises(I.IsaError):
+        I.block_addr(isa, sep, table, 0, 0, 1)
+    for bad in (dict(s1=256), dict(row_bytes=256), dict(n0=250, s1=264, row_bytes=0), dict(n2=2)):
+        with pytest.raises(I.IsaError):
+            I.inline_addr(isa, dict(td, **bad), table, 0, 0)
+    with pytest.raises(I.IsaError):                                          # PAGED keeps scales in the page's region
+        I.inline_addr(isa, dict(td, flags=td["flags"] | 1 << isa["enums"]["td_flags"]["PAGED"]), table, 0, 0)
+    # Ring entries of the gather: one row each, staged raw (inline scales are part of the row's bytes).
+    idx = random.Random(3).sample(range(1 << 20), 1500) + [7]               # row 7 crosses a 2 KiB block (1,848 .. 2,112)
+    rows = [table - 8 + i * 264 for i in idx]
+    assert rows[-1] // 2048 != (rows[-1] + 263) // 2048
+    stream = [(0, 264, 0, 264, 256, a) for a in rows]
+    plan = I._ring_reads(stream, "cut")[-1]
+    assert len(plan) == 2 and len({r[0] // 8 for r in plan}) == 2 and all(r[2][0][0] == len(rows) - 1 for r in plan)
+    assert I.staging_ring([stream], ring=2048)["done"]                       # the minimum ring: live, about 7 rows held
+    assert 0.10 < I.staging_ring([stream])["rate"] / 256 < 0.15               # 16 KiB: about 0.12 rows per cycle
 
 
 # ---------------------------------------------------------------- batched append and page bounds (memmap.md section 6, W-4)

@@ -181,7 +181,7 @@ Rules:
   | `src_reg`, `dst_reg` | base addresses; a PAGED operand's base is a paged pointer (`isa.yaml` `paged_ptr`: node, first row, byte in the row) |
   | `idx_reg` | SPM offset of the index list (gather, scatter) |
   | `n_reg` | override of the outermost count (0: from the TD) |
-  | `scale_reg` | address of the scale of the base element's block, in the scale array of a non-paged block-format operand (row stride TD `aux0`; memmap.md §6). The base element starts a block (review finding W-5) |
+  | `scale_reg` | address of the scale of the base element's block, in the scale array of a non-paged block-format operand (row stride TD `aux0`; memmap.md §6). The base element starts a block (review finding W-5). Unused with `SCALE_INLINE` (Z-4) |
   | `aux_reg` | SPM offset where the FP8-target conversions and `NVFP4_BF16` write the FP32 column scales (R0: none) |
   | `pt_reg` | SPM offset of the page table of the PAGED operand (at most one operand is PAGED) |
   | `ts_reg` | NVFP4 FP32 tensor scale in bits [31:0] (R0: 1.0) |
@@ -216,11 +216,14 @@ Rules:
   share (numerics.md D1).
 - **Scales before data** (review findings V-1, W-1): block scales are read into the DMA staging ring (CSR `DMA_STAGE`) before the
   data that uses them, and a conversion unit that spans several responses is staged raw there. A unit's raw slot is taken
-  with its scales, when the scale read is issued, so a started entry never waits for ring space. So a read response never waits
-  for another one, and the ring cannot fill with scales whose data can never be issued (noc.md §4 rule 2, microarch.md §2.5).
+  with its scales, when the scale read is issued, so a started entry never waits for ring space. Every data read and every
+  unit belongs to exactly one ring entry: a granule shared by two entries is two partial reads (review finding Z-1). So a
+  read response never waits for another one, and the ring cannot fill with entries that can never complete (noc.md §4 rule
+  2, microarch.md §2.5). `DMA_STAGE` holds at least 2 KiB, else a block-format conversion faults `ILLEGAL_FIELD` (Z-3).
 - **Scale location and write packets** (review findings V-4, V-5, W-5): an element's block scale is found from its row and its
   whole in-row offset (dims 0, 2, 3). Every dim-0 run starts on a block: the base (or the paged pointer's `byte`), `s1`, `s2` and
-  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
+  `s3` are multiples of the block's bytes (`ILLEGAL_FIELD`). `SCALE_INLINE` rows (Engram) are exempt: each row is its elements
+  followed by their scales, so any base and `s1` work (memmap.md §6, review finding Z-4). Write packets merge adjacent destination bytes, including consecutive rows of one page, so a
   32 B block of 4 B or 8 B scale rows is one aligned write. memmap.md §6 walks two KV appends field by field, and the batched
   (`DMA_SCATTER`) form (review finding W-4).
 

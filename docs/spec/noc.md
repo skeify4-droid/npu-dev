@@ -105,7 +105,7 @@ Four mechanisms remove the four kinds of deadlock:
        head of the RSP channel into a core would wait for its scale queued behind it (tested below). The DMA's own wait, a
        data read issued only after its scales have sunk, is a request-on-response edge, which cannot close a cycle (tested
        below). Whether the ring itself can fill with entries that cannot complete is below channel level: microarch.md §2.5
-       and `isa.staging_ring`.
+       and `isa.staging_ring` (every data read belongs to one ring entry, review finding Z-1).
    - A DMA never sends read data on as a write *(review finding I-1)*: one operand of every DMA transfer is local (`TD_SPACE`
      otherwise). If it did, the response channel into a core would wait on that core's request injection, which closes a cycle
      (tested below). (Separated from the V-1 bullet above, review finding W-6.)
