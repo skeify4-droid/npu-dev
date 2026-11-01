@@ -65,13 +65,13 @@
 
 | Criterion | Status |
 |---|---|
-| Spec reviewed | done, as a self-review (this document), and an independent review (below). The independent review's findings are open |
+| Spec reviewed | done, as a self-review (this document), and an independent review (below). The independent review's findings are resolved at the spec level (see Resolutions at the end), pending a verification session |
 | `isa.yaml` generator emits SV / C++ / Python | done (R-6) |
 | Every block has an interface table | done (R-13) |
 
 ## Not done
 
-- **Independent review** (done 2026-11-01, see below; its findings are open). Recommended before Phase 3 RTL starts on `core/dma`, `core/seq` and `hbm`; `common` and `arith` do not
+- **Independent review** (done 2026-11-01, see below; its findings were resolved by a fix session, see Resolutions at the end). Recommended before Phase 3 RTL starts on `core/dma`, `core/seq` and `hbm`; `common` and `arith` do not
   depend on it.
   - **Why:** the session that wrote the specs also built the models that check them and reviewed them. Both serious findings above
     (R-3 between noc.md and hbm.md, the PC fold between memmap.md and microarch.md) sat at seams between specs, so the review
@@ -323,7 +323,9 @@ group; the group column of the table maps to them.
 - X-2 (a), (c), (d), (e) and the `ACT_CK` and `tRREFDA` values: hbm.md H-9 JESD238 checklist.
 - Phase 4: the link tests of X-4, X-5 and I-7 and the SV checker's rule-removal test (PLAN Phase 4). Phase 7 and the golden model:
   the X-6 deadlock detector (PLAN Phase 7).
-- No arch.md frozen number changed. I-8 option A would have changed DeepSeek's "weights only" count; the user chose B.
+
+**Frozen numbers:** no arch.md frozen number changed, and arch.md needs no edit beyond its change-log row. I-8 option A would have
+changed DeepSeek's "weights only" count; the user chose B.
 
 **For the verification session, check first:**
 1. I-2 end to end: one NVFP4 paged KV gather and one KV append (data rows, scale rows by `SCALE_REGION`, tail-block rewrite) through
