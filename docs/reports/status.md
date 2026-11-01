@@ -591,3 +591,37 @@ the optional X-10 and X-14.
 - Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7, Y-10, X-13), the golden-model
   checks (X-6 detector, semaphore order including Y-8 and Y-9, W-4 (a) write order), the Phase 7 converting-rate and gather
   checks (Z-2, Y-2, Y-4, X-9), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fixes for the sixth verification (2026-11-02)
+
+### Changes
+The sixth verification (bc8f6af, scoped to the seven check-first items) found U-1 to U-3 and notes N-1 to N-5 (spec_review.md,
+Verification 6). This session fixed U-1 to U-3 and N-1 to N-4 on branch `spec-verification6-fixes`, one commit per group,
+with `make pytest` green before each. The "Resolutions (verification 6 fixes)" section of `docs/reports/spec_review.md` has
+one row per finding and note. The user chose U-1 (b) and the stated residual for U-3.
+- **Group 1 (95a2f4b), `core/dma` TD checks, `core/ni`, tag table:**
+  - U-1 (b): a fold-converted TD whose tiles could cross a 256 B granule faults `ILLEGAL_FIELD` (base or paged `byte`,
+    `s1`-`s3` multiples of the tile's bytes; n0 a multiple of 256 when n2 / n3 > 1). Re-derived: MXFP4, K = 384,
+    `s1` = 192 gave one 2 KiB request with units of 128 and 64 B, 24 pieces against 16 placed. v1 has no raw slots or
+    response pieces; the reference keeps them for a later version. New reference `isa.cvt_source_check`.
+  - U-2: converting BF16 / FP32 sources are element-aligned (`ILLEGAL_FIELD`).
+  - N-4: `DMA_STAGE` holds 2-32 KiB; the tag entry is about 70 bits (4.5 KiB). N-3: slot-count wording (later version).
+- **Group 2 (e42e8a0), the read-issue arbiter text:** N-1 (P1 on the listed reasons, P2's free resources, P4: a ring-queue
+  head allocates within a bound) and N-2 (the paced stream's 17 → 10 B/cycle next to a plain DQ, and no cap).
+- **Group 3 (a0cd582), runtime and link text:** U-3: late `WR` / `SEM` requests of a restarted step are kept out only by
+  the drain conditions and the timeout; a Phase 4 test.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 unchanged; `make numerics`, `make hbm`, `make links` not rerun
+  (no input changed). The tag-table estimate drops from about 95 to about 70 bits, which arch.md does not freeze.
+- N-2 rerun: paced NVFP4 / KV alone 16.6 / 17.0 B/cycle at L = 845; with a plain DQ 9.6 / 76.2 and 10.7 / 75.0.
+
+### Tests
+- `make pytest`: 231 passed (230 before). `test_isa.py` 54 → 55.
+- `make isa`: `isa_ref.md` only; `isa_pkg.sv` unchanged and lint clean. No RTL changed.
+
+### Next
+- Phase 3 RTL may start on all of `core/dma` (the read-issue arbiter with P1-P4 first) and `core/ni`, along with `hbm`,
+  `common`, `arith` and `core/seq`. A verification pass should check the new U-1 (b) rule and the 70-bit tag entry first
+  (check-first list at the end of spec_review.md).
+- Open: as after the verification 5 fixes, plus the U-3 late-request test in Phase 4.

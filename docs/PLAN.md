@@ -255,6 +255,14 @@ session checks the fixes next.
     user's choices). Read requests are cut at SPM destination runs. `SCALE_INLINE` is reserved in v1 (the user's choice). No
     frozen number changed. The read-issue arbiter may start Phase 3 RTL with its P1-P3 formal properties first, and so may
     the `core/ni` response path.
+  - **Verified a sixth time (scoped), then fixed (2026-11-02).** The sixth verification (bc8f6af) checked the seven
+    check-first items and found U-1 to U-3 and notes N-1 to N-5. A seventh fix session resolved U-1 to U-3 and N-1 to N-4
+    on branch `spec-verification6-fixes` (95a2f4b, e42e8a0, a0cd582; spec_review.md "Resolutions (verification 6
+    fixes)"). A fold-converted TD whose tiles could cross a 256 B granule faults `ILLEGAL_FIELD`, so v1 has no split
+    units, raw slots or response pieces (the user's choice); converting 2 / 4 B sources are element-aligned; `DMA_STAGE`
+    holds 2-32 KiB. P4 (a ring-queue head allocates) joins P1-P3. Late requests of a restarted step rest on the drain
+    conditions, not the epoch (stated, the user's choice). No frozen number changed. All of `core/dma` and `core/ni` may
+    start Phase 3 RTL, the arbiter with P1-P4 first.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)

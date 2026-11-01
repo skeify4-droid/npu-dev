@@ -1827,3 +1827,79 @@ These agree with `noc.scenarios()` and `test_gather_leaf_load`.
 - the generated SV and C++, `make isa`, and `make numerics` / `hbm` / `links`, whose inputs are unchanged;
 - the Phase 4 epoch and late-packet tests, which do not exist yet (item 5 and U-3 are argued, not run);
 - U-1 (a)'s request cut, which I did not build.
+
+# Resolutions (verification 6 fixes, 2026-11-02)
+
+**Who:** a seventh fix session (Opus 5.5). It is not the author, any reviewer, any earlier fix session or any verifier.
+Branch `spec-verification6-fixes` from bc8f6af, one commit per group, `make pytest` green before each. Scope: U-1 to U-3 and
+the notes N-1 to N-4, nothing else. The user chose U-1 (b) and, for U-3, to state the residual. The Verification 6 tables
+above are unchanged.
+
+**Method.** I re-derived U-1 executably with `isa.read_requests` and `isa.rd_rsp_layout` (probe script, not committed), and
+U-2 and U-3 by argument from the spec text. N-2's numbers were rerun in `isa.staging_ring`. Before asking about U-1 I listed
+every v1 path that creates a split unit (U-1 row) and wrote the exact `ILLEGAL_FIELD` condition. Each suggested resolution
+was checked against the specs and then taken, changed or rejected; each row says which.
+
+| Group | Commit | Findings |
+|---|---|---|
+| 1 | 95a2f4b | U-1 (b) (the user's choice), U-2, N-3, N-4: `core/dma` TD checks, `core/ni` response path, tag table |
+| 2 | e42e8a0 | N-1, N-2: the `core/dma` read-issue arbiter text, P1-P4 in PLAN Phase 3 |
+| 3 | a0cd582 | U-3 (the user's choice): runtime and link text, Phase 4 test |
+
+| # | Status | Group | What was done |
+|---|---|---|---|
+| U-1 | fixed ((b), the user's choice) | 1 | **Agree with the verifier.** **Re-derived:** MXFP4 → E4M3, K = 384, `s1` = 192, output rows contiguous (384 B per row). `read_requests` forms (0, 2,048) and (2,048, 1,024) from 16 rows; the first request spans rows 0-10 with 128 B tiles and 64 B short tiles. The tiles at 192, 960 and 1,728 (rows 1, 5, 9) are split by the granule boundaries at **256, 1,024 and 1,792**; those at **512, 768, 1,280 and 1,536** fall between units (the verifier: the same). True pieces **24**, `rd_rsp_layout(unit=(0, 128, raw))` **16**; the first wrong piece is at byte **128** (the short tile [128, 192) against a 128 B unit [128, 256)). `rd_rsp_layout` takes one unit size per entry, so it cannot place the layout. Also: K = 352 (`s1` = 176) splits 7 units in the first 2 KiB, two of them 48 B short tiles (at 480 and 1,008), 29 pieces against 16; MXFP8, K = 384, `s1` = 384 splits the tiles at 384, 1,152 and 1,920 (the last across the 2 KiB block), 13 pieces against 8. With rows padded in SPM, or the HBM pitch padded to 256 B, each row is its own request and nothing splits. **Every v1 path that created a split unit:** fold (`*_E4M3`) sources whose row pitch is not whole 256-element tiles (the short last tile), a K slice or base off a tile (fold tiles from byte 64), `s2` / `s3` off a tile or n0 not a multiple of 256 with n2 / n3 > 1 (a tile across two dim-0 runs), on any fold source (non-paged, paged `byte` / `s1`, a gather's base + index x `s1`); and 2 / 4 B elements off their size (U-2). `*_BF16` and E4M3 / E5M2 → BF16 have elements of at most 1 B and never split; `SCALE_INLINE` was already reserved. **Took (b), changed:** the condition is an alignment rule, slightly stricter than "a tile can cross a granule", as W-5's block rule is: under a fold `cvt` the source base (PAGED: the pointer's `byte`), `s1`, `s2` and `s3` are multiples of the tile's bytes T (128 B at 4 bits, 256 B for MXFP8), and n0 is a multiple of 256 when n2 or n3 > 1 (the verifier did not name this clause), else `ILLEGAL_FIELD`. Every tile, the short last tile included, then lies in one granule, and a K slice starts on a tile. **The memmap.md §6 / microarch.md §2.5 contradiction** is settled for memmap: its clause is now a rule with the fault, and microarch.md no longer lists "a K slice that does not start on one" as legal. **Kept from (a):** a per-row request at the padded pitch still has two unit sizes, so the text now says a fold read's tiles are T bytes from its first byte and only the last may be short, ending at the request's end (a request that spans rows has whole tiles only). Raw slots, response pieces and the unit-size, unit-offset and slot-index tag fields leave the v1 `core/dma` and `core/ni`; the text and `isa.staging_ring` / `rd_rsp_layout(unit=)` keep them, marked as a later version's. An unpadded fold weight is repacked, or converted with the exact `*_BF16` path, which accepts it. New reference `isa.cvt_source_check`; `test_cvt_source_check_no_split_units` asserts the U-1 numbers above, the padded layout (one request per row, every tile in one granule, the short tile at the request's end), the K-slice, MXFP8, n2 and paged cases, and 300 random legal fold TDs with no split tile. microarch.md §2.5 (tag table, converting responses, no split units, ring allocation and size, the compiler bullet, the interface table), memmap.md §6, isa.md §5, `isa.yaml` `DMA_COPY` / `DMA_GATHER`, noc.md §2, PLAN Phase 3 `core/dma` and `core/ni`. |
+| U-2 | fixed | 1 | **Agree**, by argument. `isa.block_addr` and the TD text have no rule for non-block formats (the test even uses a BF16 base of 0x102), and a read's `len` is in bytes, so `BF16_FP32` from 0x…0FF puts element 0 in the `gidx` 0 and 1 responses; FP32 → BF16 at 2 mod 4 the same. In v1 such a transfer has no scale read, hence no ring entry, and V-1 forbids holding the byte in the converter. **Took**, extended: the rule covers the source base (or paged `byte`), `s1`-`s3` and a gather's `row_bytes` whatever the source space, and it is in the reference (`isa.cvt_source_check`) instead of text only, so the Phase 3 `ILLEGAL_FIELD` cases have something to compare against. `cvt = NONE` is unaffected. isa.md §5, `isa.yaml` (`DMA_COPY`, `DMA_GATHER`, `row_bytes`), microarch.md §2.5, PLAN Phase 3. |
+| U-3 | fixed (the user's choice: the residual stated) | 3 | **Agree**, by argument. Every target copies `epoch` and executes what it accepts; only the initiator compares. A late read is harmless (its response is dropped); a late `WR` or `SEM` (also a write-add or `MC_WR`) of the old step writes and adds to an `rsem` the CP zeroed. **Took** the stated residual: L-4 (d) and (f), the L-4 data-outcome line, L-11 and isa.md §8 say late requests rest on conditions 1-3 and the timeout, as packets two restarts old do; PLAN Phase 4 adds a `WR` with `rsem` held at its target past its initiator's timeout and `T_DRAIN`. **Not taken**, costed for the user: a target-side epoch check in the SPM and CORECTL targets. It needs every writer in the target's step (epochs diverge once one step restarts), a CP exemption, an epoch on `MC_WR` (none today: a header change), and it leaves HBM and GSRAM writes, which have no owning core, on the time argument anyway. |
+| N-1 | fixed | 2 | (P1) is now stated on the enumerated pass list (no entry left and the next instruction or `DMA_LIST` entry not at the head, a semaphore wait, a `SIGNAL` waiting for release, a plain read or write next), which Phase 3 proves, not on "any reason other than". (P2) now reads: while the holder lacks only pace, a ready plain request of another DQ whose own resources are free issues, one per cycle; **changed:** "resources" names a burst id for a write packet next to the verifier's tag and credits. (P4) added as proposed, with its argument (while a head waits no other DQ allocates, so P3 drains a fixed set of entries, then the head fits; a head that goes idle leaves by P1). microarch.md §2.5 and PLAN Phase 3. |
+| N-2 | fixed | 2 | **Re-derived** (`isa.staging_ring`, `hbm="server"`, `DMA_PACE` 16 KiB, L = 845): NVFP4 weights alone **16.6**, KV gather alone **17.0** (L = 1,200: 11.8 / 12.0); with a plain DQ **9.6 / 76.2** and **10.7 / 75.0**, total 85.8 / 85.7. The verifier: 16.5 / 17.1, 9.5 / 76.3, 10.7 / 74.9, 11.7 / 12.0. **Took** the sentence: the paced stream drops to about 10 because the plain DQ's queue lengthens its round trip, the two go from 17 + 17 to 86, and a cap only moves bytes (with the verifier's 48 KiB cap figure at 1,200). microarch.md §2.5. |
+| N-3 | fixed (moot in v1) | 1 | Under U-1 (b) there are no pieces in v1, but the paragraph stays as a later version's definition, so the wording was fixed there: slot = the request's first unit's raw-slot index (the entry's split units before it, split or not) plus the granule boundaries from the first unit's start up to the piece's unit start, with the literal "boundaries crossed" named as the wrong count. The `rd_rsp_layout` docstring says the count runs from u0. The PLAN `core/ni` test for a request that starts past a split point moves with the pieces to the later version. |
+| N-4 | fixed | 1 | **Re-derived** under (b): the v1 tag entry is about **70 bits** (22-bit SPM destination, 8-bit granule offset, 11-bit `len`, 8-bit mask, 2-bit DQ, epoch, 5 bits of format and shape, an 11-bit ring offset of the first unit's scales), 4.5 KiB for 512 tags; the verifier's 95-101 bits included the raw-slot fields. **Changed:** the largest ring is **32 KiB** (11-bit offsets in 16 B units), not the 16 KiB a 10-bit offset gives, so the 24 and 32 KiB rings that Phase 7 costs stay possible for one bit. A block-format conversion with `DMA_STAGE` above 32 KiB faults `ILLEGAL_FIELD`, as one below 2 KiB does (`isa.cvt_source_check(stage=)`, tested at 0, 1 KiB, 2, 16, 32 and 64 KiB). The pace counter is unaffected (4.5 x 32 KiB is within 18 bits). microarch.md §2.5, isa.md §5, `isa.yaml` `DMA_STAGE`, PLAN Phase 3. |
+
+**Proposals not taken as written** (the row says why):
+- U-1 (b): an alignment rule instead of "tiles can cross a granule", with an n0 clause for n2 / n3 > 1; (a)'s "last unit may be short" sentence kept, because padded per-row requests need it.
+- U-2: in the reference too, and for any source space.
+- U-3: the optional target-side check not taken (MC_WR has no epoch; HBM and GSRAM stay on the time argument).
+- N-1: P2's free resources include a write packet's burst id.
+- N-3: fixed although moot, in the later-version text.
+- N-4: 32 KiB, not 16 KiB.
+
+**Reference and tests:**
+- New: `isa.cvt_source_check` (U-1 fold tiles, U-2 element alignment, N-4 `DMA_STAGE` bounds), constants `FOLD_CVTS` and `STAGE_MAX`.
+- `isa.rd_rsp_layout`: docstring only (`unit=` is a later version's; N-3's count; one unit size per entry). `isa.read_requests`, `isa.block_addr` and `isa.staging_ring` are unchanged.
+- `make pytest` 231 passed (230 before); `test_isa.py` 54 → 55 (`test_cvt_source_check_no_split_units`).
+
+**Regenerated:**
+- `make isa` in group 1: `docs/spec/isa_ref.md` only (the `DMA_COPY` and `DMA_GATHER` text). `isa_pkg.sv`, `isa.h` and `isa_defs.py` are unchanged; `verilator --lint-only -Wall isa/gen/isa_pkg.sv` is clean, and `git status` was clean after a rerun.
+- `make numerics`, `make hbm`, `make links`, `make sweep`, `make models`: not rerun. Nothing under `sw`, `sim` or `models` changed (`git diff --stat main..HEAD -- sw sim models` is empty).
+
+**Frozen numbers:** none changed. The ring default stays 16 KiB of SPM, `DMA_PACE` 72 KiB and the tag table 512 entries. The new 32 KiB ring maximum and the tag-table estimate (about 95 → 70 bits, 6 → 4.5 KiB) are microarch.md numbers that arch.md does not freeze. D1 is unchanged. arch.md has a change-log row.
+
+**Outside the scope** (one line each, not fixed):
+- `isa.read_requests` compares destination contiguity in the run's own bytes; for a converting read the destination run is in output bytes (2x or 4x the input), so a caller who passes output addresses gets no merges at all. Fewer merges is safe (more requests), but the docstring should say the destination is given in input-byte equivalents, or the function should take the ratio.
+
+## Before Phase 3, after the verification 6 fixes
+
+| Block | Still open |
+|---|---|
+| `core/dma` | none at the spec level. Arbiter: P1-P4 (N-1) as formal properties, with X-7, X-8, X-10, X-11, X-14 in text and reference. Request former: cuts at 2 KiB blocks, destination runs and entry boundaries; the v1 `ILLEGAL_FIELD` checks of U-1 (b), U-2 and N-4 against `isa.cvt_source_check`. No raw-slot path in v1 |
+| `core/ni` | none at the spec level: 1-flit `RD_RSP`, the epoch compare, and converting responses that each convert from their own bytes (no pieces in v1, U-1 (b)); tag entry about 70 bits |
+| `core/seq` | none |
+| `hbm` | as after the verification 5 fixes (X-2 (a), (c)-(e) on the H-9 checklist; Y-4) |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | as after the verification 5 fixes, plus U-3: a late `WR` with `rsem` held past its initiator's timeout and `T_DRAIN` |
+| compiler / runtime | as after the verification 5 fixes, plus U-1 (b): fold-weight pitches padded to whole tiles and K slices on tiles are now required, not only the compiler's practice; unpadded fold layouts are repacked or use `*_BF16` |
+| Phase 7 | as after the verification 5 fixes; a ring above 16 KiB is possible up to 32 KiB (N-4) |
+| later version | raw slots and response pieces (split fold tiles, `SCALE_INLINE`), with X-12's tag fields; it must cut a converting request where the unit size changes (U-1 (a)) |
+
+**May `core/dma` start Phase 3 RTL?** **Yes, all of it.**
+- Read-issue arbiter: yes, with P1-P4 as its first deliverable. N-1 and N-2 were text, and Verification 6 found the rule itself sound.
+- Request former: yes. U-1 (b) removes the case it could not describe, and U-2 and N-4 are `ILLEGAL_FIELD` checks with a reference.
+- Raw-slot path: there is none in v1. Nothing to build.
+
+**May the `core/ni` response path start Phase 3 RTL?** **Yes.** In v1 every converting response converts from its own valid range, so the NI needs no unit cut, and the tag entry has no unit size, unit offset or slot index.
+
+**For the next verification pass, check first:**
+1. **The U-1 (b) rule.** Is base / `byte`, `s1`, `s2`, `s3` a multiple of T, plus n0 a multiple of 256 when n2 or n3 > 1, enough for every fold source (paged, gather)? Does "a fold read's tiles are T bytes from its first byte, the last ends at the request's end" hold under every request cut (2 KiB block, destination run, Z-1 entry boundary)?
+2. **The 70-bit tag entry.** Is the ring offset of the first unit's scales enough for a v1 converting response without an element offset, including an entry that spans a destination-run cut (two requests in one entry)?
+3. **P4 and P2 as worded** (microarch.md §2.5), against the reduced configuration in PLAN.
