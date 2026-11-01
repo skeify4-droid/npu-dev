@@ -173,7 +173,7 @@ enums:
     NODE_ID: 0x001
     CYCLE: 0x002
     PC: 0x003
-    STATUS: 0x004    # queue busy bits, fault bit; the DMA stays busy while tags or write bursts are outstanding, also after a fault (review W-2)
+    STATUS: 0x004    # queue busy bits, fault bit; the DMA stays busy while tags or write bursts are outstanding, also after a fault or a CP stop (review W-2, Z-7)
     FAULT_CAUSE: 0x005
     FAULT_ADDR: 0x006
     FP_STATUS: 0x007   # sticky FP flags, write 1 to clear: [0] INVALID [1] OVERFLOW [2] SATURATE [3] NAN_IN (numerics.md N-5)

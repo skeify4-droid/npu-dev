@@ -268,7 +268,13 @@ session checks the fixes next.
     replay-buffer `ERR`, possibly for a reused tag), no core faults with any other cause, a response for a tag that is not
     outstanding is dropped, a `LINK` `ERR` frees no tag, `STATUS` stays busy until every tag is freed by its response or
     timeout, and after the CP restarts the step no response of the old step is accepted (a delayed duplicate response for a
-    reused tag is injected).
+    reused tag is injected);
+  - a late `LINK` `ERR` at the restart (Z-7): the bridge's replay-buffer `ERR`s are held on the mesh (a stalled RSP leaf)
+    past the release of the last tag. The CP restarts only after every core of the step, faulted or stopped, shows `STATUS`
+    idle, the bridge reports `err_done` and `T_DRAIN` has passed, and no core of the restarted step faults. With `T_DRAIN`
+    shortened below the hold, the restarted core faults `LINK`, which shows the wait is needed. A core the CP stopped
+    without a fault, with a response in flight, is not restarted before that response has arrived. The recovery time is
+    measured (L-11).
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.
@@ -313,10 +319,14 @@ session checks the fixes next.
 - **Program-level deadlock detector** (independent spec review X-6): report a deadlock when every engine and front end of every core
   is blocked on a semaphore wait (or a full queue behind one) and no transfer is in flight, with the wait chain. The golden
   instruction-level model (`sw/compiler`, Phase 3) gets the same check next to its SPM race checker; the compiler's issue-order
-  rule (d2d_c2c.md L-7) is what it guards. It also checks the kernel-boundary rule (isa.md §3, review findings V-2, W-3): every add to a
-  network-facing semaphore is causally after its owner's wait for that semaphore's previous use, also across kernels and when
-  the index moved to another call site (the final credit), every wait target is the carried base plus the use's total
-  (data-dependent totals from the program's SPM base table), and a multicast source waits for one credit per destination.
+  rule (d2d_c2c.md L-7) is what it guards. It also checks the kernel-boundary rule (isa.md §3, review findings V-2, W-3, Z-5, Z-6): every add to a
+  network-facing semaphore (buffer, credit and multi-adder flag semaphores, one per buffer parity) is causally after its
+  owner's wait for that semaphore's previous use, also across kernels and when the index moved to another call site (the
+  final credit); a single-adder flag's adds come from one DQ; no add of the old call site arrives after a move (the owner's
+  drain wait covered its full count, including the credits of a credit semaphore's last use); every wait target is the carried base
+  plus the use's total (data-dependent totals from the program's SPM base table); and a multicast source waits for one
+  credit per destination. Test programs: a credit semaphore moved between two collectives with 8 consumers (Z-5), a reused
+  8-adder ready flag with and without parities, and a shared-parity credit semaphore, which must be flagged (Z-6).
   And the write-after-write rule (hbm.md H-2, W-4 a): two writes of the same HBM bytes are ordered by an ack.
 - **Converting-stream rate** (review finding Z-2): NVFP4 → BF16 weight streams and the paged NVFP4 KV gather against the
   `isa.staging_ring` table in microarch.md §2.5, with real per-PC queues and other cores' traffic, at the default `DMA_PACE`

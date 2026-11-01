@@ -128,7 +128,18 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     - **(d)** a faulted core's tags and burst ids are freed only by their responses or acks (dropped) or by the per-request
       timeout. `STATUS` shows the DMA busy until all are free, and the CP restarts a core only after that: at most one timeout
       (100 µs by default) after the fault, added to a recovery that already includes a link retrain. So no late response of
-      the old step matches a tag of the new one.
+      the old step matches a tag of the new one. The same holds for a core the CP stopped without a fault: it stops like a
+      faulted core (isa.md §8), and its tags drain the same way.
+    - **(e) Restart condition *(review finding Z-7)*.** The CP restarts the step only when:
+      1. `STATUS` shows the DMA idle on **every core of the step**, faulted or stopped by the CP;
+      2. every down bridge reports `err_done` in its link-state CSR (L-9): it has injected the `ERR` for every request head
+         of its replay buffer and discarded the buffer;
+      3. and after that, a mesh drain time `T_DRAIN` has passed (runtime parameter, default 10 µs, about 15,000 cycles, far
+         above an intra-die RSP transit; Phase 4 measures the worst case under load).
+      - Why: an `ERR` (`LINK`) frees nothing, so `STATUS` idle does not show that every `ERR` has arrived. An `ERR` for a tag
+        that its real response already freed can still be on the mesh when the last tag of a core is freed. Arriving after
+        the restart, it would fault the new step by (a), and the recovery would start again. Requests that reach the down
+        bridge later get their `ERR` at once, and after condition 1 no core of the step sends any.
     - The data outcome is unchanged: the step restarts, and the CP zeroes the network-facing semaphores at the quiescent
       restart (isa.md §3), so writes executed before an `ERR` and their `rsem` counts do not survive.
   - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface
@@ -171,15 +182,21 @@ Collectives use only the following, all existing in ISA v0.1.
   - Each collective call site owns two receive buffers per peer, used alternately.
   - **One byte-counting semaphore per buffer parity** *(review finding I-6 c)*: a producer that runs ahead into buffer B would
     otherwise complete buffer A's count early. With forwarding, one semaphore per chunk slot.
-  - The consumer `SIGNAL`s the producer's credit semaphore once a buffer is consumed. Monotonic semaphores mean no reset and no
-    handshake per call (isa.md §3: network-facing semaphores are never reset).
+  - The consumer `SIGNAL`s the producer's credit semaphore once a buffer is consumed, **one credit semaphore per buffer
+    parity** as well *(review finding Z-6)*: a credit for use u needs only the write of u, which waited for the credits of
+    u - 2, so a shared credit semaphore with several consumers could complete a wait with credits of the wrong use.
+    Monotonic semaphores mean no reset and no handshake per call (isa.md §3: network-facing semaphores are never reset).
+  - A ready flag with several adders, reused every step, follows the same parity-and-credit rule; credits and single-adder
+    flags need no credit of their own (isa.md §3).
   - The producer's credit wait is normally already satisfied, so it is off the critical path.
   - **Across kernels** *(review finding V-2)*: parities, credit counts and semaphore bases carry over, and there is no barrier
     between kernels. Every receive buffer follows this discipline, including pipeline hand-offs and HBM buffers that
     complete by `SIGNAL` (isa.md §3).
   - **Allocation and reassignment** *(review finding W-3, isa.md §3)*: every network-facing semaphore, credits and `SIGNAL`-only
     handshakes included, belongs to one call site for the whole program. It moves to another call site only at a quiescent
-    point, or after its owner's last wait at the old one, with a final credit from the owner to each new adder. Data-dependent
+    point, or after its owner's drain wait at the old one, for every add the old call site will ever receive (for a credit
+    semaphore that includes the credits of its parity's last use; review finding Z-5), with a final credit from the owner to each
+    new adder. The new base is the drain wait's target. Data-dependent
     bases (the all-to-all's byte totals, L-7) are carried by the program in an SPM base table, not by the CP.
   - **Multicast and many-to-one buffers:** the producer waits for one credit per consumer of a use, n for a `DMA_MCAST` to n
     cores.
@@ -296,7 +313,7 @@ with TP > 2:
 | `noc` | in/out | flit_t (2 planes) | credit per VC | leaf router; arrivals injected into class X |
 | `tx[PORTS*LANES]` | out | 1248 | valid/ready (PHY pacing) | link flits to the PHY |
 | `rx[PORTS*LANES]` | in | 1248 | valid | link flits from the PHY (CRC checked here) |
-| `csr` | in/out | 64 | valid/ready | C2C peer routing table, replay counters, CRC error counters, link state |
+| `csr` | in/out | 64 | valid/ready | C2C peer routing table, replay counters, CRC error counters, link state (up / down, cause, and `err_done`: every replay-buffer `ERR` injected after link down, review finding Z-7) |
 | `irq` | out | 1 | level | link down |
 
 **Link layer TX/RX (`link/ll_tx`, `link/ll_rx`)**, per lane, inside the bridge:
@@ -338,9 +355,15 @@ with TP > 2:
 - Above 8 packages, through an external rail switch: the switch must keep REQ and RSP separate and do its own link-level retry.
   Perf simulator only.
 - The DMA request timeout and the runtime's recovery after a link-down event are Phase 4 (`link`, `die`) and runtime items.
+- **Recovery time budget *(review finding Z-7)*: not a number for this spec.** A link-down is a failure (more than 8
+  consecutive failed replays, or PHY loss of lock), not part of normal operation, so its recovery time sets availability, not
+  throughput, and no hardware size or default depends on it. The hardware parts are bounded here: the DMA timeout (100 µs,
+  L-4 (d)), `T_DRAIN` (10 µs, (e)) and the retrain (vendor PHY data, not known yet). The runtime states the budget together
+  with the serving availability target, and Phase 4 measures the recovery on `PKG_TINY`.
 - Phase 4 link tests from the review (PLAN Phase 4): CRC error on an idle flit and on a replayed flit carrying stale credits (no
   credit lost or double-counted, X-4); credit counters wrapping past 2^12; REQ blocked at the receiver while RSP keeps draining
   (I-7); link down under load on `PKG_TINY`: every core with a transfer through the link faults, with `LINK` (requests still on
   its side, including the replay buffer) or `TIMEOUT` (requests the far side had accepted), and the CP still reaches every core
   (X-5, V-7); with only the reverse path failed, cores whose transfers completed may also fault with `LINK`, and no late
-  response of the old step is accepted after the restart (W-2).
+  response of the old step is accepted after the restart (W-2); a `LINK` `ERR` held on the mesh past the last tag's release
+  does not fault the restarted step, because the CP waits for every core of the step, `err_done` and `T_DRAIN` (Z-7).

@@ -212,7 +212,8 @@ across both planes (`noc.scenarios()`).
   requests with `ERR` (`LINK`), including the requests in its replay buffer, and drops everything else, so the mesh drains and
   the cores with transfers through it fault, with `LINK` or, for requests the far side had accepted, `TIMEOUT` (review findings
   X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8). A replay-buffer `ERR` can be stale, so
-  it may also fault a core whose transfer completed; it frees no tag, and the CP restarts the whole step (W-2).
+  it may also fault a core whose transfer completed; it frees no tag, and the CP restarts the whole step (W-2), once every
+  core of the step is idle, the bridge has sent its last `ERR` and a drain time has passed (Z-7).
 
 ## 8. Open items
 

@@ -63,21 +63,46 @@ Rules:
   - **Credit before reuse.** Every receive buffer follows the d2d_c2c.md L-6 discipline: two buffers per call site used
     alternately, one semaphore per buffer parity, and a credit `SIGNAL` from the consumer once it has consumed a buffer. A
     producer writes a parity's buffer, and adds to its semaphore, only after the credit for that parity's previous use.
+    The credits also have **one semaphore per buffer parity** *(review finding Z-6)*: a consumer's credit for use u needs only
+    the producer's write of u, which waited for the credits of u - 2, not u - 1. With one credit semaphore for both parities
+    and several consumers, early credits of use u - 1 could complete the wait meant for the credits of u - 2.
     Parities and credit counts carry across kernel boundaries, so a kernel boundary is only another call. This holds for
     collectives, pipeline hand-offs and HBM buffers that complete by `SIGNAL`.
   - **Every network-facing semaphore belongs to one call site** *(review finding W-3)*, like a buffer: buffer semaphores,
     credit semaphores and `SIGNAL`-only handshakes (count exchanges, ready flags) alike. The compiler allocates them for the
-    whole program, across kernels, and records the map with the program. A credit or flag counts events, not bytes of a
-    reusable buffer, so with an exact base (below) its own waits never pass early and it needs no credit of its own. What it
-    must not see is adds from another call site.
+    whole program, across kernels, and records the map with the program. What a semaphore must never see is adds from
+    another call site, or from another use of its own call site beyond the one its owner waits for.
+  - **Credits and flags** *(review finding Z-6)*. Two kinds need no credit of their own:
+    - a credit semaphore (per parity): a consumer's credit for use u + 2 needs the producer's write of u + 2, which waited
+      for every credit of use u;
+    - a flag with one adder whose adds come from one DQ: each `SIGNAL` waits for the acks of the earlier ones, so the adds
+      arrive in order.
+    - A flag with several adders, reused every step (a ready flag from 8 dies), can pass early: a fast adder's add for step
+      s + 1 can land before a slow adder's add for step s, and the owner's step-s wait then completes with 7 step-s adds.
+      Such a flag follows the parity-and-credit rule like a buffer semaphore: two flags used alternately, and an adder adds to
+      a parity's flag only after the owner's credit for that parity's previous use, unless its add is already causally after
+      that wait (for example, it follows a reply the owner sends after the wait).
   - **Reassignment.** With 63 usable semaphores per core, an index will serve several call sites over a program. It moves from
     call site X to call site Y only:
     - at a quiescent point (boot, or the CP's restart after a fault; above), or
-    - after its owner's last wait at X, with every add of Y causally after that wait. Adds from other cores wait for a
-      **final credit**: a `SIGNAL` from the owner to each of Y's adders, sent after the last X wait, which Y's first add waits
-      for like any later credit. A credit semaphore's adds are caused by its owner's own buffer writes, so the owner issues Y's
-      first write after its last X credit wait, in the same DQ or behind a local semaphore.
-    - Y's base is X's final target. The extra cost is one `SIGNAL` per adder per move, usually sent long before Y's first add.
+    - after its owner's **drain wait** at X *(review finding Z-5)*: a wait for every add that X will ever receive, X's full
+      count over all its uses. Every add of Y is causally after the drain wait.
+      - For a buffer semaphore the drain wait is the wait of X's last use. For a credit semaphore it is not: the producer's
+        last wait on a parity's credit semaphore, before it writes that parity's last use, covers the credits of the use
+        before. The credits of the last use (n for n consumers) arrive whenever that buffer is consumed, so the producer
+        adds a wait for them. (With one credit semaphore for both parities, which Z-6 rules out, the credits of the last
+        two uses would be late.)
+      - Adds from other cores wait for a **final credit**: a `SIGNAL` from the owner to each of Y's adders, sent after the
+        drain wait, which Y's first add waits for like any later credit. A credit semaphore's adds are caused by its owner's
+        own buffer writes, so the owner issues Y's first write after the drain wait, in the same DQ or behind a local
+        semaphore.
+    - Y's base is X's full count, the drain wait's target. The extra cost is the drain wait (normally satisfied long before
+      Y's first use; when Y follows X at once, the compiler picks another index) and one `SIGNAL` per adder per move.
+    - Example (Z-5): producer P uses S30 as the credit semaphore of one buffer parity of a collective X with 8 consumers.
+      Without the drain wait, S30 would move to Y with the target of P's last X credit wait as its base, the 8 credits of
+      that parity's last use would count toward Y, and Y's first credit wait would pass 8 credits early: P would overwrite a
+      buffer its consumers are still reading, silently. The third verifier's version, with one credit semaphore for both
+      parities, is 16 credits early.
     - Example (W-3): kernel k uses S20 for a "counts ready" handshake from 8 dies; kernel k + 1 maps S20 to a pipeline hand-off.
       Without the rule, a producer that has already halted k adds to S20 before the consumer's kernel-k wait, which then passes
       early and reads stale counts. With it, the producer's first hand-off add waits for the consumer's final credit, which the
@@ -93,9 +118,13 @@ Rules:
   - Example (V-2): 32 contributors write-add into an owner's buffer with `rsem`. Contributor A halts kernel k and starts k + 1. Its
     adds go to the other parity's semaphore. Its next adds to kernel k's semaphore (kernel k + 2) wait for the owner's credit, which
     the owner sends only after its kernel-k wait. So the owner's kernel-k count holds kernel-k bytes only.
-  - The golden model checks that every add to a network-facing semaphore is causally after its owner's wait for that
-    semaphore's previous use, whichever call site the use belonged to (the credit for a buffer parity, or the final credit
-    after a reassignment), and that every wait target equals the carried base plus the use's total.
+  - The golden model checks:
+    - every add to a network-facing semaphore (a buffer semaphore, a credit semaphore or a multi-adder flag, one per parity)
+      is causally after its owner's wait for that semaphore's previous use, whichever call site the use belonged to (the
+      credit for a buffer parity, or the final credit after a reassignment). The one exception is a single-adder flag, whose
+      adds must instead come from one DQ;
+    - no add of X arrives after the semaphore moved to Y: the owner's drain wait covered X's full count (Z-5);
+    - every wait target equals the carried base plus the use's total.
   - Rejected:
     - A barrier per kernel (start kernel k + 1 only after every core that shares a network-facing semaphore has halted k). It puts
       a system-wide sync on the critical path of every kernel: about 0.6-4.5 µs across 8 dies, 0.4-2.7% of a DeepSeek decode step
@@ -302,7 +331,10 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
   outstanding requests are still accepted and dropped (their tags freed), and its SPM, GSRAM and CORECTL targets keep serving
   requests. A response for a tag that is not outstanding is dropped, faulted or not. A tag is freed by its response, by an
   `ERR` other than `LINK`, or by its timeout, and `STATUS` shows the DMA busy until every tag and burst id is free; the CP
-  restarts the core only then (d2d_c2c.md L-4, review finding W-2). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  restarts the core only then (d2d_c2c.md L-4, review finding W-2). A core the CP stops without a fault behaves the same.
+  After a link-down event the CP restarts the step only once every core of the step is idle, faulted or stopped, every down
+  bridge reports `err_done` and the drain time `T_DRAIN` has passed, so no stale `ERR` (`LINK`) reaches the new step
+  (d2d_c2c.md L-4 (e), review finding Z-7). So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
   recovery accesses rely on.
 
 Causes:
