@@ -246,6 +246,15 @@ session checks the fixes next.
     in turns (the user's choice). Partial-granule responses are defined, and an epoch bit drops stale link `ERR`s (the user's
     choice). The Engram table keeps its separate scale array (the user's choice). No frozen number changed. `core/ni` and
     `core/dma` may start Phase 3 RTL, except the `core/dma` read-issue arbiter, which waits for a verification pass.
+  - **Verified a fifth time, then fixed (2026-11-01).** The fifth verification (ed2ea70) found X-7 to X-16. A sixth fix
+    session resolved all ten on branch `spec-verification5-fixes` (b8e6596, a2eea9a, 7b0f910; spec_review.md "Resolutions
+    (verification 5 fixes)"). The ring turn passes when its holder has no entry to start, so a semaphore wait cannot
+    deadlock the ring. The pace holds the turn only against converting DQs, write packets count toward a turn, the ring
+    turn counts data granules, and one-granule entries are paced in full (the last two taken by the user). `isa.staging_ring`
+    models semaphores and writes. A response inside one 128 B half is 1 flit, and responses and acks echo the epoch (the
+    user's choices). Read requests are cut at SPM destination runs. `SCALE_INLINE` is reserved in v1 (the user's choice). No
+    frozen number changed. The read-issue arbiter may start Phase 3 RTL with its P1-P3 formal properties first, and so may
+    the `core/ni` response path.
   - `common` and `arith` do not depend on them and can start now.
 
 ### Phase 3: RTL, leaf and core blocks (L)

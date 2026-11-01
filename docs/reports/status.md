@@ -539,3 +539,55 @@ fixes)" section of `docs/reports/spec_review.md` has one row per finding. The us
 - Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7, Y-10), the golden-model checks (X-6
   detector, semaphore order including Y-8 and Y-9, W-4 (a) write order), the Phase 7 converting-rate check (Z-2, Y-2, Y-4),
   vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.
+
+## Phase 2: fixes for the fifth verification (2026-11-01)
+
+### Changes
+The fifth verification (ed2ea70) found X-7 to X-16 (spec_review.md, Verification 5). This session fixed all ten on branch
+`spec-verification5-fixes`, one commit per group, with `make pytest` green before each. The "Resolutions (verification 5
+fixes)" section of `docs/reports/spec_review.md` has one row per finding. The user chose X-9, X-13 (b) and X-16, and took
+the optional X-10 and X-14.
+- **Group 1 (b8e6596), the `core/dma` read-issue arbiter:**
+  - X-7: the ring turn passes whenever its holder cannot start an entry for a reason other than ring space, credits, pace or
+    the issue turn, and a turn is taken only when a DQ waits. A semaphore wait inside a turn hung the core (cycle 3,649;
+    182 of 400 random programs under the text, 59 with the reference's end-of-stream pass, 0 now). P1-P3 formal properties
+    in PLAN Phase 3.
+  - X-8: the issue turn is held for the pace against converting DQs only. At `DMA_PACE` 16 KiB a plain DQ next to paced
+    weights gets 76 B/cycle instead of 17.
+  - X-11: a write packet counts one credit toward the turn, so a 1 MiB write no longer locks out a reader for 4,096 cycles.
+  - X-10: the ring turn is counted in data granules (NVFP4 + MXFP8 weights 17 / 66 → 40 / 40).
+  - X-14: one-granule entries are paced in full (MX row gathers +27-40% at 845).
+  - X-15 (a), (b), (d): the reference bullet, the `bw_dq` window, isa.md §5.
+- **Group 2 (a2eea9a), `core/ni`, `hbm`, NoC:**
+  - X-9: a 1-flit `RD_RSP` when the valid bytes lie in one 128 B half; a stack's busiest leaf link with 8 gathering cores
+    goes from 1.21 to 0.91.
+  - X-12: read requests are cut at SPM destination runs, and converting responses are placed per unit (fold tiles from
+    byte 64).
+  - X-13 (a), (b): the epoch is echoed in `RD_RSP` and `WR_ACK`, and acks are coalesced per epoch; one bit covers one restart.
+- **Group 3 (7b0f910), runtime and ISA text:**
+  - X-13 (c): every step with a faulted core is restarted, each with its own conditions and epoch toggle.
+  - X-16: `SCALE_INLINE` is reserved in v1 (`ILLEGAL_FIELD`).
+  - X-15 (c): the `NI_EPOCH` comment.
+
+### Results
+- No arch.md frozen number changed (change-log row added). D1 unchanged; `make numerics`, `make hbm`, `make links` not rerun
+  (no input changed). The tag-table estimate grows to about 95 bits (6 KiB), which arch.md does not freeze.
+- Arbitration at an 845-cycle round trip, data B/cycle under the rule: KV gather + plain 28 / 56, two KV gathers + plain
+  19 / 19 / 40, NVFP4 weights + KV gather 37 / 37, NVFP4 + MXFP8 weights 40 / 40.
+- `isa.staging_ring` models write transfers, semaphore waits, `SIGNAL`s and gaps. 800 random four-DQ programs complete
+  under the rule.
+- A cost found in X-8: at a 16 KiB pace the paced stream itself drops from about 17 to about 10 B/cycle, because the
+  plain DQ's backlog lengthens its round trip.
+
+### Tests
+- `make pytest`: 230 passed (224 before). `test_isa.py` 49 → 54, `test_noc.py` 20 → 21.
+- `make isa` (Verilator lint of `isa_pkg`) clean; `isa_defs.py` and `isa_ref.md` changed for `epoch` and `SCALE_INLINE`. No
+  RTL changed.
+
+### Next
+- Phase 3 RTL may start on the `core/dma` read-issue arbiter, with the P1-P3 properties first, and on the `core/ni`
+  response path, along with the rest of `core/dma`, `core/ni`, `hbm`, `common`, `arith` and `core/seq`. A verification pass
+  should still check the new details first (check-first list at the end of spec_review.md).
+- Open: the H-9 JESD238 checklist, the Phase 4 link tests (X-4, X-5, I-7, V-7, W-2, Z-7, Y-10, X-13), the golden-model
+  checks (X-6 detector, semaphore order including Y-8 and Y-9, W-4 (a) write order), the Phase 7 converting-rate and gather
+  checks (Z-2, Y-2, Y-4, X-9), vendor PHY latencies, and the DeepSeek `hc_fn` check for numerics D2.
