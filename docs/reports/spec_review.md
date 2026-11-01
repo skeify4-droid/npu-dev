@@ -1145,3 +1145,347 @@ chose between real options for Y-2, Y-3, Y-7 and Y-10. The tables above are unch
 5. **Y-4 model differences:** my per-PC model and the verifier's differ by 5.5% at 845 for the KV gather, and by 2 against 9 in what a 24 KiB ring gains. A third model, or Phase 7, should say which is closer.
 6. **The epoch bit (Y-10):** whether one bit is enough with back-to-back link failures, and what the CP must do if a step spans cores whose `NI_EPOCH` it cannot write (a core of another step that also faulted).
 7. **The Engram layout (Y-7):** the sibling staging of two arrays (two gathers and two pushes per owner), and whether `SCALE_INLINE`, now used by no surveyed model, should stay in the ISA.
+
+
+# Verification 5 (2026-11-01)
+
+**Who:** a fifth verification session (Opus 5.5). It is not the author, the reviewer, any of the fix sessions or the earlier
+verifiers. No spec, model or test was changed; this section is the only edit (branch `spec-verification5` from b27474b). New
+findings are numbered from X-7, because X-1 to X-6 are taken by the xhigh checks above.
+
+**Method.** I read CLAUDE.md, Verification 4, the resolutions of the verification 4 fixes and the four commits (180d3bf,
+cfffee9, efe47a5, b27474b), and the specs their rows cite: microarch.md §2.5 and §2.6, noc.md §2, §4 and §7 (and §5 for flit
+costs), isa.md §3, §5 and §8, memmap.md §3 and §6, hbm.md H-2, H-3 and H-9, d2d_c2c.md L-4, L-6, L-9 and L-11,
+hyper_connections.md §4, `isa.yaml` (`DMA_STAGE`, `DMA_PACE`, `NI_EPOCH`, `SCALE_INLINE`, `DMA_GATHER`, `noc_header`) and PLAN
+Phases 3, 4 and 7. For each Y-n I asked whether the new text closes the verifier's failure scenario and whether it opens a new
+one. I walked the seven check-first items in order, then re-checked W-1, V-1, V-3 / X-6 rule 2, Z-1, Z-5 / Z-6 and D1.
+
+**Own model.** Before I read `isa.staging_ring` I wrote a cycle model from microarch.md §2.5 alone (scratch, not committed; no
+code in common).
+- What it has:
+  - Per-DQ entries with HBM byte ranges. Reads are granule pieces grouped into requests inside one 2 KiB block, and scale reads
+    that cross a 2 KiB block of the scale array are two reads of one entry.
+  - A ring of 16 B units, contiguous with wrap-skip, one allocation per entry at its first scale read (at its first data read
+    for inline rows), and in-order reclaim. Raw slots for inline rows and for fold tiles from byte 64.
+  - 512 tags (one per request) and 512 granule credits (one per granule touched). The pace is weighted by format and capped at
+    4.5 x the ring, and a converting read may issue when none is in flight.
+  - Credit-fair turns (the winner keeps its turn for 8 credits and holds it for credits and pace) and ring turns (a queue
+    entered by a DQ whose entry does not fit or that finds others waiting; the head allocates 256 B before the turn passes).
+    Greedy read-ahead within a DQ, and one request per cycle.
+  - One response per granule. One `ni_rsp` FIFO per core, sinking a piece in max(elements / 256, bytes / 512) cycles; credits,
+    tags and pace are returned at the sink.
+  - HBM: `paced` (an issue budget at 87 B/cycle, responses L after issue), `server` (a FIFO at 87 B/cycle, L/2 out and back,
+    32 B burst rounding) and `pc` (32 per-PC FIFOs of 21.8 B/cycle shared by N cores, PC from the memmap.md §3 hash).
+  - Cross-DQ semaphore waits and signals between transfers, which the reference does not have.
+- What it shares with the reference: the rule text, the three HBM abstractions as Verification 4 describes them, the 87 B/cycle
+  share, and the stream shapes of the §2.5 table (8-granule weight entries, one entry per KV row).
+- What it does not share: the code, address-based pieces everywhere, burst rounding, a separate tag count, credits returned at
+  the sink rather than on arrival, a ring queue entered only under contention (the reference makes every allocation take the
+  turn), semaphores, per-PC HBM with 8 cores, and no `boundary="shared"` mode (Z-1 is checked with the reference only).
+- Per-DQ rates are data bytes per cycle over the window where every DQ still receives data: from the latest DQ's 5% mark to
+  the earliest DQ's 95% mark. Single-stream rates are elements/cycle between 25% and 75%.
+
+**Executable checks** (all under `scripts/memrun`):
+- `make pytest`: 224 passed (rc 0, 27.5 s, 76 MB peak).
+- `make isa`: the generators rewrote identical files, `git status` was clean afterwards, and `verilator --lint-only -Wall` on
+  `isa_pkg.sv` passed.
+- `make numerics`, `make hbm`, `make links`: not rerun. `git diff --stat 9aea46f b27474b` changes no model input: under
+  `sw`, `sim` and `isa` only `isa/isa.py` changed, and it is not an input of those three.
+
+## Probes (own model and `isa.staging_ring` side by side)
+
+**1. Single stream, 16 KiB ring, `hbm="server"` unless paced** (elements/cycle, L = 500 / 700 / 845 / 1,000 / 1,200):
+
+| stream | own model | `isa.staging_ring` | §2.5 table |
+|---|---|---|---|
+| NVFP4 weights, paced | 154.7 / 154.7 / 152.7 / 129.1 / 107.6 | 154.7 / 154.7 / 153.3 / 128.6 / 106.7 | 155 / 155 / 153 / 129 / 107 |
+| NVFP4 weights, tags only | 130.4 / 118.6 / 111.3 / 104.4 / 96.7 | 129.6 / 117.7 / 110.3 / 103.4 / 95.7 | 130 / 118 / 110 / 103 / 96 |
+| NVFP4 weights, the rule | 154.7 / 154.7 / 150.7 / 127.9 / 107.0 | 154.7 / 154.7 / 150.7 / 127.4 / 106.3 | 155 / 155 / 151 / 127 / 106 |
+| KV gather, paced | 154.7 / 154.7 / 154.5 / 130.8 / 109.1 | 154.7 / 154.7 / 154.7 / 130.5 / 108.2 | 155 / 155 / 155 / 130 / 108 |
+| KV gather, tags only | 133.1 / 118.7 / 111.4 / 104.5 / 96.8 | 136.0 / 117.9 / 110.6 / 103.6 / 95.9 | 136 / 118 / 111 / 104 / 96 |
+| KV gather, the rule | 154.7 / 154.7 / 154.1 / 130.3 / 108.7 | 154.7 / 154.7 / 154.2 / 130.0 / 108.0 | 155 / 155 / 154 / 130 / 108 |
+| MXFP4 weights, flat 72 KiB | 164 / 164 / 159 / 134 / 111 | 163.8 / 163.8 / 159.5 / 135.5 / 113.5 | 164 / 164 / 160 / 136 / 114 |
+| MXFP8 weights, flat 72 KiB | 85 / 85 / 83 / 69 / 57 | 84.4 / 84.4 / 82.1 / 68.9 / 57.1 | 84 / 84 / 82 / 69 / 57 |
+| MXFP4 / MXFP8 weights, the rule or tags only | full rate (164 / 85) at every L | full rate (163.8 / 84.4) | all |
+
+Every row agrees within 2.2%. The largest gap is the KV gather with tags only at L = 500 (133 against 136).
+
+**2. Ring sizes with the cap** (the rule, elements/cycle at the same five L; own / reference):
+
+| ring (cap) | NVFP4 weights | KV gather | MXFP4 | MXFP8 |
+|---|---|---|---|---|
+| 4 KiB (18 KiB) | 63 / 45 / 38 / 32 / 27 · 62 / 45 / 38 / 32 / 27 | 65 / 47 / 39 / 33 / 27 · same | 125 / 91 / 75 / 64 / 54 · 125 / 90 / 75 / 64 / 53 | 84 / 83 / 75 / 64 / 54 · 84 / 83 / 75 / 64 / 53 |
+| 8 KiB (36 KiB) | 125 / 90 / 75 / 64 / 54 · 125 / 90 / 75 / 64 / 53 | 130 / 93 / 77 / 65 / 54 · 130 / 93 / 77 / 65 / 55 | 164 / 164 / 151 / 128 / 107 · 164 / 164 / 151 / 127 / 106 | all · all |
+| 24 KiB (72 KiB) | 155 / 155 / 151 / 128 / 107 · 155 / 155 / 151 / 128 / 106 | 155 / 155 / 154 / 130 / 109 · 155 / 155 / 154 / 130 / 108 | all · all | all · all |
+| 32 KiB (72 KiB) | as 24 KiB · as 24 KiB | as 24 KiB · as 24 KiB | all · all | all · all |
+
+The cap matches the §2.5 rows (8 KiB: 125 / 90 / 75 / 64 / 53 and 130 / 93 / 77 / 65 / 55). It helps MXFP4 at a 4 KiB ring (125
+against 104 flat at L = 500) and the KV gather at 8 KiB (130 against 104). At 24-32 KiB the CSR's 72 KiB binds, as intended. The
+derived limits that §2.5 rejects also reproduce: 24 KiB with 108 KiB and 32 KiB with 144 KiB give the KV gather 123.1 / 110.4
+at 845 (§2.5: 123 / 110).
+
+**3. Arbitration mixes at L = 845, `DMA_PACE` 72 KiB** (data B/cycle per DQ while all run; own / reference / §2.5):
+
+| arbitration | KV + plain | two KV + plain | NVFP4 weights + KV | NVFP4 weights + plain |
+|---|---|---|---|---|
+| `greedy` | 72/6 · 72/6 · 72/6 | 37/37/3 · 38/38/1 · 37/37/3 | 37/37 · 37/37 · 37/37 | 38/44 · 38/44 · – |
+| `hold` | 5/81 · 5/81 · 5/81 | 5/5/76 · 5/5/76 · 5/5/76 | 37/37 · 38/38 · 38/38 | 28/56 · 28/56 · – |
+| **`fair` + ring turns (the rule)** | 28/55 · 28/56 · 28/56 | 20/20/39 · 18/18/39 · 18/18/39 | 37/37 · 37/37 · 37/37 | 41/41 · 41/41 · – |
+| `fair`, no ring turns | 28/55 · 28/56 · 28/56 | 24/9/49 · 20/20/41 · 20/20/41 | **24/52** · 0/77 · 0/77 | 41/41 · 41/41 · – |
+
+The rule's rows agree within 2 B/cycle. The last row's starvation is timing-dependent: my model finds the same direction (a
+weight stream at 24 against 52) but not the reference's 0, because which DQ takes freed ring space first depends on the order
+in which DQs are offered it. At L = 500 the rule gives the same shares (28/56, 21/21/41, 39/39, 41/41).
+
+**4. Fairness knobs (own model, L = 845; the reference where it has the knob):**
+- Issue quantum (credits per turn) 1 / 4 / 8 / 16 / 32: KV + plain 5/81, 17/68, 28/55, 28/55, 28/55; two KV + plain 5/5/76,
+  14/14/56, 20/20/39, 20/20/41, 22/22/27; weights + KV 37/37 up to 8, 36/36 at 16, 31/31 at 32. So 8 sits at the start of the flat
+  region: smaller starves one-credit DQs, and 32 starts to cost the plain DQ.
+- Ring quantum 32 / 64 / 256 / 1,024 B: weights + KV 66/8, 60/15, 37/37, 37/37 (the reference: 66/8, 60/15, 37/37, 37/37).
+  256 B is the smallest quantum that lets a 256 B NVFP4 entry compete with 32 B KV entries.
+- **Two converting DQs of different formats** (X-10). NVFP4 + MXFP4: 27/54 (reference 27/54). NVFP4 + MXFP8: 17/66 (17/66).
+  NVFP4 + MXFP8 + plain: 10/37/37 (10/37/38). MXFP4 + MXFP8 + plain: 19/33/33 (19/33/33). The totals stay at 80-85 B/cycle, but
+  the ring turn hands out 256 B of ring, which is one NVFP4 entry, two MXFP4 entries or four MXFP8 entries. A ring quantum of
+  8 data granules (one data request) gives 40/40, 40/40 and 28/28/28, and leaves weights + KV (37/37), KV + plain (28/55) and
+  two KV + plain (20/20/39) unchanged.
+- **Do the turns cost a single stream anything?** No. The rule and `greedy` without ring turns give identical rates for one
+  stream (NVFP4 154.7 / 150.7 / 127.9, KV 154.7 / 154.2 / 130.4, MXFP8 84.4 at 500 / 845 / 1,000). Y-1's entry sizes next to a
+  plain DQ at 845 (8 / 16 / 64 / 128 granules): converting 82 / 82 / 76 / 67 elements/cycle and plain 41 / 41 / 44 / 49 B/cycle,
+  against 151 / 149 / 138 / 124 alone. The split is even in credits, and large entries lose ring coverage as they do alone.
+
+**5. The pace and the turn** (X-8). With `DMA_PACE` 16 KiB at L = 845, NVFP4 weights + plain: own 17/17, reference 14/38 under
+the rule, against 10/76 and 9/77 under `greedy`. KV + plain: own 17/34, reference 13/39, against 11/75 under `greedy`. The
+converting DQ holds the turn while it waits for pace, so the plain DQ, which the text says is limited by tags only, gets at most
+one turn per paced request. My model's coupling is stronger than the reference's, and I did not find why. The plain DQ loses
+48-78% of its rate, and the total 40-60%. At the default 72 KiB with a 16 KiB ring there is no loss at 845. With a 2 KiB ring
+(cap 9 KiB) the reference's plain DQ gets 64-67 against 80-81, and mine 81. A variant in my model, where a request that waits
+only for pace lets a DQ whose next read is plain issue, gives 10/76 and 11/75 at 16 KiB. It leaves every default case unchanged
+(41/41, 28/55, 20/41/20 for KV + plain + weights) and completes every run.
+
+**6. Liveness of the turns** (check-first item 1; own model; the reference has no semaphores):
+- **Targeted: the ring-turn head goes idle** (X-7). 2 KiB ring; DQ0 streams NVFP4 weights and keeps the ring full; DQ1 gathers
+  37 KV rows, waits on flag F, then gathers 37 more; DQ2 gathers 200 KV rows and sets F when they complete. DQ1 reaches the head
+  of the ring queue, allocates five 32 B entries (160 B, below the 256 B quantum) and waits on F. DQ2 and DQ0 wait behind it in
+  the queue. At L = 500 nothing moves after cycle 3,628, with the ring empty and every credit free. The reference's end-of-stream
+  pass hangs the same way, because DQ1 still has work. This holds at L = 300, 500 and 845 with 2 and 4 KiB rings; at 16 KiB the
+  ring never queues and the run completes. With no semaphore at all, a DQ whose stream ends at 160 B into its turn blocks the others the same way
+  (`isa.staging_ring` passes the turn there, in `_ring_release`, but the text does not say so). With the turn passed whenever the
+  holder has nothing to allocate, every case completes.
+- **Random programs:** 400 programs of 4 DQs, each 1-5 transfers drawn from NVFP4 / MXFP4 / MXFP8 weights (data and scale
+  offsets random, so scale reads cross 2 KiB blocks), KV gathers, inline rows (raw slots, allocated at the first data read), fold
+  tiles from byte 64 (raw slots plus scales), Engram rows and plain reads. Cross-DQ semaphore waits go only to earlier transfers,
+  so every program is deadlock-free by itself. Rings 2-16 KiB, L = 50-845, `DMA_PACE` 0 / 1 / 8 / 72 KiB, 8-512 credits, paced or
+  server HBM. Deadlocks: **332** with the turn kept until 256 B whatever the holder has left (the text), **119** with the turn
+  passed only at the end of the DQ's stream (the reference's rule), **0** with the turn passed whenever the holder has no entry
+  to start.
+- **Targeted: the item 1 deadlock attempt.** Four DQs: inline rows (one row per entry), fold tiles from byte 64, NVFP4 weights
+  with scale reads across 2 KiB blocks, and plain 2 KiB reads. Rings 2 / 4 / 8 KiB, 8 / 9 / 16 / 24 / 64 / 512 credits (8: a plain
+  read needs every credit), L = 50 / 300 / 845, `DMA_PACE` 0 / 1 / 72 KiB, paced and server: 324 runs, 0 deadlocks (with the idle
+  pass). In 4.49 M cycles one DQ held the issue turn while a different DQ was at the head of the ring queue.
+
+**7. Z-1 under the new arbitration** (`isa.staging_ring`, `boundary="shared"`, `sizing="quarter"`, four L of 100-845, paced and
+server with 72 KiB; deadlocked / runs):
+
+| stream | DQs | 4 KiB | 8 KiB | 16 KiB | 32 KiB |
+|---|---|---|---|---|---|
+| index key, the rule | 3 / 4 | 8/8, 8/8 | 0/8, 8/8 | 0/8, 0/8 | 0/8, 0/8 |
+| index key, `Z1_ARB` | 3 / 4 | 0/8, 8/8 | 1/8, 8/8 | 2/8, 3/8 | 0/8, 1/8 |
+| fold tiles from byte 64, the rule | 3 / 4 | 0/8, 8/8 | 0/8, 8/8 | 0/8, 8/8 | 8/8, 8/8 |
+| fold tiles, `Z1_ARB` | 3 / 4 | 0/8, 8/8 | 0/8, 8/8 | 0/8, 8/8 | 0/8, 8/8 |
+
+`boundary="cut"` completed in every one of these runs under both arbitrations. So "shared" deadlocks under the new arbitration
+far beyond the 4 KiB case the test asserts: fold tiles with four DQs at every ring size, the index key at 4-8 KiB. Some cases
+deadlock only under the new arbitration (index key, 4 KiB, 3 DQs; fold tiles, 32 KiB, 3 DQs) and some only under the old one
+(index key at 16 KiB). The pinning to `Z1_ARB` reproduces the earlier numbers and hides no regression.
+
+**8. Partial responses** (check-first item 3). `isa.rd_rsp_layout` agrees with noc.md §2 (one `RD_RSP` per granule touched,
+`gidx` from the first byte's granule, payload aligned, valid bytes from the tag table), hbm.md H-2 (descriptors with first burst
+and burst count; a burst cut inside is read twice) and `isa.yaml` `gidx` (3 bits: at most 8 granules inside one 2 KiB block;
+`len` 12 bits holds 2,048). For SRAM targets the text says "only the bytes". The element offset is tested only for the NVFP4
+granule cut at byte 128 (element 256). Two cases are not covered (X-12):
+- a request whose bytes have more than one SPM destination run;
+- a fold-tile request from byte 64, whose every granule carries the 64 B tail of a split tile (raw slot), a whole tile
+  (converted) and the 64 B head of the next split tile (another raw slot).
+
+`ERR` and timeout: an `ERR` other than `LINK` frees the tag and the credits left in the 8-bit mask, and the core is stopped.
+Since a request stays inside one 2 KiB block, it has one target and gets either responses or one `ERR`, so a partial request
+needs no new rule.
+
+**9. Response flits on the mesh** (X-9; noc.md §5 routes, `sim/analytic/noc.py`, with my own flit counts). Each `RD_RSP` is 2 flits,
+also for a 32 B scale read or an 8 B Engram scale. Eight cores of a stack on the paged KV gather at the 0.85 share (a 32 B scale
+read plus a 256 B row: 4 RSP flits and 2 REQ flits per 288 B): the busiest HBM leaf → mesh link is at **1.21** (1.42 at the full
+share), against 0.68 for 2 KiB plain reads at the same rate. With a 1-flit response for a range inside one 128 B half, it is
+0.91.
+
+**10. Per-PC queues, a third model** (check-first item 5; own `pc` mode, 8 cores of one stack, `DMA_PACE` 72 KiB, mean / slowest
+core):
+
+| case | own, L = 500 (mean / slowest) | own, L = 845 | Verification 4 (500 / 845) | fix session (500 / 845) |
+|---|---|---|---|---|
+| 8 x KV gather, 16 KiB | 147.4 / 145.4 | **133.5** / 132.5 | 144 / 132 | 146 / 140 |
+| 8 x KV gather, 24 KiB | 152.6 | 142.1 (+8.6) | 152 / 141 (+9) | 146 / 142 (+2) |
+| 8 x KV gather, 32 KiB | 153.5 | 142.0 | 152 / 141 | |
+| 8 x KV gather, tags only | 124.7 | 105.4 | 126 / 107 | 128 / 109 |
+| 8 x NVFP4 weights | 153.5 / 152.8 | 144.4 / 143.7 | 155 / 146 | 149 / 143 |
+| 1 converting + 7 plain, weights (B/cycle; plain cores) | 51 (92) | 49 (92) | 51 (92) | 50 (90-93) |
+| 1 + 7, KV gather | 52 (93) | 48 (93) | 44 (93) | 49 |
+| 4 + 4, weights | 61 (112) | 58 (112) | 62 (112) | |
+
+With the ring as a byte count freed out of order (no in-order reclaim), the same model gives 150.3 / 137.6 at 16 KiB and gains
+only +5 at 845 from 24 KiB.
+
+**11. The pace key** (check-first item 2; own model, server, 72 KiB):
+- A per-row gather of MX rows (256 B row plus its scale read, one entry per row), elements/cycle at L = 500 / 845 / 1,000:
+  - MXFP4: by format 134 / 110 / 103, flat 155 / 151 / 130;
+  - MXFP8: by format 67 / 55 / 52, flat 77 / 75 / 65.
+- Engram (separate array): 0.260 / 0.218 rows/cycle by format at 500 / 845, against 0.302 / 0.291 flat (§2.5: 0.27 / 0.22 and
+  0.30). Inline rows: 0.117 / 0.070 (§2.5: 0.12 / 0.07).
+- Counting entries whose data is one granule in full and longer entries by format ("by entry shape"): these gathers get the
+  flat rates, and the MX weight streams keep the full rate to 1,200 cycles (164 / 84). NVFP4 is unchanged.
+
+**12. The `bw_dq` window.** `isa.staging_ring([kv, plain[:60]], hbm="server", inflight=72 KiB, rt=845)` returns `bw_dq` 77/0. The
+plain DQ ran, but it finished before the 25% mark, so the window falls back to 25-75%, where it had no data. The streams of
+`test_staging_ring_tag_arbitration` are long enough that none ends before the 25% mark (by my estimate from the 18/18/39 shares,
+the short KV DQ of two KV + plain ends after the 75% mark), so its asserts are not affected.
+
+## Check-first list, in order
+
+1. **Ring turns and credit-fair turns (Y-3).**
+   - **Liveness argument.** It is not complete as written. The issue turn has its early pass ("passes early when the DQ has
+     nothing ready"); the ring turn has none, so a holder that has nothing to allocate keeps it (probe 6, X-7). With that pass
+     added, the argument closes:
+     - a held issue turn waits only for credits or pace, which responses free;
+     - a ring-queue head waits only for space, which allocated entries free, since their reads need only credits, pace and
+       issue turns, and those rotate;
+     - an empty ring takes any entry ≤ ring (the allocator restarts at 0 when it is empty, as `_Ring` does).
+     No other cycle turned up in 724 four-DQ runs with raw slots, inline rows, scale reads across 2 KiB blocks and as few as 8
+     credits.
+   - **As a formal property.** It is one Phase 3 can prove, but not as written in §2.5 and PLAN. Their properties ("every
+     allocated entry needs only tags", "no data read waits for another entry's scales") are about entries, not the turns. It
+     needs two safety properties and one bounded-liveness property under an environment that returns every granule within R
+     cycles:
+     - (P1) a ring-turn holder that cannot start an entry for a reason other than space releases the turn the next cycle;
+     - (P2) the issue turn is held only while the holder's next request lacks credits or pace;
+     - (P3) any DQ with a ready read issues within a bound in R, the quantum and the DQ count.
+     All three fit SymbiYosys k-induction on a reduced configuration (2-4 DQs, 8 credits, a ring of 16 units).
+   - **Fairness.** 1-credit / 8-credit mixes split credits evenly (28 + 3 against 56). Quantum 8 is right (probe 4). The ring
+     quantum is right in bytes for NVFP4 against KV, but it splits converting DQs of different formats by scale bytes (17/66,
+     X-10). The turns cost a single stream nothing. Holding the issue turn for pace throttles a plain neighbour when the pace
+     binds (X-8). Write packets are not placed in the turns at all (X-11).
+2. **The pace across formats (Y-2).** The weighted count and the cap reproduce at 4, 8, 16, 24 and 32 KiB (probe 2). NVFP4 / MXFP4 /
+   MXFP8 in different DQs share by ring bytes, not by the pace (probe 4). The MXFP8 per-row gather loses 0.29 → 0.22 rows/cycle at
+   845, as stated. A weight by format is the right key for multi-granule entries, whose pace bounds scale bytes in the ring.
+   For one-granule entries the pace bounds the queue, which the flat count measures, so the format key is wrong there (X-14).
+   No surveyed model has an MX row gather on a critical path.
+3. **Partial responses (Y-5).** Consistent across noc.md §2, hbm.md H-2, microarch.md §2.5 and `isa.yaml` (probe 8). Two gaps
+   (X-12), and the 2-flit cost of a sub-granule response (X-9).
+4. **`isa.staging_ring` changes.** The new defaults reproduce the §2.5 tables within 2% (probes 1-3). The `bw_dq` window is
+   right while every DQ outlives the 25% mark and wrong otherwise (probe 12, X-15). The Z-1 pinning hides no regression, and
+   "shared" deadlocks under the new arbitration at every ring size for fold tiles (probe 7).
+5. **Y-4.** The third model sides with the fourth verifier: 133.5 against 132 and 140 at 845, and +8.6 against +9 and +2 from a
+   24 KiB ring. In-order reclaim explains about half of the fix session's gap: freeing out of order gives 137.6 and +5 (probe
+   10). Its ring was "count-based", and the spec's ring reclaims in order. The other half (137.6 against 140) is probably address
+   placement, not shown. This is no Phase 7 result: none of the three models has bank timing, FR-FCFS or the mesh, and probe 9
+   adds a mesh limit that none of them models.
+6. **The epoch bit (Y-10).** Closes the single-restart case. Gaps in X-13: two back-to-back restarts alias, `RD_RSP` and `WR_ACK`
+   carry no epoch, and steps sharing a die are not covered by "the step". `NI_EPOCH` timing against in-flight requests is
+   sound: it is written only while the step is stopped and its DMA idle, so no request of the step is in flight. A write while
+   requests were in flight would only turn their `LINK` `ERR`s into `TIMEOUT`s, since the timeout stays as the backstop.
+7. **Engram as a separate array (Y-7).** The bytes hold: 48 x 288 B = 13,824 B of HBM reads, 12.7 KB of payload, 288 B for an
+   inline row at 8 B alignment too (`test_engram_separate_array_gather`). The sibling path is two plain gathers (256 B rows, 8 B
+   scale rows) and two pushes with `rsem`. The requester converts SPM to SPM with `scale_reg` on the staged scales, and one
+   semaphore can count both pushes (256 n + 8 n bytes). On C2C an 8 B scale row costs a 2-flit response, the same 4 flits per row
+   as an inline 264 B row, and the traffic is about 3 MB per step, so it does not matter. `SCALE_INLINE` now serves no surveyed
+   model but still costs the arbiter a second allocation trigger and the ring its 272 B unit (X-16).
+
+## Verdicts on Y-1 to Y-10
+
+| # | Verdict | Notes |
+|---|---|---|
+| Y-1 | resolved | The entry rule and the 2 L + T_entry formula hold. Own model at 845 with the rule: entries of 8 / 16 / 64 / 128 granules give 151 / 149 / 138 / 124 alone. The rule costs a single stream nothing next to a plain DQ beyond the even split (probe 4). No new scenario. |
+| Y-2 | resolved, gap | MXFP4 / MXFP8 at full rate to 1,200, NVFP4 unchanged, and the cap right at 4-32 KiB, own model and reference. New: holding the issue turn for pace throttles plain DQs when the pace binds (X-8). The format key is wrong for one-granule entries, at no cost to surveyed models (X-14). |
+| Y-3 | resolved, gap | Multi-credit and one-credit DQs no longer starve each other (28/56, 18-20/18-20/39, 37/37, own and reference). New: the ring turn has no early pass, which deadlocks with a semaphore wait or a stream end inside a turn (X-7, M). Ring bytes split converting DQs by format (X-10). Write packets have no place in the turns (X-11). Not a formal property yet. |
+| Y-4 | resolved, gap | The table note, PLAN Phase 7 and hbm.md H-9 are as described. The third model sides with the fourth verifier (probe 10). New: the RSP flits of sub-granule responses load the HBM leaf links to 1.21 when a stack's 8 cores gather (X-9). |
+| Y-5 | resolved, gap | The failure scenario (payload packed from the first byte; whole granules read) is closed in noc.md §2, hbm.md H-2 and the reference. Gaps: a request with more than one SPM destination run, and a fold-tile granule that feeds two raw slots and the converter (X-12). |
+| Y-6 | resolved | `test_staging_ring_pace_below_one_request` and my model agree: a 1 KiB limit completes one read at a time, and the counter reaches 2^17. No new case. |
+| Y-7 | resolved, gap | The separate-array gather is legal, non-split and about 2.2-3x the inline rate. Bytes and the sibling path check out. Whether `SCALE_INLINE` stays is an open choice (X-16). |
+| Y-8 | resolved | With the entry as credits expected, the wait before writing use u reads the entry before adding n_u, which covers uses up to u - 2. The drain target after the last write covers all of them, and the final credit's +1 enters the adder's entry and its first wait. A per-use n_u is known to the producer, which is the one that chose the destinations. Argued, not run. |
+| Y-9 | resolved | The exception now needs `SIGNAL`s from one DQ, and other single-adder flags fall back to the general rule. Matches d2d_c2c.md L-6 and the PLAN test programs. |
+| Y-10 | resolved, gap | A stale `ERR` of the previous epoch is dropped whatever its age. "However long it stays on the mesh" holds for one restart, not two in a row, and responses carry no epoch (X-13). |
+
+**Earlier verdicts, re-checked after these changes:**
+- W-1 (every allocated entry needs only tags): holds. An allocated entry's reads need credits, pace and the issue turn, all freed
+  by responses or rotating. A second scale read across a 2 KiB block needs no ring space. The ring turn is needed only to start
+  an entry.
+- V-1 (no response waits for another): holds. Per-granule responses of a cut granule each convert from their own entry. In my
+  model no non-split data response arrived before its entry's scales, in any mode.
+- V-3 / X-6 rule 2 (a DQ waiting on a semaphore holds nothing): **does not hold under the text as written.** A DQ that waits on a
+  semaphore inside its ring turn holds the ring turn (X-7). With the pass on idle it holds again, and microarch.md §2.5's "so a
+  DQ whose head waits on a semaphore holds nothing another DQ needs" becomes true.
+- Z-1 (cut reads): holds. Cut never deadlocked, under either arbitration, in the reference or my model. Shared still does
+  (probe 7).
+- Z-5 / Z-6 with Y-8's base table: hold (Y-8 row).
+- D1: not reopened. The 1.60x is converter and SPM-port capacity, which neither the pace weighting nor the turns change. X-9 is
+  mesh capacity, a separate limit.
+
+## Verification 5 findings
+
+| # | Sev | From | Finding | Failure scenario | Suggested resolution |
+|---|---|---|---|---|---|
+| X-7 | M | Y-3, V-3, X-6 | **The ring turn has no early pass, so a holder with nothing to allocate deadlocks the ring.** §2.5: "only the DQ at its head allocates, keeping that turn for 256 B of ring". The issue turn "passes early when the DQ has nothing ready"; the ring turn does not. `isa.staging_ring` passes it at the end of a DQ's stream (`_ring_release`), but it has no semaphores, so it never sees a DQ whose next instruction waits. | 2 KiB ring, L = 500 (also 300 / 845, and a 4 KiB ring): DQ0 streams weights; DQ1 gathers 37 KV rows and then waits on flag F; DQ2 gathers 200 KV rows and sets F when they complete. DQ1 heads the ring queue, allocates 160 B and waits on F; DQ2 is queued behind it and never allocates. The core hangs from cycle 3,628 with the ring empty and every credit free. In 400 random 4-DQ programs: 332 deadlocks under the text, 119 under the reference's end-of-stream pass, 0 with the pass on idle. PLAN's test "a DQ blocked on a semaphore while another DQ streams" is this case. | Write: "The ring turn passes when its holder cannot start an entry for any reason other than ring space: no started transfer has an entry left, its next instruction is not at the head or waits on a semaphore, or its next read is plain." Add semaphore waits (or idle gaps) between transfers to `isa.staging_ring`, with the probe-6 case and a random sweep as tests. Add the P1-P3 formal properties (check-first item 1) to PLAN Phase 3. |
+| X-8 | M | Y-2, Y-3 | **Holding the issue turn for pace throttles DQs the pace does not limit.** "While its next request waits for credits or pace it holds the turn: no other DQ's read overtakes it", while "plain reads are limited by tags only". When the pace binds, a plain DQ gets one turn per paced request. The pace binds at a `DMA_PACE` the runtime lowers, at the cap of a ring below 16 KiB, and above the round trip the ring covers. | `DMA_PACE` 16 KiB at L = 845. NVFP4 weights + 2 KiB plain reads: reference 14/38 B/cycle (52 of 87), own 17/17, against 9/77 and 10/76 under `greedy`. KV gather + plain: reference 13/39, own 17/34. At L = 1,200 the reference gives 11/30. The plain DQ, for example the next layer's activations, loses half or more of its rate to a stream that was throttled on purpose. | Hold the turn for credits; for pace, hold it only against other converting DQs: a request that waits only for pace lets a DQ whose next read is plain issue meanwhile. Own model: 10/76 and 11/75 at 16 KiB, every default case unchanged, every run complete. Add a 16 KiB-pace case to `test_staging_ring_tag_arbitration`. |
+| X-9 | M | Y-5, Y-4 | **Sub-granule responses cost full 2-flit packets, and a stack's gathering cores overload its leaf links.** `RD_RSP` is always 2 flits (noc.md §2, hbm.md H-2), now one per granule touched. A 32 B KV scale read and an 8 B Engram scale each cost as much link as 256 B, and every one-granule entry adds a header-only REQ flit. noc.md §5 sizes the links for 2 KiB plain reads only. | DeepSeek decode attention gathers the top-512 KV rows per query (model_features.md row 2), a 32 B scale read plus a 256 B row each. With the 8 cores of a stack at the 0.85 share, the busiest HBM leaf → mesh link is at 1.21 of capacity (`noc.py` routes, my flit counts). So the gather gets at most about 0.83 of its share (about 128 elements/cycle) before per-PC effects (Y-4: 132-134). | Decide before the `core/ni` and `hbm` response paths: a 1-flit `RD_RSP` when the valid range lies in one 128 B half. It needs no new header field, since both ends know the range from the request and the tag table, and the KV gather drops to 0.91. Or keep 2 flits and add the gather case to noc.md §5 and PLAN Phase 7, marking the §2.5 KV column as mesh-optimistic too. |
+| X-10 | L | Y-3 | **The ring quantum in bytes splits converting DQs by format.** 256 B of ring is one NVFP4 entry, two MXFP4 entries or four MXFP8 entries, each one data request. §2.5 says "under the rule, credits are shared evenly", which holds for KV + plain, not for two converting DQs. | NVFP4 + MXFP8 weights in two DQs at 845: 17/66 data B/cycle (own and reference); NVFP4 + MXFP4: 27/54; with a plain DQ: 10/37/37. The total is unchanged (80-85), so this is about sharing. A kernel that consumes an NVFP4 and an MXFP8 stream in lockstep runs at the NVFP4 stream's 17. | Count the ring turn in data granules of the allocated entries (8 granules, one data request) rather than in ring bytes: own model 40/40, 40/40, 28/28/28, with KV and plain cases unchanged. Or state the split in §2.5. |
+| X-11 | L | Y-3, V-3 | **Write packets have no place in the credit-fair turns.** Shared resources "are taken per read or write packet, round-robin", but the turn lasts "until it has taken 8 granule credits", and writes take none. Read literally, a DQ that wins with a write keeps the turn until its writes run out. Not modelled. | A MoE dispatch `DMA_COPY` of 1 MiB from SPM to remote SPMs in DQ2 while DQ1 prefetches the next expert's weights: DQ1 issues nothing for at least 4,096 cycles (2.7 µs at the NI's 256 B/cycle). | Count a write packet's granule (one per packet, at most 256 B) toward the 8-credit turn. Do not hold the turn for write burst ids, which acks free. Add a read DQ next to a write DQ to the Phase 3 arbitration test. |
+| X-12 | L | Y-5 | **The tag-table entry and the placement rule assume one destination run and one unit kind per request.** §2.5: granule g "lands at the destination + (g x 256 - the first byte's offset)", with one ring entry offset and one element offset per tag. Nothing says that a read request's SPM destination is contiguous, and with fold tiles from byte 64 every granule mixes raw and converted bytes. | (a) Two adjacent 512 B HBM rows (s1 = 512) read into SPM rows padded to s1 = 576 (bank spreading, §2.3): if the DMA merges them into one 1 KiB request, granule 2 lands at dst + 512 instead of dst + 576, silently. (b) A fold-tile granule from byte 64 feeds two raw slots and the converter; an NI built from the entry list has one ring offset to put it at. `test_rd_rsp_layout` covers raw placement and the NVFP4 element 256 only. | State that a read request is cut where its SPM destination run ends (as write packets are). State that raw-slot offsets and unit boundaries come from the ring entry (first unit address, unit size, raw-slot base) and not the tag table. Extend `isa.rd_rsp_layout` or a test with the fold-tile case and a padded destination. |
+| X-13 | L | Y-10, W-2 | **The epoch covers one restart and only `ERR`s.** (a) "However long it stays on the mesh" holds for an `ERR` one restart old. After two restarts in a row the epoch is back, so the guarantee is again a time argument (two drains and two retrains). (b) `RD_RSP` and `WR_ACK` carry no epoch, so L-4 (d)'s "no late response of the old step matches a tag of the new one" still rests on the 100 µs timeout. (c) L-4 (c) / (e) restart "the step", but a stale replay-buffer `ERR` can fault a core of another step on the die (W-2). | (a) Link fails in step N, the step restarts (epoch 1) and the link fails again at once; at the second restart (epoch 0) an `ERR` from step N still held behind a stalled SPM port faults the new step. (b) A response delayed past its tag's timeout lands in the SPM of the reused tag's new request. (c) Step B's core faults `LINK` from a stale `ERR` while the CP restarts only step A. | Reword (a). Optionally echo `epoch` in `RD_RSP` and `WR_ACK` (bit 122 is a common header bit, and the target copies it from the request), so the core drops late responses of the old epoch too. Decide before `core/ni` RTL, as for Y-10. State that a link-down event restarts every step with a `LINK` or `TIMEOUT` fault, each with its own conditions 1-3 and `NI_EPOCH` toggle. |
+| X-14 | L | Y-2 | **The format weight is the wrong key for one-granule entries.** For multi-granule entries the pace bounds scale bytes in the ring, which the format weight tracks. For one-granule entries (row gathers) it bounds the queue, which only the flat byte count tracks. | A per-row MXFP4 gather of 256 B rows at L = 845: 110 elements/cycle by format, 151 flat (own model); MXFP8 55 against 75; Engram 0.22 against 0.29 rows/cycle. No surveyed model has an MX row gather on a critical path: KV gathers are NVFP4 and Engram is hidden. | Optional: weight by entry shape. An entry whose data is one granule counts in full, longer ones by format (one more term in the shift select). Own model: the gathers get the flat rates, MX weights keep 164 / 84 to 1,200, NVFP4 is unchanged. Otherwise note the case in §2.5. |
+| X-15 | L | Y-3, Y-10 | **Text and reference slips.** (a) microarch.md §2.5 "Reference" bullet: "Its defaults are the rule: ... turn-holding (`arb="hold"`)". The default is `"fair"`, and `"hold"` is the rejected rule that starves the KV gather (5/81). (b) `bw_dq` falls back to the 25-75% window when a DQ ends before the 25% mark and then reports it as 0 (probe 12). (c) The `isa.yaml` `NI_EPOCH` and `epoch` comments cite L-4 (e) for the epoch, which is (f). (d) isa.md §5 repeats "ring space in turns of 256 B" without the pass (X-7). | (a) An RTL engineer who takes the bullet at its word builds the rejected arbiter. (b) A future arbitration test with a short stream asserts on a 0 that is a window artifact, the same class of error as the fix session's first Y-3 measurement. | Fix (a), (c) and (d) with the X-7 text. For `bw_dq`, measure each DQ from the latest DQ's first data to the earliest DQ's last data, and return None when there is no common window. |
+| X-16 | L | Y-7 | **`SCALE_INLINE` serves no surveyed model now.** It costs the arbiter a second allocation trigger (an entry allocated at its first data read, not at a scale read), the ring its 272 B largest unit, a TD flag, `isa.inline_addr` and five `ILLEGAL_FIELD` conditions, all to be verified in Phase 3. | No failure: it is cost without a user. Every Phase 3 property and test on the arbiter must cover the inline trigger, which no kernel will exercise. | The user's choice. Keep it, or mark the flag reserved (`ILLEGAL_FIELD`) in v1, keep the reference code and tests, and drop the inline path from the v1 `core/dma` RTL scope. |
+
+## Before Phase 3, after verification 5
+
+| Block | Still open |
+|---|---|
+| `core/dma` | Read-issue arbiter: X-7 (the ring turn's pass on idle), X-8 (no pace hold against plain DQs), X-11 (writes in the turns); optional X-10 (ring quantum in granules) and X-14 (pace key by entry shape); the P1-P3 formal properties. Text: X-12, X-15 (a), (d). X-16 if the inline path is dropped. Everything else as after the verification 4 fixes |
+| `core/ni` | X-9 (1-flit `RD_RSP`, or accept 2 flits) before the response path; X-13 (b) if the epoch is echoed in responses (header); X-12 text |
+| `core/seq` | none |
+| `hbm` | X-9 (the `RD_RSP` flit count in H-2); X-2 (a), (c)-(e) on the H-9 checklist; per-initiator fairness (Y-4) |
+| `common`, `arith` | none |
+| Phase 4 `link`, `noc` | X-13 (two restarts in a row; the bridge's epoch copy as before); the W-2, Z-7 and Y-10 tests as listed in PLAN |
+| compiler / runtime | as after the verification 4 fixes, plus X-13 (c) (restart every step with a `LINK` or `TIMEOUT` fault) and the X-16 choice |
+| Phase 7 | Y-4 and X-9: 8 cores on per-PC queues with the KV gather's RSP flits on the leaf links; the pace coupling at reduced rings (X-8) |
+
+**Can the `core/dma` read-issue arbiter start Phase 3 RTL?** **Not yet.**
+- X-7 is a deadlock in the text as written, and the reference's partial fix (a pass at the end of the stream) still deadlocks
+  119 of 400 random programs with semaphores.
+- X-8 and X-11 change what the turn is held for.
+- Each is one or two sentences in §2.5 and a small change to `isa.staging_ring` (semaphore gaps and the pass on idle, the pace
+  rule, writes counted as credits), with the probe-6 cases as tests.
+- Once those are in and the tests pass, the arbiter can start without another full verification pass. The P1-P3 properties go
+  into PLAN Phase 3 at the same time.
+- The rest of `core/dma` is not affected and can proceed.
+- `core/ni` should settle X-9 (and X-13 (b), if taken) before its response path is written, because both change the response
+  packet.
+
+**Where an executable check is needed beyond these probes:**
+- X-7, X-8, X-11, now: `isa.staging_ring` with semaphore waits between transfers, a 16 KiB-pace mixed case and a write DQ. The
+  probe-6 targeted case and a random sweep become tests.
+- X-7 in Phase 3: the P1-P3 formal properties on the arbiter.
+- X-9: noc.md §5 with gather traffic, then Phase 7 with a mesh model, 8 cores per stack and per-PC queues.
+- X-12: the Phase 3 `core/ni` test with a fold-tile request from byte 64 and a padded SPM destination.
+- X-13: the Phase 4 late-`ERR` test with two restarts in a row, and a late `RD_RSP` past its timeout.
+- Y-8 and Y-9: the golden-model semaphore check (still argued, not run).
+
+**Not checked:**
+- the JESD238 items (still unavailable);
+- the generated SV and C++ beyond the lint in `make isa`;
+- my per-PC model's fidelity: FIFO per PC, no bank or row timing, no FR-FCFS, no refresh, no mesh, 8 symmetric cores, my own
+  address placement;
+- why my pace coupling (probe 5) is stronger than the reference's;
+- write packets, which neither model has (X-11 is argued);
+- the mesh beyond the leaf-link estimate of probe 9: no router or VC model, and REQ flits of plain reads at the 1/16 rate;
+- SPM port arbitration against the DMA, and the SPM load of raw slots;
+- the published Engram checkpoint (no network; repo notes only);
+- the golden-model checks, which do not exist yet;
+- `make numerics`, `make hbm`, `make links`: not rerun, since their inputs did not change.
