@@ -116,7 +116,9 @@ blocks stay on one leaf and streams stay at full rate (hbm.md H-1, review findin
   - Granularity: 32 B (the DMA handles any size; sub-32 B writes use byte masks).
 - **GSRAM:** slice-contiguous 1 MiB windows. Software spreads hot data over slices itself.
 - **ACC:** not memory-mapped. Only MXU and VPU instructions reach it (space `ACC`, addressed in rows of 64 FP32).
-- **Alignment:** tile bases in SPM are 64 B aligned. Read requests do not cross a 2 KiB boundary; the DMA splits them.
+- **Alignment:** tile bases in SPM are 64 B aligned. A stationary-load (MXU W) tile with a padded pitch starts on a 2 KiB boundary,
+  the only base alignment at which every padded pitch is conflict-free (microarch.md §2.3, review finding V-8). Read requests
+  and write bursts do not cross a 2 KiB boundary; the DMA splits them (review finding V-10).
 
 ## 5. Core control block (CORECTL, per core)
 

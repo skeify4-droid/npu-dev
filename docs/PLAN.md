@@ -251,8 +251,9 @@ session checks the fixes next.
   - CRC error on an idle flit, and a replayed flit with stale credit counters: no credit lost or counted twice (X-4);
   - credit counters wrapping past 2^12 under a long stream (X-4);
   - REQ blocked at the receiving leaf while RSP keeps draining through the same link (per-VN queues, I-7);
-  - `PKG_TINY` link down under load: every core with a transfer through the link faults with `LINK`, the mesh drains, and the CP
-    still reaches every core (X-5).
+  - `PKG_TINY` link down under load: every core with a transfer through the link faults, with `LINK` (requests still on its
+    side, including those in the replay buffer) or `TIMEOUT` (requests the far side had accepted), the mesh drains, faulted cores
+    keep sinking responses and serving target requests, and the CP still reaches every core (X-5, V-7).
 - `die`: command processor, core instances, global SRAM, mesh, HBM subsystem. `pkg`: 2 dies + D2D. `system`: N packages + C2C.
 - Exit: `TINY` die boots a program from HBM, runs GEMM + softmax, writes back. `PKG_TINY` does a cross-die all-reduce.
   `MULTI_TINY` does an all-to-all.

@@ -109,7 +109,10 @@ isa.md §5) a cheap multiply at the ACC input.
 - Bank = `addr[10:6] ^ addr[15:11]`. Contiguous 2 KiB always covers all 32 banks. Power-of-two row pitches do **not** all spread
   (corrected, review finding I-13): over 64 rows the row starts reach 32, 16, 8, 4, 2 and 1 banks at 2, 4, 8, 16, 32 and 64 KiB.
   A stationary load of two 256 B rows per cycle therefore collides at 2, 4 and 64 KiB pitches. The compiler pads such SPM pitches
-  by 512 B (1 KiB at a 16 KiB pitch), which makes every power-of-two pitch from 2 to 128 KiB conflict-free (`test_isa.py`).
+  by 512 B (1 KiB at a 16 KiB pitch), which makes every power-of-two pitch from 2 to 128 KiB conflict-free (`test_isa.py`) for
+  tiles whose base is 2 KiB aligned. The compiler places stationary-load tiles with a padded pitch that way (review finding V-8):
+  at an 8 KiB + 512 B pitch half of the 256 B-aligned bases collide, and at bases that are only 64 B aligned most padded pitches
+  do. Every other padded pitch is also conflict-free at any 256 B-aligned base.
   - Not changed: folding `addr[20:16]` into the hash (the review's option) still collides at 2 and 4 KiB, and a hash that spreads
     every row bit over the upper bank bits fixes powers of two but loses on common non-power-of-two pitches (6 and 7 KiB).
 - Peak read clients:
@@ -208,7 +211,8 @@ isa.md §5) a cheap multiply at the ACC input.
 - Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
 - Plane choice is per packet: round-robin over planes with credits. No ordering is needed (noc.md §7).
 - Write acknowledgements carry a byte count and are coalesced per 2 KiB burst (noc.md §2, hbm.md H-2):
-  - every `WR` carries its burst's total bytes (`blen`), and the target acks when it has accepted them all;
+  - every `WR` carries its burst's total bytes (`blen`), and the target acks when it has accepted them all. A burst stays inside
+    one 2 KiB-aligned block, so it has one target (review finding V-10);
   - a full table acks its oldest entry early with a partial count, so accepting a write never waits for ack state (review finding R-3);
   - an entry idle for `ACK_FLUSH` cycles (CSR, default 64) is acked with its partial count, which completes bursts whose entry was
     evicted (review finding X-3);
@@ -283,7 +287,7 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | q_pop[4] | in | instruction + operands | valid/ready | DQ0-DQ3; one sequencer per DQ, so a head waiting on a semaphore holds no shared resource (§2.5, review finding V-3) |
-| dtab_rd | out/in | idx 8, data 256 | 1-cycle | tile descriptors |
+| dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant (review finding V-9) | tile descriptors when an instruction starts |
 | spm_rd / spm_wr | out | 256 / 512 B/cycle | valid/ready, banked | data in/out, index lists, page tables, scales and raw units in the staging ring (CSR `DMA_STAGE`) |
 | ni_req | out | flit_t | valid/ready | read requests, write packets |
 | ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and the SPM ports, because scales are staged before their data (§2.5, review finding V-1) | read data, scales, acks |
@@ -294,7 +298,7 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | q_pop | in | instruction + operands | valid/ready | MQ |
-| dtab_rd | out/in | idx 8, data 256 | 1-cycle, arbitrated | `a_td`, `w_td` when an instruction starts (review finding I-11) |
+| dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant | `a_td`, `w_td` when an instruction starts (review findings I-11, V-9) |
 | a_rd | out/in | 256 B/cycle | valid/ready | A rows from SPM |
 | w_rd | out/in | 512 B/cycle | valid/ready | stationary loads |
 | scale_rd | out/in | 64 B/cycle | valid/ready | rowscale / colscale |
@@ -308,7 +312,7 @@ Conventions:
 | q_pop | in | instruction + operands | valid/ready | VQ |
 | spm_rd[2] / spm_wr | out | 512 B/cycle each | valid/ready, banked | operand streams |
 | acc_rd | out/in | 4 rows x 64 x 32 | fixed latency | ACC epilogues |
-| dtab_rd | out/in | idx 8, data 256 | 1-cycle | operand shapes |
+| dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant (review finding V-9) | operand shapes when an instruction starts |
 | sem_inc | out | 6 + 4 | pulse | completion |
 
 **SPM (`core/spm`)**
@@ -368,7 +372,7 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| rd | in/out | idx 8, data 256 | one read per cycle, round-robin over DMA, MXU, VPU, 1-cycle | TDs at instruction start |
+| rd | in/out | idx 8, data 256 | request/grant: one grant per cycle, round-robin over DMA, MXU, VPU; data 1 cycle after the grant | TDs at instruction start |
 | wr | in | 32 B | valid/ready | DMA (space `DTAB`) and CORECTL writes; ordered by software (isa.md §4) |
 
 **Accumulator (`core/acc`)**, 2048 rows x 64 FP32, shared by the MXU and the VPU

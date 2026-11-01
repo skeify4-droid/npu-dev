@@ -208,6 +208,7 @@ constexpr Field kNocHeader_len{50, 39};
 constexpr Field kNocHeader_addr{99, 51};
 constexpr Field kNocHeader_gidx{53, 51};
 constexpr Field kNocHeader_cause{57, 54};
+constexpr Field kNocHeader_err_wr{58, 58};
 constexpr Field kNocHeader_wop{101, 100};
 constexpr Field kNocHeader_rsem{107, 102};
 constexpr Field kNocHeader_blen{119, 108};

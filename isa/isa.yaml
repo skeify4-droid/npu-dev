@@ -254,6 +254,8 @@ td:
 
 # DMA_LIST entry, 32 B in SPM (isa.md section 5). `op` selects the layout. Addresses are absolute (GPA, or an SPM offset for an
 # SPM operand, as the TD space says). Entries carry no conversion and no paging: those use DMA_COPY / DMA_GATHER directly.
+# Each entry is checked like the instruction it encodes (review V-6): at most one GLOBAL operand (TD_SPACE), rsem required on
+# MCAST and SRAM destinations only for rsem (ILLEGAL_FIELD), HBM write alignment (HBM_ALIGN); FAULT_ADDR = the entry's SPM offset.
 dma_list_entry:
   bits: 256
   select: op
@@ -306,6 +308,7 @@ noc_header:
     addr:     {bits: [99, 51], types: [RD_REQ, WR, SEM, MC_WR]}                 # target GPA (node resolved by the source)
     gidx:     {bits: [53, 51], types: [RD_RSP]}                                 # granule index within the read request
     cause:    {bits: [57, 54], types: [ERR], enum: fault_cause}
+    err_wr:   {bits: [58, 58], types: [ERR]}               # 1: tag is a write burst id, 0: a read tag (review V-10)
     wop:      {bits: [101, 100], types: [WR, MC_WR], enum: wop}
     rsem:     {bits: [107, 102], types: [WR, MC_WR]}
     blen:     {bits: [119, 108], types: [WR, SEM]}         # total bytes of the burst this packet belongs to (ack trigger)
@@ -514,6 +517,9 @@ instructions:
       Entries start in order; an entry with wsem != 0 starts only when sem[wsem] reaches wval (serial compare), and
       later entries wait behind it. Transfers of started entries may overlap. A SIGNAL entry releases every earlier
       entry and every earlier instruction of the queue. The list must not change until the instruction completes.
+      Each entry is checked like the instruction it encodes: COPY / GATHER / SCATTER like DMA_COPY (one GLOBAL operand,
+      else TD_SPACE; rsem only to SRAM, else ILLEGAL_FIELD), MCAST like DMA_MCAST (rsem required); FAULT_ADDR is the
+      faulting entry's SPM offset.
       Used for collective schedules and other precomputed transfer lists. Completion = all listed transfers complete.
   SIGNAL:
     op: 0x45
@@ -732,4 +738,4 @@ memmap:
       ba:     [18, 17]         # hashed: ba ^= row[8:7]
       row:    [33, 19]         # 0 .. 24575
     rows: 24576
-  spm_bank: "bank = addr[10:6] ^ addr[15:11]; pad power-of-two row pitches >= 2 KiB (memmap.md section 4)"
+  spm_bank: "bank = addr[10:6] ^ addr[15:11]; pad power-of-two row pitches >= 2 KiB, padded stationary-load tiles 2 KiB aligned (memmap.md section 4)"

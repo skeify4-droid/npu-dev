@@ -179,6 +179,8 @@ def test_noc_header_widths(isa):
     mc = I.fmt_fields(isa, "T_DMAMC")
     assert [f[k] for k in ("mc_x0", "mc_x1", "mc_y0", "mc_y1")] == [I.width(mc[k]) for k in ("x0", "x1", "y0", "y1")]
     assert 1 << f["gidx"] >= 2048 // 256                                 # granules of one 2 KiB read
+    err = I.unpack(isa, "noc_header", I.pack(isa, "noc_header", type="ERR", tag=0x1FF, err_wr=1, cause="LINK"))
+    assert err["err_wr"] == 1 and err["tag"] == 0x1FF                     # V-10: ERR says which tag space its tag is in
 
 
 def test_layout_validator_rejects(isa):
@@ -262,6 +264,21 @@ def test_spm_bank_strides():
     assert [pair_ok(1 << k) for k in range(11, 17)] == [False, False, True, True, True, False]
     for k in range(11, 18):
         assert pair_ok((1 << k) + (1024 if k == 14 else 512))
+
+
+def test_spm_bank_strides_over_tile_bases():
+    """V-8: the padded pitches are conflict-free for two-row stationary loads at every 2 KiB-aligned tile base (the rule in
+    memmap.md section 4), and every one except 8 KiB + 512 B also at every 256 B-aligned base. At 8 KiB + 512 B half of the
+    256 B-aligned bases collide, which is why the rule asks for 2 KiB."""
+    def pair_ok(pitch, base):
+        rb = lambda b: {I.spm_bank(b + o) for o in range(0, 256, 64)}
+        return all(not (rb(base + i * pitch) & rb(base + (i + 1) * pitch)) for i in range(0, 128, 2))
+    padded = [(1 << k) + (1024 if k == 14 else 512) for k in range(11, 18)]
+    for p in padded:
+        assert all(pair_ok(p, b) for b in range(0, 1 << 17, 2048))
+        bad = sum(not pair_ok(p, b) for b in range(0, 1 << 17, 256))
+        assert bad == (256 if p == 8192 + 512 else 0)
+    assert pair_ok(8192 + 512, 0) and not pair_ok(8192 + 512, 0x200)       # the verifier's example base
     assert all(len({I.spm_bank(b + o) for o in range(0, 2048, 64)}) == 32 for b in range(0, 1 << 22, 2048 * 7))
 
 

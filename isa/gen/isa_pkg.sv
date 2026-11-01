@@ -322,6 +322,8 @@ package isa_pkg;
   localparam int NOC_HEADER_GIDX_LSB = 51;
   localparam int NOC_HEADER_CAUSE_MSB = 57;
   localparam int NOC_HEADER_CAUSE_LSB = 54;
+  localparam int NOC_HEADER_ERR_WR_MSB = 58;
+  localparam int NOC_HEADER_ERR_WR_LSB = 58;
   localparam int NOC_HEADER_WOP_MSB = 101;
   localparam int NOC_HEADER_WOP_LSB = 100;
   localparam int NOC_HEADER_RSEM_MSB = 107;

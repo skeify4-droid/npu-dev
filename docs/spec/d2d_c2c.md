@@ -106,9 +106,16 @@ A link flit is one NoC flit plus link fields: 1248 bits (156 B), one flit per cy
     block unrelated traffic on them: other cores' HBM reads, the cores' fault interrupts to the CP, and the CP's recovery accesses.
     So after link down the bridge:
     - answers every request that arrives for the link with `ERR` (cause `LINK`), like a target that cannot serve the address;
+    - answers every request head in its replay buffer the same way, then discards the buffer *(review finding V-7)*: those
+      initiators are on this side, and the far side may never have accepted the request;
     - drops responses that arrive for the link (their initiators are on the far side, and time out there);
-    - discards its replay buffer and anything still in its receive buffer.
-    The mesh therefore drains, and every core with a transfer through the link faults with `LINK` from the `ERR`.
+    - discards anything still in its receive buffer.
+    The mesh therefore drains. Every core with a transfer through the link faults: with `LINK` if the request was still on this
+    side of the link (arriving, or in the replay buffer), and with `TIMEOUT` if the far side had already accepted it and its
+    response was lost. Bridges keep no table of outstanding requests, so the second case cannot get an `ERR`. The CP treats a
+    `TIMEOUT` during a link-down event as part of it.
+  - The drain also needs faulted cores to keep sinking: a fault stops a core's front end and engines, not its network interface
+    (isa.md §8).
   - The DMA's per-request timeout (CSR, default 100 µs) stays as the backstop for transfers whose responses were lost on the far side.
     It faults with `TIMEOUT`, not `LINK`, because a timeout alone does not show that a link failed (review finding I-15).
   - Recovery is a runtime action: retrain, then restart the step.
@@ -310,5 +317,6 @@ with TP > 2:
 - The DMA request timeout and the runtime's recovery after a link-down event are Phase 4 (`link`, `die`) and runtime items.
 - Phase 4 link tests from the review (PLAN Phase 4): CRC error on an idle flit and on a replayed flit carrying stale credits (no
   credit lost or double-counted, X-4); credit counters wrapping past 2^12; REQ blocked at the receiver while RSP keeps draining
-  (I-7); link down under load on `PKG_TINY`: every core with a transfer through the link faults with `LINK` and the CP still reaches
-  every core (X-5).
+  (I-7); link down under load on `PKG_TINY`: every core with a transfer through the link faults, with `LINK` (requests still on
+  its side, including the replay buffer) or `TIMEOUT` (requests the far side had accepted), and the CP still reaches every core
+  (X-5, V-7).

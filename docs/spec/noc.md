@@ -30,11 +30,11 @@ Status: **reviewed 2026-11-01** (Phase 2 self-review, [spec_review.md](../report
 |---|---|---|---|---|
 | RD_REQ | REQ | none | 1 | up to 2 KiB, not crossing a 2 KiB boundary (one HBM leaf or one SRAM target) |
 | RD_RSP | RSP | 256 B | 2 | one per 256 B granule: tag + granule index; destination space reserved at request time |
-| WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id and the burst's total bytes (`blen`) |
+| WR | REQ | ≤ 256 B | ≤ 2 | op: write / add FP32 / add BF16 / max FP32; optional `rsem` byte count; burst id and the burst's total bytes (`blen`); a burst is ≤ 2 KiB and inside one 2 KiB-aligned block, so it has one target (the DMA splits there, as for reads; review V-10) |
 | WR_ACK | RSP | none | 1 | burst id + byte count; coalesced per write burst (≤ 2 KiB) at the target (rules below) |
 | SEM | REQ | 8 B | 1 | `SIGNAL`: add or set at a semaphore address (a WR to the add window) |
 | MC_WR | REQ (MC VC) | ≤ 256 B | ≤ 2 | intra-die multicast to a mesh rectangle; posted, no ack; `rsem` applies at each destination |
-| ERR | RSP | none | 1 | address fault / unsupported operation |
+| ERR | RSP | none | 1 | address fault / unsupported operation; `err_wr` says whether `tag` is a read tag or a write burst id (review V-10) |
 
 A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on the head flit. Its bit layout is `isa.yaml`
 `noc_header`, generated into `isa_pkg`, `isa.h`, `isa_defs.py` and [isa_ref.md](isa_ref.md) (review finding I-12(b)):
@@ -44,7 +44,7 @@ A flit is 1024 data bits plus a 128-bit header sideband. The header is valid on 
   way to it. The receiving bridge rewrites it: from the address for a request, from the `ini_*` fields for a response.
 - `ini_node`, `ini_x`, `ini_y`, `ini_port`: the initiator. Requests carry it, and responses are delivered to it.
 - `tag` (9 bits: a read tag, or a write burst id), `len` (12 bits, bytes), `addr` (49 bits, requests only).
-- Type-specific fields share bits: `gidx` (granule index, `RD_RSP`), `cause` (`ERR`), `wop` and `rsem` (`WR`, `MC_WR`), `blen`
+- Type-specific fields share bits: `gidx` (granule index, `RD_RSP`), `cause` and `err_wr` (`ERR`), `wop` and `rsem` (`WR`, `MC_WR`), `blen`
   (total bytes of the burst, `WR`, `SEM`), and the multicast rectangle (`MC_WR`).
 
 Header in the sideband means a 256 B write is 2 flits, not 3.
@@ -205,8 +205,9 @@ across both planes (`noc.scenarios()`).
 - **QoS:** none beyond round-robin in v1. The perf simulator reports per-class latency, to decide whether HBM responses need priority.
 - **Errors:** a target that cannot serve an address returns `ERR`. The initiating DMA records it, stops the core and interrupts the CP.
   Links carry CRC-32C with go-back-N replay ([d2d_c2c.md](d2d_c2c.md) L-4). A link that goes down keeps sinking: its bridge answers
-  requests with `ERR` (`LINK`) and drops everything else, so the mesh drains and the cores with transfers through it fault (review
-  finding X-5).
+  requests with `ERR` (`LINK`), including the requests in its replay buffer, and drops everything else, so the mesh drains and
+  the cores with transfers through it fault, with `LINK` or, for requests the far side had accepted, `TIMEOUT` (review findings
+  X-5, V-7). A faulted core's network interface keeps sinking and serving (isa.md §8).
 
 ## 8. Open items
 

@@ -44,9 +44,11 @@ Every tile instruction carries a sync block:
     injected (below).
 
 Rules:
-- Semaphores are **monotonic counters**. Counts wrap modulo 2^32, and the serial compare stays correct across the wrap as long as a
-  wait's target is less than 2^31 ahead of the value. A byte-counting semaphore can therefore count any total (a 32K-token prefill
-  puts about 2.6 GB through one all-reduce semaphore) provided no single wait spans 2 GiB.
+- Semaphores are **monotonic counters**. Counts wrap modulo 2^32, and the serial compare stays correct across the wrap as long as
+  `|value - target| < 2^31` (as `isa.sem_ready` says; review finding V-11): the target is less than 2^31 ahead of the value, and the
+  value is less than 2^31 past it. A byte-counting semaphore can therefore count any total (a 32K-token prefill puts about 2.6 GB
+  through one all-reduce semaphore) provided no single wait spans 2 GiB and no wait uses a target more than 2 GiB stale. The carried
+  base and the buffer credits (below) bound both.
   - A ping-pong pipeline over iteration i waits for "filled >= i + 1" and "freed >= i - 1". No decrement races are possible.
 - **Two kinds of semaphore** (the compiler assigns them):
   - **Local:** only this core's engines and `SINC` change it. `SSET` may reset it, and faults `SEM_BUSY` while a queued instruction
@@ -170,6 +172,9 @@ Rules:
     (d2d_c2c.md L-7): one `DMA_LIST` of chunk forwards, each waiting on its chunk's count, takes one queue slot instead of one per
     chunk.
   - A `SIGNAL` entry releases every earlier entry of the list and every earlier instruction of the queue.
+  - **Each entry is checked like the instruction it encodes** (review finding V-6): `COPY`, `GATHER` and `SCATTER` like `DMA_COPY`
+    (at most one `GLOBAL` operand, else `TD_SPACE`; `rsem` only to SRAM, else `ILLEGAL_FIELD`), `MCAST` like `DMA_MCAST` (`rsem`
+    required). `FAULT_ADDR` holds the faulting entry's SPM offset.
 - `SIGNAL`: remote semaphore add/set with release semantics.
 - **Block-scale contract:**
   - Converting MXFP4 / NVFP4 / MXFP8 to E4M3 writes the elements plus one FP32 **column scale** per (output row of the weight,
@@ -259,14 +264,21 @@ S4 as well and the wait is `S4 >= 2`. The compiler's scheduler does this countin
 
 ## 8. Faults
 
-A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP. Causes:
+A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP.
+- "Stops" means the front end and the engines (review finding V-7). The network interface keeps working: responses to the core's
+  outstanding requests are still accepted and dropped (their tags freed), and its SPM, GSRAM and CORECTL targets keep serving
+  requests. So a faulted core never blocks RSP or REQ on its die, which is what the link-down drain (d2d_c2c.md L-4) and the CP's
+  recovery accesses rely on.
+
+Causes:
 - illegal opcode or field value;
 - a descriptor whose space is not allowed for that operand, including a DMA with both operands `GLOBAL` (`TD_SPACE`);
 - address faults (memmap.md §8), including `RAIL`;
 - ACC or SPM range overflow;
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
 - an invalid page-table entry in paged DMA;
-- a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4);
+- a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4). A request the
+  far side had already accepted gets no `ERR` and faults with `TIMEOUT` instead;
 - a DMA request with no response within the timeout CSR (`TIMEOUT`; review finding I-15, which separates it from `LINK`);
 - an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);
 - a `DMA_MCAST` without `rsem` (`ILLEGAL_FIELD`).

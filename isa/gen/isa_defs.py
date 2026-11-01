@@ -227,6 +227,7 @@ LAYOUTS = {'paged_ptr': {'bits': 64,
                            'addr': {'bits': [99, 51], 'types': ['MC_WR', 'RD_REQ', 'SEM', 'WR'], 'enum': None},
                            'gidx': {'bits': [53, 51], 'types': ['RD_RSP'], 'enum': None},
                            'cause': {'bits': [57, 54], 'types': ['ERR'], 'enum': 'fault_cause'},
+                           'err_wr': {'bits': [58, 58], 'types': ['ERR'], 'enum': None},
                            'wop': {'bits': [101, 100], 'types': ['MC_WR', 'WR'], 'enum': 'wop'},
                            'rsem': {'bits': [107, 102], 'types': ['MC_WR', 'WR'], 'enum': None},
                            'blen': {'bits': [119, 108], 'types': ['SEM', 'WR'], 'enum': None},
@@ -465,4 +466,5 @@ MEMMAP = {'gpa_bits': 49,
                     'ba': [18, 17],
                     'row': [33, 19]},
          'rows': 24576},
- 'spm_bank': 'bank = addr[10:6] ^ addr[15:11]; pad power-of-two row pitches >= 2 KiB (memmap.md section 4)'}
+ 'spm_bank': 'bank = addr[10:6] ^ addr[15:11]; pad power-of-two row pitches >= 2 KiB, padded stationary-load tiles 2 '
+             'KiB aligned (memmap.md section 4)'}
