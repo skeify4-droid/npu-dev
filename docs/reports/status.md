@@ -290,6 +290,7 @@
 - `make isa`, `make lint unit` clean. `make hbm` and `make links` reports are byte-identical across runs.
 
 ### Next
-- Independent Opus/xhigh review of ISA + HBM (PLAN §5) before Phase 3 RTL on `core/dma`, `core/seq`, `hbm`.
+- Independent review of the whole spec set before Phase 3 RTL on `core/dma`, `core/seq`, `hbm` (scope in spec_review.md, Not done).
+  Correction: an earlier note said PLAN §5 asks for an Opus/xhigh ISA + HBM pass; §5 lists that only as an alternative.
 - Phase 3: `common` blocks (FIFOs, async FIFO, credit interfaces, arbiters, SRAM wrapper) and `arith`.
 - Open: vendor HBM3e timing (tCCD_L), PHY latencies, the DeepSeek `hc_fn` check for numerics D2.

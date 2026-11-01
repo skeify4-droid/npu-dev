@@ -8,8 +8,8 @@
 - [hyper_connections.md](../spec/hyper_connections.md) where it states requirements on them.
 
 **Who reviewed:** the authoring session (Opus 5.5, high effort). This is a **self-review**.
-- PLAN §5 asks for an Opus / xhigh review of the ISA and HBM specs. That independent pass has not been done, and is listed under
-  Not done below.
+- This is the recommended setting for Phase 2 in PLAN §5; Opus / xhigh on ISA + HBM is listed there only as an alternative.
+- A self-review cannot catch the author's own assumptions. An independent review of the whole spec set is recommended; see Not done.
 
 **Method:**
 1. **Numbers.** Every number one spec quotes from another was traced to its source (arch.md §1, `sim/analytic/*`, `isa.yaml`), and
@@ -65,13 +65,29 @@
 
 | Criterion | Status |
 |---|---|
-| Spec reviewed | done, as a self-review (this document). The independent ISA + HBM pass is still open |
+| Spec reviewed | done, as a self-review (this document). The independent review is still open |
 | `isa.yaml` generator emits SV / C++ / Python | done (R-6) |
 | Every block has an interface table | done (R-13) |
 
 ## Not done
 
-- **Independent review.** PLAN §5 asks for an Opus / xhigh review of the ISA and HBM specs; it is recommended before Phase 3 RTL starts
-  on `core/dma`, `core/seq` and `hbm`.
+- **Independent review.** Recommended before Phase 3 RTL starts on `core/dma`, `core/seq` and `hbm`; `common` and `arith` do not
+  depend on it.
+  - **Why:** the session that wrote the specs also built the models that check them and reviewed them. Both serious findings above
+    (R-3 between noc.md and hbm.md, the PC fold between memmap.md and microarch.md) sat at seams between specs, so the review
+    covers the whole set, not single specs.
+  - **How:** a fresh, read-only session starting from `CLAUDE.md` and the specs (about 32k words with `isa.yaml`), at Opus / high,
+    the PLAN §5 setting. Findings go into a new "Independent review" section of this file; fixes are made in a later session.
+  - **Depth:**
+
+    | Depth | Specs | Why |
+    |---|---|---|
+    | Deepest | isa.md / `isa.yaml`, memmap.md, microarch.md interface tables | Least covered by executable checks; hardest to change once RTL exists |
+    | Model assumptions | hbm.md, noc.md, d2d_c2c.md | `hbm.py`, `noc.py` and `links.py` check them; review what the models assume, not their outputs |
+    | Lighter | numerics.md | Bit-accurate golden model and tests |
+    | Consistency only | arch.md, hyper_connections.md, model_descriptor.md | Frozen in Phase 1; reopen only for an actual error |
+
+  - **xhigh, only for two checks:** whether `rules()` in `sim/analytic/hbm.py` covers every DRAM timing constraint (it becomes the
+    reference for the Phase 4 timing checker), and the deadlock paths (R-3 partial acks, staged all-to-all) against noc.md §4.
 - **Real device numbers.** No JESD238 / vendor HBM3e timing, UCIe PHY latency, or SerDes latency was available. The model tables are
   the inputs to replace: `make hbm` and `make links` regenerate everything from them.

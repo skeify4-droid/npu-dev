@@ -213,7 +213,8 @@ experiments `make numerics`). **Step 3 done (2026-11-01):** HBM controller (`doc
   As built: CRC-32C + go-back-N on both links (required, not optional); no engine: hierarchical direct all-reduce and rail-staged
   all-to-all as DMA programs.
 - Exit: spec reviewed. `isa.yaml` generator emits SV/C++/Python. Every block has an interface table.
-  **Met (2026-11-01)** as a self-review; the independent Opus/xhigh pass on ISA + HBM (§5) is still recommended before Phase 3.
+  **Met (2026-11-01)** as a self-review. An independent review of the whole spec set is still recommended before Phase 3 RTL on
+  `core/dma`, `core/seq` and `hbm` (scope and settings: [spec_review.md](reports/spec_review.md), Not done).
 
 ### Phase 3: RTL, leaf and core blocks (L)
 | Block | Contents | Verification hook |
