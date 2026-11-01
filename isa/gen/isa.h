@@ -216,6 +216,25 @@ constexpr Field kNocHeader_mc_x1{115, 112};
 constexpr Field kNocHeader_mc_y0{118, 116};
 constexpr Field kNocHeader_mc_y1{121, 119};
 constexpr Field kNocHeader_rsv{127, 122};
+constexpr int kDmaListEntryBits = 256;
+constexpr Field kDmaListEntry_op{2, 0};
+constexpr Field kDmaListEntry_wsem{8, 3};
+constexpr Field kDmaListEntry_wval{40, 9};
+constexpr Field kDmaListEntry_src_td{48, 41};
+constexpr Field kDmaListEntry_dst_td{56, 49};
+constexpr Field kDmaListEntry_src{105, 57};
+constexpr Field kDmaListEntry_dst{154, 106};
+constexpr Field kDmaListEntry_wop{157, 155};
+constexpr Field kDmaListEntry_rsem{163, 158};
+constexpr Field kDmaListEntry_n{179, 164};
+constexpr Field kDmaListEntry_idx{201, 180};
+constexpr Field kDmaListEntry_mc_x0{183, 180};
+constexpr Field kDmaListEntry_mc_x1{187, 184};
+constexpr Field kDmaListEntry_mc_y0{190, 188};
+constexpr Field kDmaListEntry_mc_y1{193, 191};
+constexpr Field kDmaListEntry_val{195, 164};
+constexpr Field kDmaListEntry_mode{196, 196};
+constexpr Field kDmaListEntry_rsv{255, 202};
 enum class Dtype : uint16_t {
   FP32 = 0,
   BF16 = 1,
@@ -397,6 +416,13 @@ enum class FaultCause : uint16_t {
   PTE_INVALID = 11,
   LINK = 12,
   ERR_RSP = 13,
+};
+enum class ListOp : uint16_t {
+  COPY = 0,
+  GATHER = 1,
+  SCATTER = 2,
+  MCAST = 3,
+  SIGNAL = 4,
 };
 enum class NocType : uint16_t {
   RD_REQ = 0,

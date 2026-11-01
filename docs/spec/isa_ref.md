@@ -9,8 +9,8 @@ Generated from `isa/isa.yaml`; the programming model is in [isa.md](isa.md). Eve
 | Opcode | Name | Format | Description |
 |---|---|---|---|
 | 0x00 | `NOP` | S_NONE | No operation. |
-| 0x01 | `HALT` | S_NONE | Wait until every queue is empty and every write is acknowledged, then stop and raise the done interrupt. |
-| 0x02 | `FENCE` | S_FENCE | Stall the front end until the queues in qmask are empty and their writes are acknowledged. |
+| 0x01 | `HALT` | S_NONE | Wait until every queue is empty and every write is acknowledged (multicast writes: injected), then stop and raise the done interrupt. |
+| 0x02 | `FENCE` | S_FENCE | Stall the front end until the queues in qmask are empty and their writes are acknowledged (multicast writes: injected). |
 | 0x03 | `IRQ` | S_IRQ | Send an interrupt with code imm to the command processor. |
 | 0x08 | `LI` | S_RI | R[rd] = imm (64-bit). |
 | 0x09 | `ADD` | S_RRR | R[rd] = R[rs1] + R[rs2]. |
@@ -36,8 +36,8 @@ Generated from `isa/isa.yaml`; the programming model is in [isa.md](isa.md). Eve
 | 0x21 | `ST` | S_MEM | SPM[R[rs1] + imm] = R[rs2] (size as LD). |
 | 0x24 | `CSRR` | S_CSR | R[rd] = CSR[csr]. |
 | 0x25 | `CSRW` | S_CSR | CSR[csr] = R[rs1]. |
-| 0x28 | `SWAIT` | S_SEM | Stall the front end until sem[sem] >= R[rs1] + imm (unsigned 32-bit compare). |
-| 0x29 | `SSET` | S_SEM | sem[sem] = R[rs1] + imm. Only legal while no queued instruction references sem. |
+| 0x28 | `SWAIT` | S_SEM | Stall the front end until (int32)(sem[sem] - (R[rs1] + imm)) >= 0 (serial-number compare, isa.md section 3). |
+| 0x29 | `SSET` | S_SEM | sem[sem] = R[rs1] + imm. Only for semaphores that no other core or DMA rsem can add to (isa.md section 3); faults SEM_BUSY while a queued instruction references sem. |
 | 0x2A | `SINC` | S_SEM | sem[sem] += R[rs1] + imm, in program order with respect to the front end only. |
 
 ## DMA (queue DQ0-DQ3 from the dq field)
@@ -47,9 +47,9 @@ Generated from `isa/isa.yaml`; the programming model is in [isa.md](isa.md). Eve
 | 0x40 | `DMA_COPY` | T_DMA | Copy the tile described by (src_reg, src_td) to (dst_reg, dst_td), converting with cvt and writing with wop. Shapes must have the same element count; the destination TD sets the order. n_reg != 0 overrides the outermost count of both TDs. At most one operand may be GLOBAL (else TD_SPACE): the other is local (SPM, DTAB, IMEM), so read data always sinks locally (noc.md section 4 rule 2). At most one TD may be PAGED; its row (dim 1) is translated through the page table at SPM[R[pt_reg]] and its base register is a paged pointer (memmap.md section 6). Block formats: scales of a non-paged operand are at R[scale_reg] with row stride TD aux0; a PAGED operand's scales are in the scale region of the same page. ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0). FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload bytes to sem[rsem] of the core that owns the destination address once the data is written. |
 | 0x41 | `DMA_GATHER` | T_DMA | Row gather. src TD row_bytes = row size (any size, no alignment needed); the index list (int32 or int64 per IDX64) is at SPM[R[idx_reg]] with count from the dst TD outer dims or n_reg. Row i of the destination = source row index[i] (base = src_reg, row pitch = src TD s1). PAGED src: index[i] + the paged pointer's row is a logical row translated through the page table at SPM[R[pt_reg]]; block scales come from the same page. Operand spaces, conversions and scale operands as DMA_COPY (MXFP8 rows with SCALE_INLINE). Keeps up to dma_outstanding_reads granules in flight. |
 | 0x42 | `DMA_SCATTER` | T_DMA | Row scatter: source row i goes to destination row index[i]; wop applies (ADD_F32 for MoE combine into SRAM). Operand spaces as DMA_COPY; PAGED dst as DMA_GATHER's src. |
-| 0x43 | `DMA_MCAST` | T_DMAMC | Copy a local SPM tile to the same SPM offset (dst_reg, dst_td) in every core of the mesh rectangle x0..x1, y0..y1 of this die (XY-tree multicast in the network). rsem applies at each destination. |
-| 0x44 | `DMA_LIST` | T_DMAL | Execute R[n_reg] + imm DMA descriptors stored back to back at SPM[R[list_reg]] (each 32 B: an encoded DMA_COPY/GATHER/SCATTER/MCAST/SIGNAL operand block with absolute addresses instead of registers). Used for collective schedules and other precomputed transfer lists. Completion = all listed transfers complete. |
-| 0x45 | `SIGNAL` | T_SIG | After every earlier instruction in this DMA queue has completed (writes acknowledged), write to the semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it. Release semantics for producer/consumer hand-off across cores, dies and packages. |
+| 0x43 | `DMA_MCAST` | T_DMAMC | Copy a local SPM tile to the same SPM offset (dst_reg, dst_td) in every core of the mesh rectangle x0..x1, y0..y1 of this die (XY-tree multicast in the network). Writes are posted (no ack): the instruction completes when every packet is injected, so FENCE, HALT and SIGNAL order only the source buffer's reuse. rsem is required (S0 = ILLEGAL_FIELD) and is the only ordering of the data at a destination (isa.md section 3). |
+| 0x44 | `DMA_LIST` | T_DMAL | Execute R[n_reg] + imm entries stored back to back at SPM[R[list_reg]], 32 B each (layout dma_list_entry: COPY, GATHER, SCATTER, MCAST or SIGNAL with absolute addresses instead of registers, no conversion, no paging). Entries start in order; an entry with wsem != 0 starts only when sem[wsem] reaches wval (serial compare), and later entries wait behind it. Transfers of started entries may overlap. A SIGNAL entry releases every earlier entry and every earlier instruction of the queue. The list must not change until the instruction completes. Used for collective schedules and other precomputed transfer lists. Completion = all listed transfers complete. |
+| 0x45 | `SIGNAL` | T_SIG | After every earlier instruction in this DMA queue has completed (writes acknowledged; a multicast only injected), write to the semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it (runtime use only: kernels add, isa.md section 3). Release semantics for producer/consumer hand-off across cores, dies and packages. |
 
 ## MXU
 
@@ -159,6 +159,31 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 | `mc_y1` | [121:119] | MC_WR |
 | `rsv` | [127:122] | all |
 
+## DMA_LIST entry (32 B in SPM, isa.md section 5), 256 bits
+
+`op` selects the layout; a field marked with types is valid only for those types, so fields of disjoint type sets share bits.
+
+| Field | Bits | Valid for |
+|---|---|---|
+| `op` (`list_op`) | [2:0] | all |
+| `wsem` | [8:3] | all |
+| `wval` | [40:9] | all |
+| `src_td` | [48:41] | COPY, GATHER, MCAST, SCATTER |
+| `dst_td` | [56:49] | COPY, GATHER, MCAST, SCATTER |
+| `src` | [105:57] | COPY, GATHER, MCAST, SCATTER |
+| `dst` | [154:106] | COPY, GATHER, MCAST, SCATTER, SIGNAL |
+| `wop` (`wop`) | [157:155] | COPY, GATHER, SCATTER |
+| `rsem` | [163:158] | COPY, GATHER, MCAST, SCATTER |
+| `n` | [179:164] | COPY, GATHER, MCAST, SCATTER |
+| `val` | [195:164] | SIGNAL |
+| `idx` | [201:180] | GATHER, SCATTER |
+| `mc_x0` | [183:180] | MCAST |
+| `mc_x1` | [187:184] | MCAST |
+| `mc_y0` | [190:188] | MCAST |
+| `mc_y1` | [193:191] | MCAST |
+| `mode` | [196:196] | SIGNAL |
+| `rsv` | [255:202] | all |
+
 ## Enumerations
 
 - `dtype`: FP32 = 0, BF16 = 1, FP16 = 2, E4M3 = 3, E5M2 = 4, MXFP8 = 5, MXFP4 = 6, NVFP4 = 7, INT8 = 8, UINT8 = 9, INT16 = 10, INT32 = 11, INT64 = 12, E8M0 = 13, UINT32 = 14
@@ -180,4 +205,5 @@ Tile formats (T_) carry the sync block: `wsem` [119:114], `wreg` [113:109], `wim
 - `hc_post_func`: MHC = 0, GATED = 1
 - `csr`: CORE_ID = 0, NODE_ID = 1, CYCLE = 2, PC = 3, STATUS = 4, FAULT_CAUSE = 5, FAULT_ADDR = 6, FP_STATUS = 7, PERF_SEL = 16, PERF_CNT0 = 17, PERF_CNT1 = 18, SEM_BASE_GPA = 32
 - `fault_cause`: NONE = 0, ILLEGAL_OP = 1, ILLEGAL_FIELD = 2, TD_SPACE = 3, ADDR_UNMAPPED = 4, ADDR_FORBIDDEN = 5, RAIL = 6, RANGE = 7, HBM_WADD = 8, HBM_ALIGN = 9, SEM_BUSY = 10, PTE_INVALID = 11, LINK = 12, ERR_RSP = 13
+- `list_op`: COPY = 0, GATHER = 1, SCATTER = 2, MCAST = 3, SIGNAL = 4
 - `noc_type`: RD_REQ = 0, RD_RSP = 1, WR = 2, WR_ACK = 3, SEM = 4, MC_WR = 5, ERR = 6

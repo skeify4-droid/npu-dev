@@ -293,6 +293,13 @@ def unpack(isa, name, word):
     return out
 
 
+def sem_ready(value, target, bits=32):
+    """Semaphore wait condition (isa.md section 3): value has reached target in serial-number order, i.e.
+    (int32)(value - target) >= 0. Correct across wrap-around while |value - target| < 2^31."""
+    d = (value - target) & ((1 << bits) - 1)
+    return d < 1 << (bits - 1)
+
+
 def queue_of(isa, name, fields):
     q = isa["instructions"][name]["queue"]
     return f"DQ{fields['dq']}" if q == "DQ" else q

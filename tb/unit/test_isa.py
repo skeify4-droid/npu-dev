@@ -209,3 +209,28 @@ def test_td_paging_and_scale_fields(isa):
     assert "SCALE_REGION" in isa["enums"]["td_flags"]
     pp = I.layout_fields(isa, "paged_ptr")
     assert pp["node"]["bits"] == tuple(isa["memmap"]["node_field"])
+
+
+def test_dma_list_entry(isa):
+    """I-12(a): the 32 B DMA_LIST entry holds a full transfer with absolute addresses and an optional semaphore wait."""
+    f = {k: I.width(v["bits"]) for k, v in I.layout_fields(isa, "dma_list_entry").items()}
+    m = isa["machine"]
+    assert isa["dma_list_entry"]["bits"] == 8 * 32
+    assert f["src"] == f["dst"] == isa["memmap"]["gpa_bits"]
+    assert 1 << f["idx"] >= m["spm_bytes"]
+    assert f["n"] == I.width(isa["td"]["fields"]["n1"])
+    assert f["wval"] == f["val"] == m["sem_bits"] and 1 << f["wsem"] >= m["semaphores"]
+    assert 1 << f["src_td"] >= m["td_entries"] and 1 << f["rsem"] >= m["semaphores"]
+    mc = I.fmt_fields(isa, "T_DMAMC")
+    assert [f[k] for k in ("mc_x0", "mc_x1", "mc_y0", "mc_y1")] == [I.width(mc[k]) for k in ("x0", "x1", "y0", "y1")]
+    assert set(isa["enums"]["list_op"]) == {"COPY", "GATHER", "SCATTER", "MCAST", "SIGNAL"}
+    w = I.pack(isa, "dma_list_entry", op="SIGNAL", wsem=5, wval=0xFFFFFFF0, dst=(3 << 42) | 0x20020012100, val=2048, mode=0)
+    assert I.unpack(isa, "dma_list_entry", w)["val"] == 2048
+
+
+def test_semaphore_serial_compare():
+    """I-4: waits compare as serial numbers, so byte-counting semaphores may wrap past 2^32."""
+    assert I.sem_ready(5, 5) and I.sem_ready(6, 5) and not I.sem_ready(4, 5)
+    assert I.sem_ready(0x00000010, 0xFFFFFFF0)              # wrapped past the target
+    assert not I.sem_ready(0xFFFFFFF0, 0x00000010)          # not there yet across the wrap
+    assert not I.sem_ready(0, 1 << 31) and I.sem_ready(0, (1 << 31) + 1)   # the 2^31 window

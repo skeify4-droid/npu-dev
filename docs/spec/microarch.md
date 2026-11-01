@@ -66,6 +66,10 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
 - In-order scalar unit, one instruction per cycle from IMEM (64 KiB = 4096 instructions; overlays by DMA into IMEM).
 - Scalar instructions, branches and `SWAIT/SSET/SINC` execute in the front end. Tile instructions read their register operands at
   issue and enter one of six queues (DQ0-DQ3, MQ, VQ). The queued copy is self-contained, so later register writes do not affect it.
+  - What is captured *(review finding I-11)*: the 128-bit instruction, every register operand of its format (8 for `T_DMA`, 6 for
+    `T_MXU` and `T_VPU`, 2 for the other DMA formats) and the 32-bit wait value `R[wreg]`. A DQ entry is 128 + 8 x 64 + 32 = 672
+    bits, an MQ / VQ entry 544 bits: about 7.5 KiB of queue storage per core.
+  - Tile descriptors are not captured: engines read DTAB when an instruction starts (isa.md §4).
 - Engines execute their queue in order. Cross-queue ordering comes only from semaphores (isa.md §3).
   - DMA queues may overlap consecutive transfers.
   - MQ and VQ instructions see the memory effects of earlier instructions in the same queue.
@@ -225,7 +229,7 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | imem_rd | out/in | addr 12, data 128 | 1-cycle SRAM | instruction fetch |
-| q_push[6] | out | 1 + 128 + 6 x 64 (instruction + captured registers) | valid/ready | issue to DQ0-3, MQ, VQ |
+| q_push[6] | out | instruction 128 + captured registers (DQ: 8 x 64; MQ, VQ: 6 x 64) + wait value 32 | valid/ready | issue to DQ0-3, MQ, VQ |
 | sem_if | in/out | 64 x 32 | register file, 1 write port per engine + network | wait conditions, signals |
 | spm_scalar | out/in | addr 22, data 64 | valid/ready | `LD` / `ST` |
 | csr_if | in/out | addr 12, data 64 | 1-cycle | CSRs |
@@ -248,6 +252,7 @@ Conventions:
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
 | q_pop | in | instruction + operands | valid/ready | MQ |
+| dtab_rd | out/in | idx 8, data 256 | 1-cycle, arbitrated | `a_td`, `w_td` when an instruction starts (review finding I-11) |
 | a_rd | out/in | 256 B/cycle | valid/ready | A rows from SPM |
 | w_rd | out/in | 512 B/cycle | valid/ready | stationary loads |
 | scale_rd | out/in | 64 B/cycle | valid/ready | rowscale / colscale |
@@ -268,7 +273,7 @@ Conventions:
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| rd_req / rd_rsp [clients] | in/out | addr 22 + 64 B lanes | valid/ready, fixed-latency response | MXU A, MXU W, VPU x2, DMA, NI target, scalar |
+| rd_req / rd_rsp [clients] | in/out | addr 22 + 64 B lanes | valid/ready, fixed-latency response | MXU A, MXU W, MXU scales (`scale_rd`), VPU x2, DMA, NI target, scalar |
 | wr_req [clients] | in | addr 22, 64 B lanes, byte mask | valid/ready | VPU, DMA, NI target, scalar |
 
 **Network interface (`core/ni`)**
@@ -316,6 +321,13 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 |---|---|---|---|---|
 | noc | in/out | flit_t | credit per VC | router port 6 |
 | sem_add | out | 6 + 32 | pulse | to the tile's semaphore file |
+
+**DTAB (`core/dtab`)**, 256 x 256 bits
+
+| Port | Dir | Width | Protocol | Purpose |
+|---|---|---|---|---|
+| rd | in/out | idx 8, data 256 | one read per cycle, round-robin over DMA, MXU, VPU, 1-cycle | TDs at instruction start |
+| wr | in | 32 B | valid/ready | DMA (space `DTAB`) and CORECTL writes; ordered by software (isa.md §4) |
 
 **Accumulator (`core/acc`)**, 2048 rows x 64 FP32, shared by the MXU and the VPU
 

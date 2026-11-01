@@ -107,7 +107,7 @@ leaf (hbm.md H-1).
 | Offset | Size | Contents |
 |---|---|---|
 | `0x00000` | 64 KiB | IMEM (4,096 instructions); writable while the core is stopped, or by DMA overlay followed by `FENCE` |
-| `0x10000` | 8 KiB | DTAB: 256 tile descriptors x 32 B |
+| `0x10000` | 8 KiB | DTAB: 256 tile descriptors x 32 B; read by an engine when an instruction starts, so DMA updates follow isa.md §4 |
 | `0x12000` | 256 B | semaphores 0-63, 32-bit: a write sets, a read returns the value |
 | `0x12100` | 256 B | semaphore add window: a write (or DMA `ADD`) adds; this is what `SIGNAL` and `rsem` use |
 | `0x13000` | 4 KiB | CSRs (isa.yaml `csr` enum, 8 B each), plus `START` (write the PC to start) and `STOP` |
@@ -182,8 +182,8 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 - The network does not order packets, even between the same two endpoints: planes and virtual channels are chosen per packet.
 - Programs get ordering from three mechanisms only:
   1. **Write acknowledgements.** `SIGNAL`, `FENCE` and `HALT` wait for every earlier write of their scope to be acknowledged, which gives
-     release semantics.
+     release semantics. Multicast writes are posted: these wait only for their injection (isa.md §3).
   2. **Byte-counting semaphores.** A write with `rsem` adds its payload size to the destination core's semaphore after the data is
      written. A consumer waiting for `>= bytes` sees all the data regardless of arrival order (put-with-signal).
-  3. **Reads after a semaphore wait** see every write that the semaphore accounted for.
+  3. **Reads after a semaphore wait** see every write that the semaphore accounted for. This is the only ordering of multicast data.
 - There are no caches, so there is nothing to keep coherent.

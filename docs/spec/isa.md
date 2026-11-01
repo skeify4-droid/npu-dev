@@ -27,24 +27,39 @@ Each core runs its own program from a 64 KiB instruction memory.
 |---|---|---|
 | R0-R31 | 64-bit | R0 reads zero; addresses, loop counters, packed FP32 parameters |
 | PC | 12-bit instruction index | |
-| S1-S63 | 32-bit unsigned | S0 encodes "no semaphore" in sync fields |
-| DTAB | 256 x 32 B tile descriptors | loaded with the program image, or by DMA (space `DTAB`) |
+| S1-S63 | 32-bit counters, compared as serial numbers (§3) | S0 encodes "no semaphore" in sync fields |
+| DTAB | 256 x 32 B tile descriptors | loaded with the program image, or by DMA (space `DTAB`) with the ordering rule of §4 |
 | CSRs | `isa.yaml` enum `csr` | core id, node id, cycle counter, fault cause/address, perf counters |
 | IMEM | 4,096 x 128-bit | written by the CP or by DMA overlays (space `IMEM`) followed by `FENCE` |
 
 ## 3. Synchronization
 
 Every tile instruction carries a sync block:
-- `wsem`, `wreg`, `wimm`: start only when `sem[wsem] >= R[wreg] + wimm` (unsigned 32-bit).
+- `wsem`, `wreg`, `wimm`: start only when sem[wsem] has reached `T = R[wreg] + wimm`, i.e. `(int32)(sem[wsem] - T) >= 0`
+  (serial-number compare, review finding I-4; `isa.sem_ready` is the reference). `SWAIT` uses the same compare.
 - `ssem`, `sinc`: `sem[ssem] += sinc` when the instruction's effects are complete:
   - **MXU:** ACC written.
   - **VPU:** destinations written.
-  - **DMA:** every write is acknowledged, or for a read every byte is in SPM.
+  - **DMA:** every write is acknowledged, or for a read every byte is in SPM. A `DMA_MCAST` completes when every packet is
+    injected (below).
 
 Rules:
-- Semaphores are **monotonic counters inside a kernel**: the front end resets them with `SSET` at kernel start, and they only grow.
+- Semaphores are **monotonic counters**. Counts wrap modulo 2^32, and the serial compare stays correct across the wrap as long as a
+  wait's target is less than 2^31 ahead of the value. A byte-counting semaphore can therefore count any total (a 32K-token prefill
+  puts about 2.6 GB through one all-reduce semaphore) provided no single wait spans 2 GiB.
   - A ping-pong pipeline over iteration i waits for "filled >= i + 1" and "freed >= i - 1". No decrement races are possible.
-  - 32 bits cover 4 G events per kernel.
+- **Two kinds of semaphore** (the compiler assigns them):
+  - **Local:** only this core's engines and `SINC` change it. `SSET` may reset it, and faults `SEM_BUSY` while a queued instruction
+    references it.
+  - **Network-facing:** any semaphore that `rsem`, `SIGNAL` or a remote write can reach. It is **never reset while any core is
+    running**, because adds from other cores may be in flight and nothing orders them against `SSET`. The CP zeroes these only at a
+    quiescent point (boot, or a restart after a fault, with every core stopped and the links drained). Using `SSET` or `SIGNAL`
+    mode 1 on one in a kernel is a program error; the golden model flags it.
+- **Kernel boundaries.** A kernel's wait targets on a network-facing semaphore are `base + count`, where `base` is the value after
+  every add of the previous kernel has landed: the previous kernel's final wait target, which the program or the runtime carries
+  forward (the CP writes it into SPM with the launch arguments). Reading the live value would not do, because adds of the next kernel
+  from a faster producer may already have arrived. Totals per kernel are fixed at compile time, so the carried base is exact.
+  - Rejected: a kernel-boundary barrier before `SSET`, which would need a system-wide quiescence point every kernel.
 - The register value in a wait condition is captured at issue, so loop counters work directly.
 - **Same queue:**
   - MQ and VQ instructions see the memory effects of earlier instructions in the same queue.
@@ -59,6 +74,16 @@ Rules:
   - `SIGNAL` adds to any semaphore in the system after all earlier transfers of its DMA queue are acknowledged (release).
   - A DMA with `rsem` adds its payload byte count to the destination core's semaphore, packet by packet (put-with-signal, no ordering
     needed).
+- **Multicast *(review finding I-5)*:** `MC_WR` packets are posted, with no acknowledgement (noc.md §2). So:
+  - A `DMA_MCAST` completes, and `FENCE`, `HALT` and `SIGNAL` treat it as done, once every packet is **injected**. That frees the
+    source buffer; it says nothing about delivery.
+  - The data is ordered at each destination only by its `rsem`, which is therefore required (`ILLEGAL_FIELD` if S0). A `SIGNAL`
+    after a multicast is not a release of the multicast data.
+  - Each destination program waits for the full byte count of every multicast it is sent before it halts. Then all multicast data of
+    a kernel has landed when every core of the kernel has halted, which is what the CP waits for before it reads results or loads the
+    next kernel.
+  - Rejected: per-destination acks. A full-die rectangle returns 32 ack flits per 16-flit burst to the source, so acks would halve the
+    multicast rate at the source's ejection port.
 
 ## 4. Tile descriptors
 
@@ -76,6 +101,14 @@ Rules:
   - Shapes repeat across loop iterations while bases change.
   - So shapes live in DTAB, set up once per kernel, and the 128-bit instruction carries only register indices.
 - Dynamic sizes (tokens per expert, a ragged last tile) come from the `n_reg` / `m_reg` override of the outermost count.
+- **When a TD is read** *(review finding I-11)*: an engine reads its TDs from DTAB when it starts an instruction, not at issue, so a
+  queued instruction sees DTAB as it is when it starts. DTAB updates are therefore ordered like IMEM overlays:
+  - before a DMA writes DTAB entry e, `FENCE` the queues that hold instructions naming e (or wait on their completion semaphores);
+  - before issuing an instruction that names the new e, wait on the DTAB-writing DMA's completion (`ssem`, or `FENCE`).
+  - The hardware does not check this; the golden model's race checker does (as for SPM, §3). DTAB rewrites are rare (kernel setup),
+    so the rule costs nothing in practice.
+  - Rejected: capturing TD contents at issue. Queue entries would grow by 512-1,024 bits each (about 15 KiB per core) and the front
+    end would need up to 4 DTAB reads per cycle.
 
 ## 5. Instruction classes
 
@@ -108,8 +141,16 @@ Rules:
 
 - `DMA_GATHER` / `DMA_SCATTER`: row lists with any row size and int32/int64 indices. Optional page translation of the row index, so
   sparse-attention KV blocks and paged caches gather in one instruction.
-- `DMA_MCAST`: one SPM tile to the same offset in a rectangle of cores.
+- `DMA_MCAST`: one SPM tile to the same offset in a rectangle of cores. Posted: complete when injected, ordered at the destinations
+  only by `rsem` (§3).
 - `DMA_LIST`: a precomputed list of transfers in SPM. Collective schedules and MoE all-to-all are lists.
+  - Each entry is 32 B, `isa.yaml` `dma_list_entry` (review finding I-12(a)): `COPY`, `GATHER`, `SCATTER`, `MCAST` or `SIGNAL`, with
+    absolute addresses, TD indices, `wop`, `rsem` and a count override. Entries carry no conversion and no paging.
+  - **An entry can wait on a semaphore** (`wsem`, `wval`, serial compare). Entries start in order, so a waiting entry holds the ones
+    behind it, but transfers already started keep going. This is what the per-chunk forward of the staged all-to-all needs
+    (d2d_c2c.md L-7): one `DMA_LIST` of chunk forwards, each waiting on its chunk's count, takes one queue slot instead of one per
+    chunk.
+  - A `SIGNAL` entry releases every earlier entry of the list and every earlier instruction of the queue.
 - `SIGNAL`: remote semaphore add/set with release semantics.
 - **Block-scale contract:**
   - Converting MXFP4 / NVFP4 / MXFP8 to E4M3 writes the elements plus one FP32 **column scale** per (output row of the weight,
@@ -200,7 +241,8 @@ A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and 
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
 - an invalid page-table entry in paged DMA;
 - a D2D/C2C link going down with transfers outstanding (d2d_c2c.md L-4);
-- an `SSET` on a semaphore that queued instructions reference.
+- an `SSET` on a semaphore that queued instructions reference (`SEM_BUSY`);
+- a `DMA_MCAST` without `rsem` (`ILLEGAL_FIELD`).
 
 Floating-point exceptions do not trap. NaN/Inf/saturation behavior is defined in numerics.md.
 

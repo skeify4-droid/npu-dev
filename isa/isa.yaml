@@ -7,7 +7,7 @@ word_bits: 128
 machine:
   scalar_regs: 32          # R0 reads as zero
   scalar_bits: 64
-  semaphores: 64           # per core, 32-bit unsigned; S0 means "none" in sync fields
+  semaphores: 64           # per core, 32-bit; waits compare as serial numbers (isa.md section 3); S0 means "none"
   sem_bits: 32
   td_entries: 256          # tile descriptors per core (DTAB)
   td_bytes: 32
@@ -196,6 +196,12 @@ enums:
     PTE_INVALID: 11    # paged DMA hit a PTE with valid = 0
     LINK: 12           # a D2D / C2C link went down with this core's transfers outstanding (d2d_c2c.md L-4)
     ERR_RSP: 13        # a target returned ERR for another reason
+  list_op:             # DMA_LIST entry kinds (dma_list_entry.op)
+    COPY: 0
+    GATHER: 1
+    SCATTER: 2
+    MCAST: 3
+    SIGNAL: 4
   noc_type:            # NoC packet types (noc.md section 2); REQ VN: RD_REQ, WR, SEM, MC_WR; RSP VN: RD_RSP, WR_ACK, ERR
     RD_REQ: 0
     RD_RSP: 1
@@ -224,6 +230,31 @@ td:
     sc_off: [243, 232]  # PAGED block formats: offset of the page's scale region, in 256 B units (memmap.md section 6)
     page_shift: [248, 244]  # PAGED: log2(rows per page)
     rsv:   [255, 249]
+
+# DMA_LIST entry, 32 B in SPM (isa.md section 5). `op` selects the layout. Addresses are absolute (GPA, or an SPM offset for an
+# SPM operand, as the TD space says). Entries carry no conversion and no paging: those use DMA_COPY / DMA_GATHER directly.
+dma_list_entry:
+  bits: 256
+  select: op
+  fields:
+    op:     {bits: [2, 0], enum: list_op}
+    wsem:   {bits: [8, 3]}                 # start when (int32)(sem[wsem] - wval) >= 0; 0 = no wait (review I-12(a), L-7)
+    wval:   {bits: [40, 9]}
+    src_td: {bits: [48, 41], types: [COPY, GATHER, SCATTER, MCAST]}
+    dst_td: {bits: [56, 49], types: [COPY, GATHER, SCATTER, MCAST]}
+    src:    {bits: [105, 57], types: [COPY, GATHER, SCATTER, MCAST]}
+    dst:    {bits: [154, 106], types: [COPY, GATHER, SCATTER, MCAST, SIGNAL]}   # SIGNAL: the semaphore's GPA
+    wop:    {bits: [157, 155], types: [COPY, GATHER, SCATTER], enum: wop}
+    rsem:   {bits: [163, 158], types: [COPY, GATHER, SCATTER, MCAST]}
+    n:      {bits: [179, 164], types: [COPY, GATHER, SCATTER, MCAST]}         # outermost count override (0: from the TD)
+    idx:    {bits: [201, 180], types: [GATHER, SCATTER]}                      # SPM offset of the index list
+    mc_x0:  {bits: [183, 180], types: [MCAST]}
+    mc_x1:  {bits: [187, 184], types: [MCAST]}
+    mc_y0:  {bits: [190, 188], types: [MCAST]}
+    mc_y1:  {bits: [193, 191], types: [MCAST]}
+    val:    {bits: [195, 164], types: [SIGNAL]}                               # value to add (mode 0) or set (mode 1)
+    mode:   {bits: [196, 196], types: [SIGNAL]}
+    rsv:    {bits: [255, 202]}
 
 # Base register of a PAGED operand (memmap.md section 6). Generated like the TD.
 paged_ptr:
@@ -265,7 +296,7 @@ noc_header:
 
 # Field layouts. Every tile-queue format starts with the sync block; front-end formats leave it zero.
 sync:
-  wsem: [119, 114]     # wait until sem[wsem] >= R[wreg] + wimm before starting (S0 = no wait)
+  wsem: [119, 114]     # wait until (int32)(sem[wsem] - (R[wreg] + wimm)) >= 0 before starting (S0 = no wait)
   wreg: [113, 109]
   wimm: [108, 101]     # signed
   ssem: [100, 95]      # sem[ssem] += sinc when the instruction's effects are complete (S0 = none)
@@ -370,8 +401,8 @@ field_types:
 instructions:
   # ---- front end: control and scalar
   NOP:    {op: 0x00, fmt: S_NONE, queue: FE, desc: "No operation."}
-  HALT:   {op: 0x01, fmt: S_NONE, queue: FE, desc: "Wait until every queue is empty and every write is acknowledged, then stop and raise the done interrupt."}
-  FENCE:  {op: 0x02, fmt: S_FENCE, queue: FE, desc: "Stall the front end until the queues in qmask are empty and their writes are acknowledged."}
+  HALT:   {op: 0x01, fmt: S_NONE, queue: FE, desc: "Wait until every queue is empty and every write is acknowledged (multicast writes: injected), then stop and raise the done interrupt."}
+  FENCE:  {op: 0x02, fmt: S_FENCE, queue: FE, desc: "Stall the front end until the queues in qmask are empty and their writes are acknowledged (multicast writes: injected)."}
   IRQ:    {op: 0x03, fmt: S_IRQ, queue: FE, desc: "Send an interrupt with code imm to the command processor."}
   LI:     {op: 0x08, fmt: S_RI, queue: FE, desc: "R[rd] = imm (64-bit)."}
   ADD:    {op: 0x09, fmt: S_RRR, queue: FE, desc: "R[rd] = R[rs1] + R[rs2]."}
@@ -397,8 +428,8 @@ instructions:
   ST:     {op: 0x21, fmt: S_MEM, queue: FE, desc: "SPM[R[rs1] + imm] = R[rs2] (size as LD)."}
   CSRR:   {op: 0x24, fmt: S_CSR, queue: FE, desc: "R[rd] = CSR[csr]."}
   CSRW:   {op: 0x25, fmt: S_CSR, queue: FE, desc: "CSR[csr] = R[rs1]."}
-  SWAIT:  {op: 0x28, fmt: S_SEM, queue: FE, desc: "Stall the front end until sem[sem] >= R[rs1] + imm (unsigned 32-bit compare)."}
-  SSET:   {op: 0x29, fmt: S_SEM, queue: FE, desc: "sem[sem] = R[rs1] + imm. Only legal while no queued instruction references sem."}
+  SWAIT:  {op: 0x28, fmt: S_SEM, queue: FE, desc: "Stall the front end until (int32)(sem[sem] - (R[rs1] + imm)) >= 0 (serial-number compare, isa.md section 3)."}
+  SSET:   {op: 0x29, fmt: S_SEM, queue: FE, desc: "sem[sem] = R[rs1] + imm. Only for semaphores that no other core or DMA rsem can add to (isa.md section 3); faults SEM_BUSY while a queued instruction references sem."}
   SINC:   {op: 0x2A, fmt: S_SEM, queue: FE, desc: "sem[sem] += R[rs1] + imm, in program order with respect to the front end only."}
 
   # ---- DMA (queue DQ<dq>)
@@ -440,23 +471,29 @@ instructions:
     queue: DQ
     desc: >-
       Copy a local SPM tile to the same SPM offset (dst_reg, dst_td) in every core of the mesh rectangle
-      x0..x1, y0..y1 of this die (XY-tree multicast in the network). rsem applies at each destination.
+      x0..x1, y0..y1 of this die (XY-tree multicast in the network). Writes are posted (no ack): the instruction
+      completes when every packet is injected, so FENCE, HALT and SIGNAL order only the source buffer's reuse. rsem is
+      required (S0 = ILLEGAL_FIELD) and is the only ordering of the data at a destination (isa.md section 3).
   DMA_LIST:
     op: 0x44
     fmt: T_DMAL
     queue: DQ
     desc: >-
-      Execute R[n_reg] + imm DMA descriptors stored back to back at SPM[R[list_reg]] (each 32 B: an encoded
-      DMA_COPY/GATHER/SCATTER/MCAST/SIGNAL operand block with absolute addresses instead of registers). Used for
-      collective schedules and other precomputed transfer lists. Completion = all listed transfers complete.
+      Execute R[n_reg] + imm entries stored back to back at SPM[R[list_reg]], 32 B each (layout dma_list_entry:
+      COPY, GATHER, SCATTER, MCAST or SIGNAL with absolute addresses instead of registers, no conversion, no paging).
+      Entries start in order; an entry with wsem != 0 starts only when sem[wsem] reaches wval (serial compare), and
+      later entries wait behind it. Transfers of started entries may overlap. A SIGNAL entry releases every earlier
+      entry and every earlier instruction of the queue. The list must not change until the instruction completes.
+      Used for collective schedules and other precomputed transfer lists. Completion = all listed transfers complete.
   SIGNAL:
     op: 0x45
     fmt: T_SIG
     queue: DQ
     desc: >-
-      After every earlier instruction in this DMA queue has completed (writes acknowledged), write to the
-      semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it. Release semantics
-      for producer/consumer hand-off across cores, dies and packages.
+      After every earlier instruction in this DMA queue has completed (writes acknowledged; a multicast only
+      injected), write to the semaphore at global address R[addr_reg]: mode 0 adds R[val_reg] + imm, mode 1 sets it
+      (runtime use only: kernels add, isa.md section 3). Release semantics for producer/consumer hand-off across
+      cores, dies and packages.
 
   # ---- MXU (queue MQ)
   MXU_MM:
