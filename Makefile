@@ -12,6 +12,8 @@ ifneq ($(wildcard $(ENV_SETUP)/env.sh),)
   export EDA_HOME
   export PATH := $(EDA_HOME)/venv/bin:$(PATH)
 endif
+# SymbiYosys lives under EDA_HOME/tools (not on the default PATH).
+export PATH := $(EDA_HOME)/tools/sby/bin:$(PATH)
 
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
@@ -74,16 +76,26 @@ isa:
 fetch-models:
 	scripts/fetch_configs.sh
 
-formal:
-	@echo "formal: no properties yet (tb/formal empty)"
+# Formal: every tb/formal/*.sby (all of its tasks), SymbiYosys with yices. Work in build/formal/<name>.
+FORMAL_SBY := $(wildcard tb/formal/*.sby)
+formal: $(BUILD)
+	@test -n "$(FORMAL_SBY)" || { echo "formal: no .sby files"; exit 0; }
+	@for f in $(FORMAL_SBY); do \
+	  name=$$(basename $$f .sby); \
+	  echo "== formal $$name"; \
+	  (cd tb/formal && $(ROOT)/scripts/memrun formal_$$name sby -f --prefix $(BUILD)/formal/$$name $$(basename $$f)) >/dev/null || { tail -30 logs/formal_$$name.log; echo "formal FAILED: $$name"; exit 1; }; \
+	  echo "   $$(grep -c 'DONE (PASS' logs/formal_$$name.log) tasks PASS"; \
+	done
+	@echo "formal: ALL PASS"
 
 e2e:
 	@echo "e2e: needs compiler and TINY config (Phase 3+)"
 
-# Synthesis of one block with Yosys (native). Usage: make syn BLOCK=trivial_add
+# Synthesis of one block with Yosys (native). Usage: make syn BLOCK=trivial_add [PARAMS="WIDTH=32 DEPTH=8"]
+# PARAMS overrides top-level parameters (chparam); the log is logs/syn_<BLOCK>.log (cell counts at the end).
 syn: $(BUILD)
-	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module>"; exit 2; }
-	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -sv $(RTL_DIR)/common/$(BLOCK).sv; synth -top $(BLOCK) -flatten; stat" 
+	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module> [PARAMS=\"P=v ...\"]"; exit 2; }
+	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -sv $(RTL_DIR)/common/$(BLOCK).sv; hierarchy -top $(BLOCK); $(foreach p,$(PARAMS),chparam -set $(word 1,$(subst =, ,$(p))) $(word 2,$(subst =, ,$(p))) $(BLOCK); )synth -top $(BLOCK) -flatten; tee -o $(BUILD)/syn_$(BLOCK).stat stat; stat" 
 
 $(BUILD):
 	mkdir -p $(BUILD)

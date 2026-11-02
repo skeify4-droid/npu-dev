@@ -1,0 +1,51 @@
+# fifo: counts / handshake safety (bmc + k-induction) and ordering of a tagged entry (bmc), several depths.
+[tasks]
+cnt_d1_reg  cnt  d1
+cnt_d3_reg  cnt  d3
+cnt_d4_reg  cnt  d4
+cnt_d4_ft   cnt  d4 ft
+cnt_d5_ft   cnt  d5 ft
+cnt_d1_ft   cnt  d1 ft
+ord_d1_reg  ord  d1
+ord_d3_reg  ord  d3
+ord_d4_reg  ord  d4
+ord_d4_ft   ord  d4 ft
+ord_d3_ft   ord  d3 ft
+ord_d1_ft   ord  d1 ft
+cov_d4_reg  cov  d4
+cov_d4_ft   cov  d4 ft
+cov_d3_ord  covo d3
+cov_d4_ord  covo d4
+
+[options]
+cnt: mode prove
+cnt: depth 10
+ord: mode prove
+ord: depth 24
+cov: mode cover
+cov: depth 20
+covo: mode cover
+covo: depth 24
+
+[engines]
+cnt: smtbmc yices
+ord: abc pdr
+cov: smtbmc yices
+covo: smtbmc yices
+
+[script]
+d1: read -define FDEPTH=1
+d3: read -define FDEPTH=3
+d4: read -define FDEPTH=4
+d5: read -define FDEPTH=5
+ft: read -define FFT=1
+read -formal fifo.sv
+read -formal fifo_formal.sv
+cnt: prep -top fifo_formal_cnt
+cov: prep -top fifo_formal_cnt
+ord: prep -top fifo_formal_order
+covo: prep -top fifo_formal_order
+
+[files]
+../../rtl/common/fifo.sv
+fifo_formal.sv
