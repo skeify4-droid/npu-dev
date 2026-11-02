@@ -12,21 +12,74 @@
 //   DEPTH  entries, a power of two >= 2 (default 8); anything else is an elaboration error
 //
 // Resets
-//   - wr_rst_n and rd_rst_n are raw asynchronous, active-low resets; either one resets the whole FIFO. Their AND asserts
-//     the reset of both domains at once (asynchronously), and each domain releases through its own two-flop reset
-//     synchronizer: a domain leaves reset on the second of its clock edges after both inputs are high. So the resets
-//     need no ordering, overlap or synchronous release from the integrator, and a reset of one side alone (for example
-//     a clk_mc domain reset by the HBM controller) clears both pointers together.
-//   - A reset of either side drops the words in flight. wr_ready and rd_valid are 0 while their domain is in reset.
+//   - wr_rst_n and rd_rst_n are raw asynchronous, active-low resets; either one resets the whole FIFO. Their AND
+//     (arst_n) asserts the reset of both domains at once (asynchronously), and each domain releases through its own
+//     two-flop reset synchronizer: a domain leaves reset on the second of its clock edges after both inputs are high.
+//     So the release needs no ordering, overlap or synchronous timing from the integrator, and a reset of one side
+//     alone clears both pointers together, under the reset-domain rule below.
+//   - A reset of either side drops the words in flight. wr_ready and rd_valid are 0 while their domain is in reset. A
+//     word pushed while the read domain is still leaving reset is kept.
 //   - Storage is not reset. rd_data is undefined while rd_valid is 0.
+//   - Reset-domain rule. A one-sided reset is a reset-domain crossing. Asserting either input clears both domains'
+//     pointers, and with them wr_ready, rd_valid and rd_data, asynchronously: at any time relative to each domain's
+//     clock, not on its edges. So across every assertion of either input, the logic on each side (what drives wr_valid
+//     / rd_ready and samples wr_ready / rd_valid / rd_data) must be either
+//       (a) in reset itself, asserted no later than the FIFO input (its release is free), or
+//       (b) idle: wr_valid (rd_ready) is 0 and no flop samples wr_ready (rd_valid, rd_data) or anything derived from
+//           them, from before the assertion until its FIFO domain has left reset (two of its clock edges after both
+//           inputs are high).
+//     For the side whose own reset is the asserted input, (a) is the usual wiring; the other side is the crossing.
+//     Otherwise its consumer can capture rd_valid = 1 with rd_data a mix of two entries (a word that was never
+//     pushed), or go metastable with no synchronizer behind it. Neither formal nor the unit tb can see this (both model
+//     the reset as a clean step), so it is an integration rule.
+//   - The side that is not reset has no port that says its words were dropped: wr_ready low looks like full, rd_valid
+//     low like empty. A requester that tracks outstanding words (a tag table waiting for responses) must be reset with
+//     the FIFO, as in (a), or be told by a separate signal. Open: the HBM controller's clk_mc reset sequence
+//     (hbm.md has one rst_n; status note, Phase 3 open question 9).
 //
-// Clock-domain crossings (constraints for STA, Phase 6). Three paths cross, all need a max delay, none a false path:
-//   - wgray -> wgray_r1 and rgray -> rgray_w1: set_max_delay -datapath_only of about one launching-clock period and a
-//     bus-skew limit below one period. A false path would let bits of successive increments arrive out of order, so
-//     a synchronizer could capture a code two steps away (a pointer value that never existed).
-//   - mem -> rd_data (written in wr_clk, read through the read mux into rd_clk logic): the same max delay. The data must
-//     settle before the write pointer that covers it has passed both synchronizer flops.
-//   - the raw resets into the other domain's reset synchronizer (asynchronous assertion only; release is synchronized).
+// Clock-domain crossings: constraints for STA in Phase 6. Command options are checked against the OpenSTA in the pinned
+// OpenROAD (18f08d7); nothing here is checked by simulation, lint or formal. T_wr / T_rd are the clock periods, U the
+// clock uncertainty of both domains. Every wr_clk <-> rd_clk path of this block is one of the paths below.
+//   - Never set_clock_groups (-asynchronous or -exclusive) on wr_clk / rd_clk and never set_false_path between them
+//     (-from / -to either clock, with or without -setup / -hold). In this OpenSTA an -asynchronous clock group or a
+//     false path removes the set_max_delay below without a warning (the path turns unconstrained; after a clock group,
+//     set_max_delay -reset_path does not restore it); a -hold false path removes the set_min_delay.
+//   - Gray pointers, wgray -> wgray_r1 and rgray -> rgray_w1:
+//       set_max_delay -ignore_clock_latency -from <wgray regs> -to <wgray_r1 regs> T_wr      (rgray -> rgray_w1: T_rd)
+//       set_min_delay -ignore_clock_latency -from <wgray regs> -to <wgray_r1 regs> 0        (likewise)
+//     The max delay includes the capture flop's setup. Each bit then arrives within one launching period of its change
+//     and not before it, so the bits of two successive increments cannot overtake one another and a synchronizer never
+//     captures a code two steps away (a pointer value that never existed). That is the whole bus-skew requirement: no
+//     separate skew check is needed (this OpenSTA has no bus-skew command). The min delay replaces the cross-clock hold
+//     check, which has no meaning between unrelated clocks.
+//   - mem -> rd_data: the array is written in wr_clk and read through the DEPTH:1 read mux; the endpoint is the
+//     consumer's register outside this block. A word is used two rd_clk edges after the edge that captured its write
+//     pointer in wgray_r1 at the earliest, so the budget from a mem register's clock pin to the consumer's D (setup
+//     included) is 2 * T_rd - U; the Gray crossing's own delay only adds slack.
+//       top level:   set_max_delay -ignore_clock_latency -from <mem regs> -through <rd_data pins>
+//                      -to <rd_clk regs> 2*T_rd-U
+//       block level: set_max_delay -ignore_clock_latency -from <mem regs> -to [get_ports rd_data*]
+//                      <2*T_rd-U minus the consumer's share>
+//       and set_min_delay -ignore_clock_latency ... 0 on the same paths.
+//     rbin -> read mux -> rd_data is an ordinary rd_clk path and stays under normal timing (-from <mem regs> leaves it
+//     out).
+//   - Reset paths. arst_n (the wr_rst_n & rd_rst_n gate) releases asynchronously to both clocks and asserts
+//     asynchronously by design (reset-domain rule above). The only exception, scoped to that net:
+//       set_false_path -through <arst_n net>
+//     It removes recovery / removal at the clear pins of the four reset-synchronizer flops (wr_rs0, wrst_n, rd_rs0,
+//     rrst_n) and the assertion paths through their clear arcs. Recovery / removal from wrst_n to the write-domain
+//     pointer flops and from rrst_n to the read-domain ones are ordinary same-clock checks and must stay: no blanket
+//     false path to reset pins (such as -to */RESETN) and none from the raw reset ports beyond this net.
+//   - Minimum pulse width. A low pulse on arst_n must clear all four reset-synchronizer flops; a runt that clears one
+//     domain and not the other brings back phantom words. The cell limit is small (ASAP7 DFFASRHQNx1 RESETN low
+//     pulse: 25.6 ps at TT with a fast input slew, more with a slow one), but this OpenSTA does not check it:
+//     set_min_pulse_width on a RESETN pin is accepted and never reported (only clock pins are checked). So it is a
+//     rule on the reset sources: wr_rst_n / rd_rst_n come from a register or another glitch-free source, and each
+//     low pulse lasts at least one period of the slower clock.
+//   - Synchronizer flops (wgray_r1/r2, rgray_w1/w2, wr_rs0/wrst_n, rd_rs0/rrst_n), the Gray source registers (wgray,
+//     rgray) and the arst_n gate: keep afifo as a hierarchy (ORFS SYNTH_KEEP_MODULES) so these names survive, never
+//     list it in SYNTH_RETIME_MODULES, and set_dont_touch these instances in OpenROAD (no resizing, buffering or
+//     removal). The pinned ORFS has no variable for dont-touch, so Phase 6 adds it in the design's floorplan script.
 //
 // Latency and throughput: a word pushed at a wr_clk edge shows on rd_valid two rd_clk edges after the edge that
 // registers the write pointer into the read domain's synchronizer; a freed entry reaches wr_ready two wr_clk edges

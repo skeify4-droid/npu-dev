@@ -653,10 +653,16 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
   shows `in_*` on `out_*` in the same cycle and a word taken that way is never stored or counted.
 - `afifo`: Cummings structure, registered Gray pointers, 2-flop synchronizers, array written in `wr_clk` and read
   combinationally in `rd_clk`. Either raw reset resets the whole FIFO: their AND asserts both domains asynchronously and
-  each domain releases through its own 2-flop reset synchronizer, so the integrator needs no ordering or overlap and a
-  one-sided reset (the HBM `clk_mc` domain alone) is legal; words in flight are dropped, `wr_ready` / `rd_valid` are 0 in
-  reset. (Before review the two resets were used directly per domain and had to overlap; with the read reset a few
-  `rd_clk` edges late, the reader saw the reset write pointer and popped never-written words.) Throughput at 1:1 with both sides always ready: DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
+  each domain releases through its own 2-flop reset synchronizer, so the release needs no ordering or overlap; words in
+  flight are dropped, `wr_ready` / `rd_valid` are 0 in reset. A one-sided reset is a reset-domain crossing: it changes
+  the other side's `wr_ready` / `rd_valid` / `rd_data` asynchronously, so across every assertion of either input each
+  side's logic is either in reset itself (asserted no later than the FIFO input) or idle (no `wr_valid` / `rd_ready`,
+  and nothing samples `wr_ready` / `rd_valid` / `rd_data`) until its FIFO domain has left reset. The side not reset
+  cannot see that its words were dropped (`wr_ready` low looks like full), so a requester tracking outstanding words
+  is reset with the FIFO (open question 9). No RTL change for this: an integration rule in the header. (Before review
+  the two resets were used directly per domain and had to overlap; with the read reset a few `rd_clk` edges late, the
+  reader saw the reset write pointer and popped never-written words.) Throughput at 1:1 with both sides always ready:
+  DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
 - `credit_tx`/`credit_rx`: a credit per flit, saturating counter (illegal events are ignored and flagged, not wrapped);
   `can_send_pkt` (>= `PKT` credits) is the virtual cut-through test for a 2-flit packet, valid only if no new head enters a
   VC while a packet is in progress on it (it does not count credits owed to a started packet's body; the router allocates
@@ -693,7 +699,8 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
   - Each testbench was run against hand-made mutants of the RTL (a wrong wrap, a wrong full condition, a dropped
     saturation, a wrong pointer update, a write-first SRAM, an ignored byte mask and so on); every functional mutant fails.
     Mutants that pass are behaviorally equivalent in legal use (for example `arb_prio` updating `last` on an unaccepted
-    grant) or, for `afifo`, a missing synchronizer, which a zero-delay simulation cannot see (below).
+    grant) or, for `afifo`, a missing synchronizer stage, which neither a zero-delay simulation nor the port-level
+    formal tasks can see (below).
 - **Formal** (SymbiYosys, yices and abc pdr; 50 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
   cover tasks show the properties are not vacuous):
   - `fifo` (16 tasks, DEPTH 1, 3, 4, 5, registered and fall-through): `count`, `full`, `empty`, `in_ready`, `out_valid`
@@ -705,10 +712,20 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     pointer chain `srw2 <= srw1 <= rbin <= wbin`, `rbin <= sw2 <= sw1 <= wbin`, at most DEPTH apart; `wr_ready` and `rd_valid`
     are exact functions of the synchronized pointers and the domain reset; a domain in reset has zero pointers on both
     sides; no overflow, no underflow; one tagged entry's data survives. Unbounded by k-induction. The properties live in
-    the RTL under `` `ifdef FORMAL `` (they need the pointers); a mutant without the synchronizer stage fails the exactness
-    property. Port-level tasks `ph2` / `ph4` (`abc pdr`, internal properties off): pushes and pops counted per domain,
-    `rd_valid` only with a word pushed and not popped, `wr_ready` only with a free entry, any reset pattern; both fail on
-    the pre-review RTL (wr reset a few `rd_clk` edges before the rd reset gives a phantom word).
+    the RTL under `` `ifdef FORMAL `` (they need the pointers). Port-level tasks `ph2` / `ph4` (`abc pdr`, internal
+    properties off): pushes and pops counted per domain, `rd_valid` only with a word pushed and not popped, `wr_ready`
+    only with a free entry, any reset pattern; both fail on the pre-review RTL (wr reset a few `rd_clk` edges before the
+    rd reset gives a phantom word).
+  - `afifo` synchronizer depth is a structural / review check, not a functional one. With a zero-delay, step-level clock
+    model a missing stage is not a functional error: a mutant that bypasses one stage (`wgray_r2 <= wgray`) passes `d4`,
+    `ph4` and the unit tb; a mutant that takes `rd_valid` from `wgray_r1` fails only `d4`, at the internal assert that
+    `rd_valid` is an exact function of `wgray_r2`, and passes `ph4` and the unit tb.
+  - `afifo` covers (`cov4`), all at the ports: a word goes through (step 9); the FIFO fills, `wr_ready` high since the
+    last reset input and then low with no reset in between (step 12); the write input alone asserts while the reader
+    shows a word (step 10); the read input alone asserts with words inside (step 7); a word pushed while the read domain
+    is still leaving reset is popped later with no reset in between (step 10); a word goes through after a write-only
+    reset (step 10). Before review the fill cover was `!wr_ready && wr_rst_n`, reached at step 1 by the reset
+    synchronizer alone.
   - `credit_tx` / loop (8 tasks): counter in [0, DEPTH] and moves by one in the right direction only on a matching event, for
     any inputs; exact error flags; under legal usage `credits + in_flight == DEPTH`; the `credit_tx` to buffer to `credit_rx`
     to `credit_tx` loop: the buffer never holds more than DEPTH, `credits + buffered + credit_out == DEPTH`, never a send
@@ -748,13 +765,37 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 6. SRAM read-during-write: `sram_1r1w` read-first (old data), `sram_1rw` no-change. Check both against the ASAP7 fakeram models
    in Phase 6; if a macro returns undefined data, the wrapper adds a bypass register (read-first) or `core/spm` must not read and write
    one bank word in a cycle. `core/spm` bank logic must not rely on write-first.
-7. `afifo` CDC constraints for Phase 6 STA (in the afifo header; not checked by simulation, lint or formal): the Gray
-   pointer crossings need `set_max_delay -datapath_only` of about one launching-clock period and a bus-skew limit, not a
-   false path (out-of-order bits of successive increments can be captured as a code two steps away); the `mem` to
-   `rd_data` path (written in `wr_clk`, read into `rd_clk` logic) needs the same max delay; the raw resets reach the other
-   domain's reset synchronizer (asynchronous assertion only). Synchronizer depth (2 flops, data and reset) to confirm
-   against the ASAP7 MTBF numbers.
+7. `afifo` CDC constraints for Phase 6 STA. The full text is in the afifo header. Command options were checked against
+   the OpenSTA in the pinned OpenROAD (18f08d7, `help` plus a 3-flop ASAP7 netlist); nothing is checked by simulation,
+   lint or formal.
+   - No `set_clock_groups` on `wr_clk` / `rd_clk` and no `set_false_path` between them. In this OpenSTA an `-asynchronous`
+     group or a false path removes `set_max_delay` without a warning (after a clock group, `set_max_delay -reset_path`
+     does not restore it). A `-hold` false path removes `set_min_delay`.
+   - Gray pointers: `set_max_delay -ignore_clock_latency` of the launching period (setup included) plus
+     `set_min_delay -ignore_clock_latency 0`. That bounds the arrival spread below one period, so no bus-skew check is
+     needed (OpenSTA has none). `-datapath_only` is Vivado's option and does not exist here.
+   - `mem` to `rd_data`: the endpoint is the consumer's register (`-through` the `rd_data` pins at the top level, or
+     `-to` the port at the block level with the consumer's share subtracted). The budget is 2 `rd_clk` periods less the
+     uncertainty, not one `wr_clk` period.
+   - Resets: one exception, `set_false_path -through` the `arst_n` net. It covers recovery / removal at the four
+     reset-synchronizer flops and the assertion paths. `wrst_n` / `rrst_n` to the pointer flops keep normal recovery /
+     removal.
+   - Minimum pulse width on `arst_n`: a runt pulse that clears one domain only brings back phantom words. OpenSTA does
+     not report `set_min_pulse_width` on a RESETN pin, so this is a rule on the reset sources: registered or
+     glitch-free, low for at least one period of the slower clock. The ASAP7 cell limit is 25.6 ps at TT.
+   - Synchronizer flops, Gray source registers and the `arst_n` gate: `SYNTH_KEEP_MODULES`, never
+     `SYNTH_RETIME_MODULES`, and `set_dont_touch` in a Phase 6 script (ORFS has no variable for it).
+   - Still open: synchronizer depth (2 flops, data and reset) against the ASAP7 MTBF numbers, and turning this text
+     into an SDC with a scripted check that every `wr_clk` / `rd_clk` path in the block is under one of these exceptions.
 8. Formal properties of `afifo` sit in the RTL file under `` `ifdef FORMAL ``. The other blocks keep them in `tb/formal`.
+9. HBM controller reset sequence (hbm.md). The controller has one `rst_n` for `clk` and `clk_mc`, and hbm.md does not
+   say whether the `clk_mc` domain is ever reset alone (for example on PHY retraining or error recovery). If it is,
+   then under the afifo reset-domain rule the `clk` side of each crossing must be idle (no `wr_valid` / `rd_ready`,
+   nothing sampling the FIFO outputs) or reset at the same time. The words in flight are dropped and nothing at the
+   ports says so (`wr_ready` low looks like full). So a read request in a dropped FIFO leaves its tag waiting forever
+   in the requester's tag table, unless the requester is reset with it or a separate "flushed" signal retires the
+   outstanding tags. hbm.md needs to define who quiesces the `clk` side, how outstanding tags and `WR_ACK` counts
+   are retired, and the order of release.
 
 ### Next
 - `make syn` numbers are generic-cell counts, not ASAP7 areas (Phase 6).
