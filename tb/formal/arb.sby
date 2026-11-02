@@ -1,0 +1,60 @@
+# arb_rr / arb_prio: grant properties and equality with a reference model for any inputs (k-induction), and the
+# round-robin fairness bound (abc pdr, unbounded). cover tasks check the properties are reachable and not vacuous.
+[tasks]
+rr_n1     rr   n1
+rr_n2     rr   n2
+rr_n3     rr   n3
+rr_n4     rr   n4
+rr_n5     rr   n5
+prio_n1   prio n1
+prio_n4   prio n4
+prio_n5   prio n5
+fair_n2   fair n2
+fair_n4   fair n4
+fair_n5   fair n5
+cov_rr    covr n4
+cov_prio  covp n4
+cov_fair  covf n4
+
+[options]
+rr: mode prove
+prio: mode prove
+fair: mode prove
+rr: depth 12
+prio: depth 12
+fair: depth 24
+covr: mode cover
+covp: mode cover
+covf: mode cover
+covr: depth 20
+covp: depth 20
+covf: depth 20
+
+[engines]
+rr: abc pdr
+prio: abc pdr
+fair: abc pdr
+covr: smtbmc yices
+covp: smtbmc yices
+covf: smtbmc yices
+
+[script]
+n1: read -define FN=1
+n2: read -define FN=2
+n3: read -define FN=3
+n4: read -define FN=4
+n5: read -define FN=5
+read -formal arb_rr.sv
+read -formal arb_prio.sv
+read -formal arb_formal.sv
+rr: prep -top arb_rr_formal
+covr: prep -top arb_rr_formal
+prio: prep -top arb_prio_formal
+covp: prep -top arb_prio_formal
+fair: prep -top arb_rr_fair_formal
+covf: prep -top arb_rr_fair_formal
+
+[files]
+../../rtl/common/arb_rr.sv
+../../rtl/common/arb_prio.sv
+arb_formal.sv
