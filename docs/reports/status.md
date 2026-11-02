@@ -625,3 +625,122 @@ one row per finding and note. The user chose U-1 (b) and the stated residual for
   `common`, `arith` and `core/seq`. A verification pass should check the new U-1 (b) rule and the 70-bit tag entry first
   (check-first list at the end of spec_review.md).
 - Open: as after the verification 5 fixes, plus the U-3 late-request test in Phase 4.
+
+## Phase 3: common blocks (2026-11-02)
+
+Branch `p3-common` (not pushed), one commit per block or group, `make lint`, `make unit`, `make formal` and `make pytest`
+green before each. `docs/spec` is unchanged. No ORFS or VM run (the macro branch is a stub, Phase 6).
+
+### Blocks (`rtl/common/`, each with `tb/unit/tb_<name>.sv`)
+| Block | Parameters | Ports (summary) |
+|---|---|---|
+| `fifo` | `WIDTH`, `DEPTH` (any >= 1), `FALLTHROUGH` (0) | `in_*` / `out_*` valid-ready, `count`, `full`, `empty`; async low reset |
+| `afifo` | `WIDTH`, `DEPTH` (power of two >= 2, default 8) | `wr_*` in `wr_clk`, `rd_*` in `rd_clk`, separate `wr_rst_n` / `rd_rst_n` |
+| `credit_tx` | `NVC` (5), `DEPTH` (4), `PKT` (2) | `send`, `credit_in` (one bit per VC), `can_send`, `can_send_pkt`, `credits`, `err_underflow`, `err_overflow` |
+| `credit_rx` | `NVC` (5), `REG` (1) | `free` (one bit per VC) to `credit_out` |
+| `arb_rr` | `N` (any >= 1) | `req`, `hold`, `accept`, one-hot `grant` |
+| `arb_prio` | `N` | same ports as `arb_rr`, lowest index wins |
+| `sram_1r1w` | `WIDTH`, `DEPTH`, `GRAN` (8) | write port with byte mask, read port, registered `rd_data` |
+| `sram_1rw` | `WIDTH`, `DEPTH`, `GRAN` (8) | `en`, `we`, `addr`, `be`, registered `rdata` |
+
+Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scripts/memrun`; the Makefile puts
+`$(EDA_HOME)/tools/sby/bin` on `PATH`; `make syn BLOCK=x PARAMS="P=v ..."` sets top-level parameters (chparam) and writes
+`build/syn_<block>.stat`. `make unit` is unchanged: each block is one file, helper modules live in the testbench file.
+
+### Choices made (all in the module header comments)
+- `fifo`: `in_ready = !full`, no dependence on `out_ready` (a full FIFO is not popped and pushed in one cycle);
+  `FALLTHROUGH` defaults to 0 (registered read, no combinational `in_valid` to `out_valid` path); with it, an empty FIFO
+  shows `in_*` on `out_*` in the same cycle and a word taken that way is never stored or counted.
+- `afifo`: Cummings structure, registered Gray pointers, 2-flop synchronizers, array written in `wr_clk` and read
+  combinationally in `rd_clk`. Both resets must overlap in time (a reset of one side alone is outside the contract); release
+  times are free. Throughput at 1:1 with both sides always ready: DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
+- `credit_tx`/`credit_rx`: a credit per flit, saturating counter (illegal events are ignored and flagged, not wrapped);
+  `can_send_pkt` (>= `PKT` credits) is the virtual cut-through test for a 2-flit packet. `credit_rx` registers the return:
+  free in cycle t, `credit_out` in t+1, counter updated at the end of t+1 (so a credit is usable in t+2, plus link time).
+- `arb_rr`/`arb_prio`: `accept` is a separate input; the pointer moves only on an accepted grant. `hold` means "a packet
+  is in progress": it is raised the cycle after the head is accepted and dropped after the tail is accepted; while it is
+  high the grant is the last winner only (zero if that requester drops its request). `arb_prio` has the same ports so the
+  two are drop-in replacements; its only state is `last`. The round-robin pointer is a thermometer mask (68 cells at N = 5).
+- `sram_1r1w`: same-address read and write in one cycle returns the OLD word (read-first); the output register holds
+  while `rd_en` is low; contents are not reset (X until written); addresses >= `DEPTH` out of contract.
+- `sram_1rw`: a write cycle leaves `rdata` unchanged (no-change mode).
+- `SRAM_MACRO`: selects `sram_macro_1r1w` / `sram_macro_1rw`, wrappers with the same ports and parameters that Phase 6
+  provides. Without them elaboration fails on purpose. Checked once by hand with a dummy wrapper (elaborates) and without
+  (unknown module); not part of `make unit`.
+
+### Test coverage
+- **Unit** (iverilog, randomized against a reference model, with stalls, fill/drain phases and resets in the middle):
+  - `fifo`: 12 configurations (DEPTH 1, 2, 3, 4, 5, 8, 16, each registered and fall-through), queue model, `count` / `full` /
+    `empty` / `in_ready` / `out_valid` checked every cycle.
+  - `afifo`: 9 side-by-side DUTs: 1.5:1.2 (667/833 ps half periods), 1.2:1.5, 1:1 with and without phase offset, writer 5x
+    slow, reader 5x slow, near 1:1 (997/1013, drifting phase), DEPTH 2 / 4 / 8 / 16, widths 1 to 32. Ordering, no loss or
+    duplication (final drain empties the model), no overflow, no phantom data, two kinds of reset (both sides asserted
+    together and released after different numbers of cycles).
+  - `credit_tx`: 5 configurations against an integer model, legal traffic and an abuse phase (sends without a credit,
+    spurious credits), reset in the middle. `credit_rx`: both `REG` settings, no credit lost or invented.
+  - `arb_rr` (N = 1, 2, 3, 4, 5, 6, 8, 16): explicit-pointer model, one-hot, non-requester, fairness bound (at most N-1 accepted
+    heads ahead of a persistent request), packets of 1 to 3 flits under `hold` with bubbles, stalled accepts. `arb_prio`:
+    N = 1 to 16 against the lowest-index model.
+  - `sram_1r1w`, `sram_1rw`: 6 and 5 configurations (DEPTH 1, 2, 8, 13, 16; one-lane, nibble, byte and 64-bit words),
+    per-lane model, hot-address phases to force same-address collisions.
+  - Each testbench was run against hand-made mutants of the RTL (a wrong wrap, a wrong full condition, a dropped
+    saturation, a wrong pointer update, a write-first SRAM, an ignored byte mask and so on); every functional mutant fails.
+    Mutants that pass are behaviorally equivalent in legal use (for example `arb_prio` updating `last` on an unaccepted
+    grant) or, for `afifo`, a missing synchronizer, which a zero-delay simulation cannot see (below).
+- **Formal** (SymbiYosys, yices and abc pdr; 48 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
+  cover tasks show the properties are not vacuous):
+  - `fifo` (16 tasks, DEPTH 1, 3, 4, 5, registered and fall-through): `count`, `full`, `empty`, `in_ready`, `out_valid`
+    against a shadow count, no overflow, no underflow, by BMC and k-induction (unbounded); in-order data (one tagged entry
+    from push to pop) and "a stalled output keeps its data", unbounded with `abc pdr` (k-induction cannot, the stored data
+    is internal state).
+  - `afifo` (4 tasks, DEPTH 2, 4, 8, multiclock with two free clocks): Gray registers follow the binary pointers, the
+    pointer chain `srw2 <= srw1 <= rbin <= wbin`, `rbin <= sw2 <= sw1 <= wbin`, at most DEPTH apart; `wr_ready` and `rd_valid`
+    are exact functions of the synchronized pointers; no overflow, no underflow; one tagged entry's data survives. Unbounded
+    by k-induction. The properties live in the RTL under `` `ifdef FORMAL `` (they need the pointers); a mutant without
+    the synchronizer stage fails the exactness property. The environment assumes the two resets are asserted together.
+  - `credit_tx` / loop (8 tasks): counter in [0, DEPTH] and moves by one in the right direction only on a matching event, for
+    any inputs; exact error flags; under legal usage `credits + in_flight == DEPTH`; the `credit_tx` to buffer to `credit_rx`
+    to `credit_tx` loop: the buffer never holds more than DEPTH, `credits + buffered + credit_out == DEPTH`, never a send
+    without a credit. Unbounded.
+  - `arb_rr`, `arb_prio` (14 tasks, N = 1 to 5): grant one-hot or zero, only to a requester, granted when anything requests
+    (hold low), alone is granted, hold grants the last winner only, equality with an independent reference model, a grant that
+    is not accepted changes nothing, the pointer moves past the winner; `arb_rr` with hold low and all grants accepted
+    grants a persistent request within N cycles (N = 2, 4, 5). All unbounded.
+  - `sram_1r1w`, `sram_1rw` (6 tasks, DEPTH 2 and 4, one tracked address and lane): a read returns the last write (read-first
+    for 1R1W), the output holds without a read (and in a write cycle for 1RW). Unbounded with `abc pdr`.
+  - Not proved: `fifo` / `afifo` are proved at small DEPTH only (1 to 5, 2 to 8); the fall-through combinational path is
+    covered by the same properties; liveness of the `afifo` (data eventually appears) is covered only by simulation.
+
+### Synthesis (Yosys `synth -flatten`, generic cells, `make syn BLOCK=x PARAMS=...`; logs in `logs/syn_*`, all under 30 MB)
+| Block | Parameters | Cells |
+|---|---|---|
+| `fifo` | W 32, D 8 / W 64, D 4 | 541 / 490 |
+| `afifo` | W 64, D 8 / D 16 | 1,050 / 2,108 |
+| `credit_tx` | NVC 5, D 4 | 108 |
+| `credit_rx` | NVC 5 | 5 |
+| `arb_rr` | N 5 / N 8 | 68 / 105 |
+| `arb_prio` | N 5 / N 8 | 30 / 51 |
+| `sram_1r1w` | W 64, D 16 | 2,212 (flops and muxes; macros replace it in Phase 6) |
+| `sram_1rw` | W 64, D 16 | 2,214 |
+
+### Open questions for review
+1. `fifo` `in_ready` does not depend on `out_ready` (no push through a full FIFO); is a throughput loss at DEPTH 1 acceptable
+   (a DEPTH-1 FIFO runs at half rate)? A skid-style FIFO would be needed for a full-rate single entry.
+2. `FALLTHROUGH` default 0. Which of the NoC and NI users want the combinational path?
+3. Credit return is registered in `credit_rx` (+1 cycle). The router's credit loop latency, and whether the credit wire is one
+   bit per VC per cycle (assumed) or coded, is a `noc/router` decision; `credit_tx` takes one bit per VC.
+4. `can_send_pkt` needs `PKT` credits for a packet head: noc.md allows packets of at most 2 flits, so `PKT` = 2. If a VC's
+   depth is 2 a 2-flit packet needs the whole buffer.
+5. `arb_rr` `hold` is "packet in progress" and the pointer moves on the head flit's accept. If the router wants the pointer to
+   move on the tail instead, change one line; fairness among packets is the same.
+6. SRAM read-during-write: `sram_1r1w` read-first (old data), `sram_1rw` no-change. Check both against the ASAP7 fakeram models
+   in Phase 6; if a macro returns undefined data, the wrapper adds a bypass register (read-first) or `core/spm` must not read and write
+   one bank word in a cycle. `core/spm` bank logic must not rely on write-first.
+7. `afifo` resets: the integrator must assert both resets together. Is that acceptable for the HBM controller reset sequence
+   (hbm.md)? Synchronizer depth (2 flops) and the CDC constraints (`set_false_path` or max-delay on the Gray pointers) are
+   not checked by simulation or lint; STA / CDC review in Phase 6.
+8. Formal properties of `afifo` sit in the RTL file under `` `ifdef FORMAL ``. The other blocks keep them in `tb/formal`.
+
+### Next
+- `make syn` numbers are generic-cell counts, not ASAP7 areas (Phase 6).
+- Phase 3 `arith` and the leaf blocks can instantiate these blocks; `flit_t` width goes in through `WIDTH`.

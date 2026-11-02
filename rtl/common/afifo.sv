@@ -19,10 +19,11 @@
 //     pointers inconsistent and is not supported.
 //   - Storage is not reset. rd_data is undefined while rd_valid is 0.
 //
-// Latency (both clocks running): a word pushed in cycle t of wr_clk is visible on rd_valid after two edges of rd_clk
-// following the edge that registers the write pointer; a freed entry reaches wr_ready two wr_clk edges after the
-// read pointer moves. Throughput is one word per cycle of the slower clock once the FIFO is not limited by DEPTH
-// against the round-trip latency (about 4 cycles of the slower clock, so DEPTH 8 sustains full rate).
+// Latency and throughput: a word pushed at a wr_clk edge shows on rd_valid two rd_clk edges after the edge that
+// registers the write pointer into the read domain's synchronizer; a freed entry reaches wr_ready two wr_clk edges
+// after the read pointer moves. The credit round trip limits throughput by DEPTH. Measured with both clocks equal and
+// both sides always ready: DEPTH 2 gives 1/3 word per cycle, DEPTH 4 gives 2/3, DEPTH 8 (the default) gives 1 (997 of
+// 1000 cycles). Size DEPTH for the slower clock's round trip of about 6 cycles.
 module afifo #(
   parameter int WIDTH = 8,
   parameter int DEPTH = 8
