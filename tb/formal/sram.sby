@@ -1,0 +1,42 @@
+# sram_1r1w / sram_1rw: a read returns the last write to the tracked location and lane (read-first for 1R1W, a write
+# cycle leaves rdata unchanged for 1RW), rd_data holds without a read. One tracked address and lane, free constants.
+# Unbounded with abc pdr (the array is small: 2 or 4 words of 8 bits).
+[tasks]
+r1w_d2   r1w d2
+r1w_d4   r1w d4
+rw_d2    rw  d2
+rw_d4    rw  d4
+cov_r1w  covr
+cov_rw   covw
+
+[options]
+r1w: mode prove
+rw: mode prove
+r1w: depth 20
+rw: depth 20
+covr: mode cover
+covw: mode cover
+covr: depth 20
+covw: depth 20
+
+[engines]
+r1w: abc pdr
+rw: abc pdr
+covr: smtbmc yices
+covw: smtbmc yices
+
+[script]
+d2: read -define FDEPTH=2
+d4: read -define FDEPTH=4
+read -formal sram_1r1w.sv
+read -formal sram_1rw.sv
+read -formal sram_formal.sv
+r1w: prep -top sram_1r1w_formal
+covr: prep -top sram_1r1w_formal
+rw: prep -top sram_1rw_formal
+covw: prep -top sram_1rw_formal
+
+[files]
+../../rtl/common/sram_1r1w.sv
+../../rtl/common/sram_1rw.sv
+sram_formal.sv
