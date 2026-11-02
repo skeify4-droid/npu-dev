@@ -635,7 +635,7 @@ green before each. `docs/spec` is unchanged. No ORFS or VM run (the macro branch
 | Block | Parameters | Ports (summary) |
 |---|---|---|
 | `fifo` | `WIDTH`, `DEPTH` (any >= 1), `FALLTHROUGH` (0) | `in_*` / `out_*` valid-ready, `count`, `full`, `empty`; async low reset |
-| `afifo` | `WIDTH`, `DEPTH` (power of two >= 2, default 8) | `wr_*` in `wr_clk`, `rd_*` in `rd_clk`, separate `wr_rst_n` / `rd_rst_n` |
+| `afifo` | `WIDTH`, `DEPTH` (power of two >= 2, default 8) | `wr_*` in `wr_clk`, `rd_*` in `rd_clk`, raw `wr_rst_n` / `rd_rst_n` (either one resets both domains) |
 | `credit_tx` | `NVC` (5), `DEPTH` (4), `PKT` (2) | `send`, `credit_in` (one bit per VC), `can_send`, `can_send_pkt`, `credits`, `err_underflow`, `err_overflow` |
 | `credit_rx` | `NVC` (5), `REG` (1) | `free` (one bit per VC) to `credit_out` |
 | `arb_rr` | `N` (any >= 1) | `req`, `hold`, `accept`, one-hot `grant` |
@@ -652,13 +652,19 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
   `FALLTHROUGH` defaults to 0 (registered read, no combinational `in_valid` to `out_valid` path); with it, an empty FIFO
   shows `in_*` on `out_*` in the same cycle and a word taken that way is never stored or counted.
 - `afifo`: Cummings structure, registered Gray pointers, 2-flop synchronizers, array written in `wr_clk` and read
-  combinationally in `rd_clk`. Both resets must overlap in time (a reset of one side alone is outside the contract); release
-  times are free. Throughput at 1:1 with both sides always ready: DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
+  combinationally in `rd_clk`. Either raw reset resets the whole FIFO: their AND asserts both domains asynchronously and
+  each domain releases through its own 2-flop reset synchronizer, so the integrator needs no ordering or overlap and a
+  one-sided reset (the HBM `clk_mc` domain alone) is legal; words in flight are dropped, `wr_ready` / `rd_valid` are 0 in
+  reset. (Before review the two resets were used directly per domain and had to overlap; with the read reset a few
+  `rd_clk` edges late, the reader saw the reset write pointer and popped never-written words.) Throughput at 1:1 with both sides always ready: DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
 - `credit_tx`/`credit_rx`: a credit per flit, saturating counter (illegal events are ignored and flagged, not wrapped);
-  `can_send_pkt` (>= `PKT` credits) is the virtual cut-through test for a 2-flit packet. `credit_rx` registers the return:
+  `can_send_pkt` (>= `PKT` credits) is the virtual cut-through test for a 2-flit packet, valid only if no new head enters a
+  VC while a packet is in progress on it (it does not count credits owed to a started packet's body; the router allocates
+  the output VC per packet or locks the port with `hold`). `credit_rx` registers the return:
   free in cycle t, `credit_out` in t+1, counter updated at the end of t+1 (so a credit is usable in t+2, plus link time).
 - `arb_rr`/`arb_prio`: `accept` is a separate input; the pointer moves only on an accepted grant. `hold` means "a packet
-  is in progress": it is raised the cycle after the head is accepted and dropped after the tail is accepted; while it is
+  is in progress": it is 1 exactly in cycles whose flit at the holder is a body or tail flit and 0 in the cycle after the
+  tail is accepted (held one cycle longer, the holder's next head wins under the lock and can keep the port); while it is
   high the grant is the last winner only (zero if that requester drops its request). `arb_prio` has the same ports so the
   two are drop-in replacements; its only state is `last`. The round-robin pointer is a thermometer mask (68 cells at N = 5).
 - `sram_1r1w`: same-address read and write in one cycle returns the OLD word (read-first); the output register holds
@@ -674,8 +680,9 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     `empty` / `in_ready` / `out_valid` checked every cycle.
   - `afifo`: 9 side-by-side DUTs: 1.5:1.2 (667/833 ps half periods), 1.2:1.5, 1:1 with and without phase offset, writer 5x
     slow, reader 5x slow, near 1:1 (997/1013, drifting phase), DEPTH 2 / 4 / 8 / 16, widths 1 to 32. Ordering, no loss or
-    duplication (final drain empties the model), no overflow, no phantom data, two kinds of reset (both sides asserted
-    together and released after different numbers of cycles).
+    duplication (final drain empties the model), no overflow, no phantom data (also while only the other side is in reset), five kinds of reset: both
+    inputs together, write side alone, read side alone, and skewed by 3 clock edges in either order, released after
+    different numbers of cycles. The pre-review RTL fails this testbench (phantom words, overflow, data errors).
   - `credit_tx`: 5 configurations against an integer model, legal traffic and an abuse phase (sends without a credit,
     spurious credits), reset in the middle. `credit_rx`: both `REG` settings, no credit lost or invented.
   - `arb_rr` (N = 1, 2, 3, 4, 5, 6, 8, 16): explicit-pointer model, one-hot, non-requester, fairness bound (at most N-1 accepted
@@ -687,17 +694,21 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     saturation, a wrong pointer update, a write-first SRAM, an ignored byte mask and so on); every functional mutant fails.
     Mutants that pass are behaviorally equivalent in legal use (for example `arb_prio` updating `last` on an unaccepted
     grant) or, for `afifo`, a missing synchronizer, which a zero-delay simulation cannot see (below).
-- **Formal** (SymbiYosys, yices and abc pdr; 48 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
+- **Formal** (SymbiYosys, yices and abc pdr; 50 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
   cover tasks show the properties are not vacuous):
   - `fifo` (16 tasks, DEPTH 1, 3, 4, 5, registered and fall-through): `count`, `full`, `empty`, `in_ready`, `out_valid`
     against a shadow count, no overflow, no underflow, by BMC and k-induction (unbounded); in-order data (one tagged entry
     from push to pop) and "a stalled output keeps its data", unbounded with `abc pdr` (k-induction cannot, the stored data
     is internal state).
-  - `afifo` (4 tasks, DEPTH 2, 4, 8, multiclock with two free clocks): Gray registers follow the binary pointers, the
+  - `afifo` (6 tasks, DEPTH 2, 4, 8, multiclock with two free clocks and two free resets; the only assumption is that
+    the run starts in reset): Gray registers follow the binary pointers, the
     pointer chain `srw2 <= srw1 <= rbin <= wbin`, `rbin <= sw2 <= sw1 <= wbin`, at most DEPTH apart; `wr_ready` and `rd_valid`
-    are exact functions of the synchronized pointers; no overflow, no underflow; one tagged entry's data survives. Unbounded
-    by k-induction. The properties live in the RTL under `` `ifdef FORMAL `` (they need the pointers); a mutant without
-    the synchronizer stage fails the exactness property. The environment assumes the two resets are asserted together.
+    are exact functions of the synchronized pointers and the domain reset; a domain in reset has zero pointers on both
+    sides; no overflow, no underflow; one tagged entry's data survives. Unbounded by k-induction. The properties live in
+    the RTL under `` `ifdef FORMAL `` (they need the pointers); a mutant without the synchronizer stage fails the exactness
+    property. Port-level tasks `ph2` / `ph4` (`abc pdr`, internal properties off): pushes and pops counted per domain,
+    `rd_valid` only with a word pushed and not popped, `wr_ready` only with a free entry, any reset pattern; both fail on
+    the pre-review RTL (wr reset a few `rd_clk` edges before the rd reset gives a phantom word).
   - `credit_tx` / loop (8 tasks): counter in [0, DEPTH] and moves by one in the right direction only on a matching event, for
     any inputs; exact error flags; under legal usage `credits + in_flight == DEPTH`; the `credit_tx` to buffer to `credit_rx`
     to `credit_tx` loop: the buffer never holds more than DEPTH, `credits + buffered + credit_out == DEPTH`, never a send
@@ -715,7 +726,7 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 | Block | Parameters | Cells |
 |---|---|---|
 | `fifo` | W 32, D 8 / W 64, D 4 | 541 / 490 |
-| `afifo` | W 64, D 8 / D 16 | 1,050 / 2,108 |
+| `afifo` | W 64, D 8 / D 16 | 1,057 / 2,115 (reset synchronizers +7) |
 | `credit_tx` | NVC 5, D 4 | 108 |
 | `credit_rx` | NVC 5 | 5 |
 | `arb_rr` | N 5 / N 8 | 68 / 105 |
@@ -730,15 +741,19 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 3. Credit return is registered in `credit_rx` (+1 cycle). The router's credit loop latency, and whether the credit wire is one
    bit per VC per cycle (assumed) or coded, is a `noc/router` decision; `credit_tx` takes one bit per VC.
 4. `can_send_pkt` needs `PKT` credits for a packet head: noc.md allows packets of at most 2 flits, so `PKT` = 2. If a VC's
-   depth is 2 a 2-flit packet needs the whole buffer.
+   depth is 2 a 2-flit packet needs the whole buffer. `noc/router` must not start a second packet on an output VC before
+   the first one's tail (see Choices).
 5. `arb_rr` `hold` is "packet in progress" and the pointer moves on the head flit's accept. If the router wants the pointer to
    move on the tail instead, change one line; fairness among packets is the same.
 6. SRAM read-during-write: `sram_1r1w` read-first (old data), `sram_1rw` no-change. Check both against the ASAP7 fakeram models
    in Phase 6; if a macro returns undefined data, the wrapper adds a bypass register (read-first) or `core/spm` must not read and write
    one bank word in a cycle. `core/spm` bank logic must not rely on write-first.
-7. `afifo` resets: the integrator must assert both resets together. Is that acceptable for the HBM controller reset sequence
-   (hbm.md)? Synchronizer depth (2 flops) and the CDC constraints (`set_false_path` or max-delay on the Gray pointers) are
-   not checked by simulation or lint; STA / CDC review in Phase 6.
+7. `afifo` CDC constraints for Phase 6 STA (in the afifo header; not checked by simulation, lint or formal): the Gray
+   pointer crossings need `set_max_delay -datapath_only` of about one launching-clock period and a bus-skew limit, not a
+   false path (out-of-order bits of successive increments can be captured as a code two steps away); the `mem` to
+   `rd_data` path (written in `wr_clk`, read into `rd_clk` logic) needs the same max delay; the raw resets reach the other
+   domain's reset synchronizer (asynchronous assertion only). Synchronizer depth (2 flops, data and reset) to confirm
+   against the ASAP7 MTBF numbers.
 8. Formal properties of `afifo` sit in the RTL file under `` `ifdef FORMAL ``. The other blocks keep them in `tb/formal`.
 
 ### Next

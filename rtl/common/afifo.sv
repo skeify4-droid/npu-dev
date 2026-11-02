@@ -11,13 +11,22 @@
 //   WIDTH  data width in bits
 //   DEPTH  entries, a power of two >= 2 (default 8); anything else is an elaboration error
 //
-// Resets (choices, listed as open questions in docs/reports/status.md)
-//   - wr_rst_n and rd_rst_n are separate asynchronous, active-low resets. Each should be released synchronously to its
-//     own clock by the integrator.
-//   - Both domains must be in reset together at some time before use (overlapping assertion; the release times may
-//     differ by any number of cycles). Resetting only one side while the other keeps a non-zero pointer leaves the
-//     pointers inconsistent and is not supported.
+// Resets
+//   - wr_rst_n and rd_rst_n are raw asynchronous, active-low resets; either one resets the whole FIFO. Their AND asserts
+//     the reset of both domains at once (asynchronously), and each domain releases through its own two-flop reset
+//     synchronizer: a domain leaves reset on the second of its clock edges after both inputs are high. So the resets
+//     need no ordering, overlap or synchronous release from the integrator, and a reset of one side alone (for example
+//     a clk_mc domain reset by the HBM controller) clears both pointers together.
+//   - A reset of either side drops the words in flight. wr_ready and rd_valid are 0 while their domain is in reset.
 //   - Storage is not reset. rd_data is undefined while rd_valid is 0.
+//
+// Clock-domain crossings (constraints for STA, Phase 6). Three paths cross, all need a max delay, none a false path:
+//   - wgray -> wgray_r1 and rgray -> rgray_w1: set_max_delay -datapath_only of about one launching-clock period and a
+//     bus-skew limit below one period. A false path would let bits of successive increments arrive out of order, so
+//     a synchronizer could capture a code two steps away (a pointer value that never existed).
+//   - mem -> rd_data (written in wr_clk, read through the read mux into rd_clk logic): the same max delay. The data must
+//     settle before the write pointer that covers it has passed both synchronizer flops.
+//   - the raw resets into the other domain's reset synchronizer (asynchronous assertion only; release is synchronized).
 //
 // Latency and throughput: a word pushed at a wr_clk edge shows on rd_valid two rd_clk edges after the edge that
 // registers the write pointer into the read domain's synchronizer; a freed entry reaches wr_ready two wr_clk edges
@@ -49,6 +58,21 @@ module afifo #(
 
   logic [WIDTH-1:0] mem [DEPTH];
 
+  // reset: either input asserts both domains; each domain releases synchronously to its own clock
+  logic arst_n;
+  logic wr_rs0, rd_rs0;                  // first synchronizer stage
+  logic wrst_n, rrst_n;                  // domain resets (second stage)
+  assign arst_n = wr_rst_n & rd_rst_n;
+
+  always_ff @(posedge wr_clk or negedge arst_n) begin
+    if (!arst_n) begin wr_rs0 <= 1'b0; wrst_n <= 1'b0; end
+    else         begin wr_rs0 <= 1'b1; wrst_n <= wr_rs0; end
+  end
+  always_ff @(posedge rd_clk or negedge arst_n) begin
+    if (!arst_n) begin rd_rs0 <= 1'b0; rrst_n <= 1'b0; end
+    else         begin rd_rs0 <= 1'b1; rrst_n <= rd_rs0; end
+  end
+
   // write domain state
   logic [AW:0] wbin, wgray;
   logic [AW:0] rgray_w1, rgray_w2;       // read pointer (Gray) synchronized into wr_clk
@@ -61,8 +85,8 @@ module afifo #(
   logic push, pop;
   logic [AW:0] wbin_n, rbin_n, wgray_n, rgray_n;
 
-  assign wr_ready = (wgray != (rgray_w2 ^ FULL_MASK));
-  assign rd_valid = (rgray != wgray_r2);
+  assign wr_ready = wrst_n && (wgray != (rgray_w2 ^ FULL_MASK));
+  assign rd_valid = rrst_n && (rgray != wgray_r2);
   assign rd_data  = mem[rbin[AW-1:0]];
 
   assign push   = wr_valid && wr_ready;
@@ -72,8 +96,8 @@ module afifo #(
   assign wgray_n = wbin_n ^ (wbin_n >> 1);       // binary to Gray
   assign rgray_n = rbin_n ^ (rbin_n >> 1);
 
-  always_ff @(posedge wr_clk or negedge wr_rst_n) begin
-    if (!wr_rst_n) begin
+  always_ff @(posedge wr_clk or negedge wrst_n) begin
+    if (!wrst_n) begin
       wbin     <= '0;
       wgray    <= '0;
       rgray_w1 <= '0;
@@ -90,8 +114,8 @@ module afifo #(
     if (push) mem[wbin[AW-1:0]] <= wr_data;
   end
 
-  always_ff @(posedge rd_clk or negedge rd_rst_n) begin
-    if (!rd_rst_n) begin
+  always_ff @(posedge rd_clk or negedge rrst_n) begin
+    if (!rrst_n) begin
       rbin     <= '0;
       rgray    <= '0;
       wgray_r1 <= '0;
@@ -135,8 +159,15 @@ module afifo #(
     assert (f_e2  <= f_e1);
     assert (f_e1  <= f_dc);
     // flags are exact functions of the synchronized pointers
-    assert (wr_ready == (f_da2 != DEPTH));
-    assert (rd_valid == (f_e2 != 0));
+    assert (wr_ready == (wrst_n && f_da2 != DEPTH));
+    assert (rd_valid == (rrst_n && f_e2 != 0));
+    // reset synchronizers: the second stage is released only after the first
+    assert (!wrst_n || wr_rs0);
+    assert (!rrst_n || rd_rs0);
+    // both domains are cleared together. While the writer is in reset the reader (released or not) has seen no write,
+    // so its pointers are zero too; while the reader is in reset the writer has seen no read (it may have pushed).
+    assert (wrst_n || (wbin == 0 && rgray_w1 == 0 && rgray_w2 == 0 && rbin == 0 && wgray_r1 == 0 && wgray_r2 == 0));
+    assert (rrst_n || (rbin == 0 && wgray_r1 == 0 && wgray_r2 == 0 && rgray_w1 == 0 && rgray_w2 == 0));
     // no overflow, no underflow: a push needs a free entry, a pop an occupied one
     assert (!wr_ready || f_dc < DEPTH);
     assert (!rd_valid || f_dc > 0);
@@ -145,11 +176,11 @@ module afifo #(
   // One tagged entry (a free, constant pointer value): the data pushed at that pointer is the data popped at it.
   (* anyconst *) reg [AW:0] f_tag;
   reg [WIDTH-1:0] f_tdata;
-  always @(posedge wr_clk) if (wr_rst_n && push && wbin == f_tag) f_tdata <= wr_data;
+  always @(posedge wr_clk) if (wrst_n && push && wbin == f_tag) f_tdata <= wr_data;
   // while the tagged entry is occupied (between rbin and wbin) the array holds its data
   wire [AW:0] f_tocc = f_tag - rbin;
   wire        f_tin  = (f_tocc < f_dc);
-  wire        f_twr  = wr_rst_n && wr_valid && wr_ready && wbin == f_tag;     // being written this edge
+  wire        f_twr  = wrst_n && wr_valid && wr_ready && wbin == f_tag;     // being written this edge
   always @(*) begin
     if (f_tin && !f_twr) assert (mem[f_tag[AW-1:0]] == f_tdata);
     if (rd_valid && rbin == f_tag) assert (rd_data == f_tdata);

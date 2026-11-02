@@ -1,8 +1,10 @@
 // Self-checking testbench for afifo (iverilog -g2012).
 // Several clock ratios run side by side, each with its own DUT, queue reference model, random valid/ready stalls,
-// probability phases (fill, drain, saturate) and resets in the middle. Checks: ordering, no loss, no duplication,
-// no overflow (wr_ready never with the model full), no phantom data (rd_valid only with data in flight), and a final
-// drain that must empty the model.
+// probability phases (fill, drain, saturate) and resets in the middle: both inputs together, the write side alone,
+// the read side alone, and skewed (one input asserted a few clock edges before the other). Either input resets the
+// whole FIFO, so the model is cleared at the first assertion. Checks: ordering, no loss, no duplication, no overflow
+// (wr_ready never with the model full), no phantom data (rd_valid only with data in flight, also while the other
+// side is in reset), and a final drain that must empty the model.
 `timescale 1ps/1ps
 
 module afifo_chk #(
@@ -69,17 +71,21 @@ module afifo_chk #(
     end
   end
 
-  // both resets asserted asynchronously, released at independent clock edges
-  task automatic do_reset(input int wcycles, input int rcycles);
+  // Reset modes: 0 both inputs together, 1 write side alone, 2 read side alone, 3 write first and read 3 rd_clk edges
+  // later, 4 read first and write 3 wr_clk edges later. Asserted asynchronously, released after independent numbers
+  // of edges (mode 0, 3, 4) or after wcycles / rcycles of the side that was reset (mode 1, 2).
+  task automatic do_reset(input int wcycles, input int rcycles, input int mode);
     #(37);
-    wr_rst_n = 0; rd_rst_n = 0;
     q.delete();
-    repeat (wcycles) @(posedge wr_clk);
-    #1 wr_rst_n = 1;
-    if (rcycles > wcycles) begin
-      repeat (rcycles - wcycles) @(posedge rd_clk);
-    end
-    #1 rd_rst_n = 1;
+    case (mode)
+      0: begin wr_rst_n = 0; rd_rst_n = 0; end
+      1: wr_rst_n = 0;
+      2: rd_rst_n = 0;
+      3: begin wr_rst_n = 0; repeat (3) @(posedge rd_clk); #1 rd_rst_n = 0; end
+      default: begin rd_rst_n = 0; repeat (3) @(posedge wr_clk); #1 wr_rst_n = 0; end
+    endcase
+    if (mode != 2) begin repeat (wcycles) @(posedge wr_clk); #1 wr_rst_n = 1; end
+    if (mode != 1) begin repeat (rcycles) @(posedge rd_clk); #1 rd_rst_n = 1; end
   endtask
 
   task automatic phase(input int pi, input int po, input int quanta);   // one quantum is 250 ns
@@ -89,8 +95,8 @@ module afifo_chk #(
 
   initial begin
     wait (run);
-    do_reset(4, 6);
-    for (int r = 0; r < 4; r++) begin
+    do_reset(4, 2, 0);
+    for (int r = 0; r < 10; r++) begin
       phase(50, 50, 8);
       phase(100, 0, 4);      // fill until full, back to back
       phase(0, 100, 4);      // drain until empty
@@ -99,8 +105,8 @@ module afifo_chk #(
       phase(20, 100, 4);
       phase(70, 70, 4);
       phase(100, 10, 3);     // mostly full
-      if (r % 2 == 0) do_reset(5 + r, 3 + 2 * r);      // reset while full, different release orders
-      else begin phase(100, 100, 1); do_reset(3, 8 + r); end
+      if (r % 2 == 0) do_reset(5 + r, 3 + 2 * r, r % 5);                  // reset while full, every mode
+      else begin phase(100, 100, 1); do_reset(3, 8 + r, (r + 2) % 5); end  // reset while streaming, every mode
       phase(60, 60, 3);
     end
     // final drain: stop writing, read at full rate, everything in flight must come out
