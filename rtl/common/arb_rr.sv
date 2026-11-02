@@ -8,10 +8,13 @@
 //     `accept` with no grant is ignored.
 //   - `hold` is the lock for multi-flit packets: while it is high the arbiter grants only the requester that won the
 //     last accepted grant (`last`), and only while that requester requests. If it drops its request the grant is
-//     zero (nobody else may interleave). The caller raises `hold` from the cycle after a head flit is accepted until
-//     the cycle after the tail flit is accepted (i.e. "a packet is in progress"). The pointer is moved by the head
-//     flit's accept (body / tail flits leave it where it is), so the next packet starts after the packet's owner.
-//     Tie `hold` to 0 for single-flit traffic.
+//     zero (nobody else may interleave). `hold` is "a packet is in progress": it is 1 exactly in the cycles whose
+//     flit at the holder is a body or tail flit, and 0 in every cycle whose flit could be a head, in particular the
+//     cycle right after the tail is accepted. A registered flag set by an accepted head that is not also a tail and
+//     cleared by an accepted tail gives exactly that. Keeping `hold` high one cycle longer lets the holder's next head
+//     win under the lock and keep the port for as long as it has back-to-back packets (starvation).
+//     The pointer is moved by the head flit's accept (body / tail flits leave it where it is), so the next packet
+//     starts after the packet's owner. Tie `hold` to 0 for single-flit traffic.
 //
 // Fairness: with hold = 0 and every grant accepted, a requester that keeps requesting is granted within N cycles
 // (formal: tb/formal/arb.sby). With hold used, a requester waits at most one whole packet per other requester.

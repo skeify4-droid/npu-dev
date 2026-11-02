@@ -3,8 +3,9 @@
 // Same ports and `hold` / `accept` meaning as arb_rr, so the two are interchangeable:
 //   - grant = lowest-numbered requester, one-hot or zero, never a non-requester;
 //   - `accept` with a grant records the winner in `last`; nothing else is stateful (there is no fairness pointer);
-//   - `hold` (a multi-flit packet is in progress) grants only `last`, and only while it requests. Tie it to 0 for
-//     single-flit traffic.
+//   - `hold` (a multi-flit packet is in progress) grants only `last`, and only while it requests. Same timing as
+//     arb_rr: 1 only in cycles whose flit at the holder is a body or tail flit, 0 in the cycle after the tail is
+//     accepted. Tie it to 0 for single-flit traffic.
 // Low indices can starve high ones by design. Use it where the order is a rule (for example response before request).
 //
 // Parameters

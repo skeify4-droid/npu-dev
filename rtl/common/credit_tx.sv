@@ -15,6 +15,12 @@
 //   DEPTH  per-VC credits at reset = per-VC receiver buffer depth in flits (>= 1)
 //   PKT    credits needed to start a packet (virtual cut-through: the largest packet in flits, 2 for noc.md; <= DEPTH)
 //
+// can_send_pkt is a virtual cut-through test only if no new head enters a VC while a packet is in progress on it: it
+// does not count the credits still owed to the body of a packet already started. The caller guarantees that (output
+// VC allocated per packet, or a port-level lock such as arb_rr `hold`). Counter-example without it, DEPTH 4 with 3
+// credits: A head (2 left), B head passes >= 2 (1 left), A tail (0 left), B tail has no credit; B's head sits in the
+// receive buffer without its tail and the VC's queue interleaves two packets.
+//
 // Timing: a send in cycle t shows in `credits` in t+1. A credit_in in cycle t shows in `can_send` in t+1.
 // Width-generic: it never sees flit data, so it does not depend on flit_t.
 module credit_tx #(
