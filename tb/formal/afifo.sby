@@ -1,0 +1,30 @@
+# afifo: pointer / full / empty safety and tagged-entry data integrity with two free clocks (multiclock),
+# unbounded by k-induction (yices) at DEPTH 2, 4, 8; cover tasks show the properties are not vacuous.
+[tasks]
+d2   prove d2
+d4   prove d4
+d8   prove d8
+cov4 cover d4
+
+[options]
+multiclock on
+prove: mode prove
+prove: depth 24
+cover: mode cover
+cover: depth 40
+
+[engines]
+smtbmc yices
+
+[script]
+d2: read -define FDEPTH=2
+d4: read -define FDEPTH=4
+cov4: read -define FDEPTH=4
+d8: read -define FDEPTH=8
+read -formal -DFORMAL afifo.sv
+read -formal afifo_formal.sv
+prep -top afifo_formal
+
+[files]
+../../rtl/common/afifo.sv
+afifo_formal.sv
