@@ -1,0 +1,45 @@
+# credit_tx / credit_rx: counter range and exact flags with free inputs, conservation under legal usage, and the
+# credit_tx -> receive buffer -> credit_rx -> credit_tx loop (no buffer overflow, every credit accounted for).
+# All unbounded (k-induction, yices).
+[tasks]
+tx_n2d3    tx   n2 d3
+tx_n1d1    tx   n1 d1
+tx_n5d4    tx   n5 d4
+loop_n2d3  loop n2 d3
+loop_n5d4  loop n5 d4
+loop_n1d1  loop n1 d1
+cov_tx     covt n2 d3
+cov_loop   covl n2 d3
+
+[options]
+tx: mode prove
+loop: mode prove
+tx: depth 8
+loop: depth 10
+covt: mode cover
+covl: mode cover
+covt: depth 20
+covl: depth 20
+
+[engines]
+smtbmc yices
+
+[script]
+n1: read -define FNVC=1
+n2: read -define FNVC=2
+n5: read -define FNVC=5
+d1: read -define FDEPTH=1
+d3: read -define FDEPTH=3
+d4: read -define FDEPTH=4
+read -formal credit_tx.sv
+read -formal credit_rx.sv
+read -formal credit_formal.sv
+tx: prep -top credit_tx_formal
+covt: prep -top credit_tx_formal
+loop: prep -top credit_loop_formal
+covl: prep -top credit_loop_formal
+
+[files]
+../../rtl/common/credit_tx.sv
+../../rtl/common/credit_rx.sv
+credit_formal.sv
