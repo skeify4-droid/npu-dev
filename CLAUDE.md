@@ -17,6 +17,9 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
 - Phase 2 specs: `docs/spec/microarch.md` (blocks, interface tables, configs), `isa.md`, `memmap.md`, `noc.md` (deadlock rules; `sim/analytic/noc.py` checks them), `numerics.md` (formats, rounding, accumulation order; golden model `sw/npumodel/numerics.py`), `hbm.md` (controller, timing table, DRAM model; `sim/analytic/hbm.py`), `d2d_c2c.md` (link layer, collective schedules; `sim/analytic/links.py`). Review record: `docs/reports/spec_review.md`. ISA: `make isa`. Experiments: `make numerics`, `make hbm`, `make links`.
 - Simulator (Icarus) and Verilator run on macOS. Yosys and Icarus take `sv2v` output for complex SV.
 - OpenROAD: `eda-run` / `orfs-make` (VM). Do not change the pinned OpenROAD/ORFS/Yosys commits.
+- afifo CDC constraints: `make cdc-sta` (VM: ORFS ASAP7 synthesis of six configurations, then OpenSTA checks of the
+  header text taken literally; `scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`). Run it after any change to
+  the afifo RTL or its constraint text.
 
 ## RTL conventions
 - Synthesizable SV: packages, structs, enums, and parameters are allowed. No classes or interfaces in synthesizable code.

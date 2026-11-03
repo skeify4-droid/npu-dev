@@ -18,9 +18,9 @@ export PATH := $(EDA_HOME)/tools/sby/bin:$(PATH)
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn clean
+.PHONY: help lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean
 help:
-	@echo "targets: lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn clean"
+	@echo "targets: lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean"
 
 # Lint every RTL file, -Wall, as its own top (block lint).
 lint:
@@ -96,6 +96,12 @@ e2e:
 syn: $(BUILD)
 	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module> [PARAMS=\"P=v ...\"]"; exit 2; }
 	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -sv $(RTL_DIR)/common/$(BLOCK).sv; hierarchy -top $(BLOCK); $(foreach p,$(PARAMS),chparam -set $(word 1,$(subst =, ,$(p))) $(word 2,$(subst =, ,$(p))) $(BLOCK); )synth -top $(BLOCK) -flatten; tee -o $(BUILD)/syn_$(BLOCK).stat stat; stat" 
+
+# CDC constraint check of the afifo header text (OrbStack VM: ORFS ASAP7 synthesis + OpenSTA, six configurations).
+# Results in build/cdc_sta/summary.txt. Heavy: nothing else (Verilator, flat Yosys, formal) at the same time.
+cdc-sta: $(BUILD)
+	scripts/memrun cdc_sta scripts/cdc_sta/run.sh $(CDC_CFGS) || { tail -20 logs/cdc_sta.log; exit 1; }
+	@grep -E "^cdc-sta:" logs/cdc_sta.log
 
 $(BUILD):
 	mkdir -p $(BUILD)
