@@ -722,10 +722,14 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     `rd_valid` is an exact function of `wgray_r2`, and passes `ph4` and the unit tb.
   - `afifo` covers (`cov4`), all at the ports: a word goes through (step 9); the FIFO fills, `wr_ready` high since the
     last reset input and then low with no reset in between (step 12); the write input alone asserts while the reader
-    shows a word (step 10); the read input alone asserts with words inside (step 7); a word pushed while the read domain
-    is still leaving reset is popped later with no reset in between (step 10); a word goes through after a write-only
-    reset (step 10). Before review the fill cover was `!wr_ready && wr_rst_n`, reached at step 1 by the reset
-    synchronizer alone.
+    shows a word (step 10); the read input alone asserts while the reader shows a word (step 10); a word pushed at a
+    `wr_clk` edge after which the read domain is still in reset (strictly before `rrst_n` rises) is popped later with no
+    reset in between (step 11); a word goes through after a write-only reset of a running FIFO (both inputs high the
+    step before, words inside, a pop done; step 21) and after a read-only reset of one (step 21). Each witness trace
+    was read to confirm it shows what its cover says. Before review the fill cover was `!wr_ready && wr_rst_n`, reached
+    at step 1 by the reset synchronizer alone. In the next review the old read-only cover fired with the read domain
+    still in reset and `rd_valid` never 1, the early-push cover pushed on the `rd_clk` edge that released `rrst_n`, and
+    the write-only cover was the tail of the initial reset (empty FIFO); these are the replacements.
   - `credit_tx` / loop (8 tasks): counter in [0, DEPTH] and moves by one in the right direction only on a matching event, for
     any inputs; exact error flags; under legal usage `credits + in_flight == DEPTH`; the `credit_tx` to buffer to `credit_rx`
     to `credit_tx` loop: the buffer never holds more than DEPTH, `credits + buffered + credit_out == DEPTH`, never a send
@@ -765,31 +769,54 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 6. SRAM read-during-write: `sram_1r1w` read-first (old data), `sram_1rw` no-change. Check both against the ASAP7 fakeram models
    in Phase 6; if a macro returns undefined data, the wrapper adds a bypass register (read-first) or `core/spm` must not read and write
    one bank word in a cycle. `core/spm` bank logic must not rely on write-first.
-7. `afifo` CDC constraints for Phase 6 STA. The full text is in the afifo header. Command options were checked against
-   the OpenSTA in the pinned OpenROAD (18f08d7, `help` plus a 3-flop ASAP7 netlist); nothing is checked by simulation,
-   lint or formal.
+7. `afifo` CDC constraints for Phase 6 STA. The full text is in the afifo header. Command options and behaviour were
+   checked against the OpenSTA in the pinned OpenROAD (18f08d7) on ORFS ASAP7 netlists of the block (flattened under a
+   wrapper with a producer and a consumer register, and the block as top); nothing is checked by simulation, lint or
+   formal. The header's commands, taken from the file as written (`T_wr` 667 ps, `T_rd` 833 ps, `U` 25 ps), put every
+   crossing endpoint in the path-delay group for max and min, with clear arcs off and on: 12 `wr_clk` to `rd_clk`
+   (4 `wgray_r1`, 8 consumer) and 4 `rd_clk` to `wr_clk`, none left in a clock group. `rbin` to the consumer stays an
+   `rd_clk` path, recovery / removal at the four synchronizer flops is gone, and `wrst_n` to `wbin` / `rrst_n` to
+   `rbin` are still timed. The block-level form gives the same on the block (8 `rd_data` ports in place of the
+   consumer).
+   - `U` = period jitter + `wr_clk` skew + `rd_clk` skew between the registers each exception names.
+     `-ignore_clock_latency` also ignores `set_clock_uncertainty` and clock latency (the required time does not move
+     with either), so the margin is written into the numbers.
    - No `set_clock_groups` on `wr_clk` / `rd_clk` and no `set_false_path` between them. In this OpenSTA an `-asynchronous`
      group or a false path removes `set_max_delay` without a warning (after a clock group, `set_max_delay -reset_path`
-     does not restore it). A `-hold` false path removes `set_min_delay`.
-   - Gray pointers: `set_max_delay -ignore_clock_latency` of the launching period (setup included) plus
-     `set_min_delay -ignore_clock_latency 0`. That bounds the arrival spread below one period, so no bus-skew check is
-     needed (OpenSTA has none). `-datapath_only` is Vivado's option and does not exist here.
-   - `mem` to `rd_data`: the endpoint is the consumer's register (`-through` the `rd_data` pins at the top level, or
-     `-to` the port at the block level with the consumer's share subtracted). The budget is 2 `rd_clk` periods less the
-     uncertainty, not one `wr_clk` period.
+     does not restore it). A `-hold` false path removes `set_min_delay`. Only `-asynchronous -allow_paths` keeps both.
+   - Gray pointers, by endpoint: `set_max_delay -ignore_clock_latency -from [get_clocks wr_clk]` to the `wgray_r1` D
+     pins, `T_wr - U`, plus `set_min_delay -ignore_clock_latency` 0 (`rgray_w1`: `rd_clk`, `T_rd - U`). Not `-from` the
+     Gray registers: Yosys merges `wgray[AW]` into `wbin[AW]` and `rgray[AW]` into `rbin[AW]` (flattened or kept
+     hierarchy), so that form left the MSB under default cross-clock timing. With `U` covering jitter and the skew
+     across the bits, no bus-skew check is needed (OpenSTA has none). `-datapath_only` is Vivado's option and does not
+     exist here.
+   - `mem` to the consumer: the budget is 2 `rd_clk` periods less `U`, not one `wr_clk` period. Top level:
+     `-from` the `mem` registers `-to [get_clocks rd_clk]`, no `-through`. The old `-through` the `rd_data` pins was
+     dropped by OpenSTA with a warning (STA-0472): those pins do not exist after a normal link, and a flattened netlist
+     has no `rd_data` net. Block level: `set_output_delay` of the consumer's share on `rd_data` and `-from` the `mem`
+     registers `-to` the `rd_data` ports at the full `2*T_rd - U`. OpenSTA subtracts the output delay itself (1641 ps
+     became 1341 ps with 300 ps), and without an output delay `rbin` to `rd_data` is unconstrained.
    - Resets: one exception, `set_false_path -through` the `arst_n` net. It covers recovery / removal at the four
-     reset-synchronizer flops and the assertion paths. `wrst_n` / `rrst_n` to the pointer flops keep normal recovery /
-     removal.
+     reset-synchronizer flops. `wrst_n` / `rrst_n` to the pointer flops keep normal recovery / removal. Clear arcs are
+     off by default here (`sta_preset_clear_arcs_enabled` 0), so no assertion path is timed; with them on, `wrst_n` /
+     `rrst_n` reach the `wgray_r1` / `rgray_w1` D pins through the clear arcs of the Gray registers (and of
+     `wbin[AW]` / `rbin[AW]`), and the endpoint form covers them.
    - Minimum pulse width on `arst_n`: a runt pulse that clears one domain only brings back phantom words. OpenSTA does
      not report `set_min_pulse_width` on a RESETN pin, so this is a rule on the reset sources: registered or
      glitch-free, low for at least one period of the slower clock. The ASAP7 cell limit is 25.6 ps at TT.
-   - Synchronizer flops, Gray source registers and the `arst_n` gate: `SYNTH_KEEP_MODULES`, never
-     `SYNTH_RETIME_MODULES`, and `set_dont_touch` in a Phase 6 script (ORFS has no variable for it).
+   - Names: the constraints need only the `wgray_r1` / `rgray_w1` flops, the `mem` registers and the `arst_n` net, and
+     these survive flattening (`arst_n` still drives exactly the four synchronizer RESETN pins after CTS), so a kept
+     hierarchy is optional. If one is kept, `SYNTH_KEEP_MODULES = *afifo`: the module elaborates as
+     `$paramod$<hash>\afifo`, and `afifo` matches nothing (Yosys warns and flattens it). Never `SYNTH_RETIME_MODULES`.
+     `set_dont_touch` on the synchronizer flops, the Gray source flops (`wgray[AW-1:0]` and `wbin[AW]`, likewise on the
+     read side) and the `arst_n` net, in a Phase 6 script (ORFS has no variable for it).
    - Still open: synchronizer depth (2 flops, data and reset) against the ASAP7 MTBF numbers, and turning this text
      into an SDC with a scripted check that every `wr_clk` / `rd_clk` path in the block is under one of these exceptions.
 8. Formal properties of `afifo` sit in the RTL file under `` `ifdef FORMAL ``. The other blocks keep them in `tb/formal`.
 9. HBM controller reset sequence (hbm.md). The controller has one `rst_n` for `clk` and `clk_mc`, and hbm.md does not
-   say whether the `clk_mc` domain is ever reset alone (for example on PHY retraining or error recovery). If it is,
+   say whether the `clk_mc` domain is ever reset alone (for example on PHY retraining or error recovery). This applies
+   only with `MC_SYNC = 0`: `TINY` and `MID` use `MC_SYNC = 1` (one clock, hbm.md H-1). The microarch.md `hbm/ctrl`
+   interface table lists `clk_mc` and no reset (no table there lists one). If `clk_mc` is reset alone,
    then under the afifo reset-domain rule the `clk` side of each crossing must be idle (no `wr_valid` / `rd_ready`,
    nothing sampling the FIFO outputs) or reset at the same time. The words in flight are dropped and nothing at the
    ports says so (`wr_ready` low looks like full). So a read request in a dropped FIFO leaves its tag waiting forever

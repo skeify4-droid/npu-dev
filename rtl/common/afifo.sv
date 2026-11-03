@@ -32,54 +32,88 @@
 //     Otherwise its consumer can capture rd_valid = 1 with rd_data a mix of two entries (a word that was never
 //     pushed), or go metastable with no synchronizer behind it. Neither formal nor the unit tb can see this (both model
 //     the reset as a clean step), so it is an integration rule.
+//     A side held idle under (b) has no port that shows when the other input asserts or when its own FIFO domain has
+//     left reset (wr_ready / rd_valid low look like full / empty), and the release depends on the other input. So the
+//     idle window needs a handshake with the logic that owns the other reset, or a fixed wait after that input's
+//     release long enough for two of this side's clock edges.
 //   - The side that is not reset has no port that says its words were dropped: wr_ready low looks like full, rd_valid
 //     low like empty. A requester that tracks outstanding words (a tag table waiting for responses) must be reset with
 //     the FIFO, as in (a), or be told by a separate signal. Open: the HBM controller's clk_mc reset sequence
 //     (hbm.md has one rst_n; status note, Phase 3 open question 9).
 //
-// Clock-domain crossings: constraints for STA in Phase 6. Command options are checked against the OpenSTA in the pinned
-// OpenROAD (18f08d7); nothing here is checked by simulation, lint or formal. T_wr / T_rd are the clock periods, U the
-// clock uncertainty of both domains. Every wr_clk <-> rd_clk path of this block is one of the paths below.
+// Clock-domain crossings: constraints for STA in Phase 6. Command options and behaviour are checked against the OpenSTA
+// in the pinned OpenROAD (18f08d7) on ASAP7 netlists of this block from ORFS synthesis (flattened under a wrapper, and
+// as top); nothing here is checked by simulation, lint or formal. T_wr / T_rd are the clock periods. U is the margin
+// the exceptions below leave by hand: -ignore_clock_latency also ignores set_clock_uncertainty and clock latency (the
+// required time does not move), so U = period jitter + wr_clk skew + rd_clk skew, the skews taken between the
+// registers each item names (Gray: across the launching bits and across the capturing bits; mem: between the mem
+// registers and the Gray source registers, and between wgray_r1 and the consumer's register). Every wr_clk <-> rd_clk
+// path of this block ends at a wgray_r1 / rgray_w1 D pin, starts at a mem register, or runs through the arst_n net;
+// the three items below cover these by endpoint, by startpoint and by net.
 //   - Never set_clock_groups (-asynchronous or -exclusive) on wr_clk / rd_clk and never set_false_path between them
 //     (-from / -to either clock, with or without -setup / -hold). In this OpenSTA an -asynchronous clock group or a
 //     false path removes the set_max_delay below without a warning (the path turns unconstrained; after a clock group,
-//     set_max_delay -reset_path does not restore it); a -hold false path removes the set_min_delay.
-//   - Gray pointers, wgray -> wgray_r1 and rgray -> rgray_w1:
-//       set_max_delay -ignore_clock_latency -from <wgray regs> -to <wgray_r1 regs> T_wr      (rgray -> rgray_w1: T_rd)
-//       set_min_delay -ignore_clock_latency -from <wgray regs> -to <wgray_r1 regs> 0        (likewise)
-//     The max delay includes the capture flop's setup. Each bit then arrives within one launching period of its change
-//     and not before it, so the bits of two successive increments cannot overtake one another and a synchronizer never
-//     captures a code two steps away (a pointer value that never existed). That is the whole bus-skew requirement: no
-//     separate skew check is needed (this OpenSTA has no bus-skew command). The min delay replaces the cross-clock hold
-//     check, which has no meaning between unrelated clocks.
-//   - mem -> rd_data: the array is written in wr_clk and read through the DEPTH:1 read mux; the endpoint is the
-//     consumer's register outside this block. A word is used two rd_clk edges after the edge that captured its write
-//     pointer in wgray_r1 at the earliest, so the budget from a mem register's clock pin to the consumer's D (setup
-//     included) is 2 * T_rd - U; the Gray crossing's own delay only adds slack.
-//       top level:   set_max_delay -ignore_clock_latency -from <mem regs> -through <rd_data pins>
-//                      -to <rd_clk regs> 2*T_rd-U
-//       block level: set_max_delay -ignore_clock_latency -from <mem regs> -to [get_ports rd_data*]
-//                      <2*T_rd-U minus the consumer's share>
-//       and set_min_delay -ignore_clock_latency ... 0 on the same paths.
-//     rbin -> read mux -> rd_data is an ordinary rd_clk path and stays under normal timing (-from <mem regs> leaves it
-//     out).
+//     set_max_delay -reset_path does not restore it); a -hold false path removes the set_min_delay. The one clock-group
+//     form that keeps both bounds here is set_clock_groups -asynchronous -allow_paths; nothing below needs it.
+//   - Gray pointers, by endpoint (<wgray_r1 D pins>: the D pins of all AW+1 wgray_r1 flops; likewise rgray_w1):
+//       set_max_delay -ignore_clock_latency -from [get_clocks wr_clk] -to <wgray_r1 D pins> T_wr-U
+//       set_min_delay -ignore_clock_latency -from [get_clocks wr_clk] -to <wgray_r1 D pins> 0
+//       set_max_delay -ignore_clock_latency -from [get_clocks rd_clk] -to <rgray_w1 D pins> T_rd-U
+//       set_min_delay -ignore_clock_latency -from [get_clocks rd_clk] -to <rgray_w1 D pins> 0
+//     By endpoint, not -from the wgray / rgray registers: the Gray MSB is the binary MSB, so Yosys merges wgray[AW]
+//     into wbin[AW] and rgray[AW] into rbin[AW] (flattened or kept hierarchy alike: AW wgray flops, and wgray_r1[AW].D
+//     comes from wbin[AW]). A -from <wgray regs> form leaves that bit under the default cross-clock check. The max
+//     delay includes the capture flop's setup. Each bit then arrives within T_wr-U (T_rd-U) of its launching edge and
+//     not before it; with U covering jitter and the skew across the launching and across the capturing flops, the
+//     bits of two successive increments cannot overtake one another, so a synchronizer never captures a code two steps
+//     away (a pointer value that never existed). With U so defined that is the whole bus-skew requirement, and no
+//     separate skew check is needed (this OpenSTA has no bus-skew command). The min delay replaces the cross-clock
+//     hold check, which has no meaning between unrelated clocks.
+//   - mem -> consumer: the array is written in wr_clk and read through the DEPTH:1 read mux into the consumer's
+//     register outside this block. A word is used two rd_clk edges after the edge that captured its write pointer in
+//     wgray_r1 at the earliest, so the budget from a mem register's clock pin to the consumer's D (setup included) is
+//     2*T_rd-U; the Gray crossing's own delay only adds slack.
+//       top level (afifo inside the design):
+//       set_max_delay -ignore_clock_latency -from <mem regs> -to [get_clocks rd_clk] 2*T_rd-U
+//       set_min_delay -ignore_clock_latency -from <mem regs> -to [get_clocks rd_clk] 0
+//     No -through: in the rd_clk domain the mem registers reach only the read mux. Not -through the rd_data pins
+//     either: after a normal (not -hier) link_design there are no hierarchical pins, and a flattened netlist has no
+//     rd_data net; OpenSTA then drops the whole exception with only a warning (STA-0472).
+//       block level (afifo as top; <consumer share> is the consumer's part of the budget, outside the block):
+//       set_output_delay <consumer share> -clock rd_clk [get_ports rd_data*]
+//       set_max_delay -ignore_clock_latency -from <mem regs> -to [get_ports rd_data*] 2*T_rd-U
+//       set_min_delay -ignore_clock_latency -from <mem regs> -to [get_ports rd_data*] 0
+//     OpenSTA subtracts the output delay from the max delay itself, so the max delay is the whole budget (taking the
+//     consumer's share off it as well would count it twice). The output delay also times rbin -> rd_data, which is
+//     unconstrained without it. In both forms rbin -> read mux -> rd_data stays an ordinary rd_clk path (-from
+//     <mem regs> leaves it out).
 //   - Reset paths. arst_n (the wr_rst_n & rd_rst_n gate) releases asynchronously to both clocks and asserts
 //     asynchronously by design (reset-domain rule above). The only exception, scoped to that net:
 //       set_false_path -through <arst_n net>
 //     It removes recovery / removal at the clear pins of the four reset-synchronizer flops (wr_rs0, wrst_n, rd_rs0,
-//     rrst_n) and the assertion paths through their clear arcs. Recovery / removal from wrst_n to the write-domain
-//     pointer flops and from rrst_n to the read-domain ones are ordinary same-clock checks and must stay: no blanket
-//     false path to reset pins (such as -to */RESETN) and none from the raw reset ports beyond this net.
+//     rrst_n) and any path through their clear arcs. Recovery / removal from wrst_n to the write-domain pointer flops
+//     and from rrst_n to the read-domain ones are ordinary same-clock checks and must stay: no blanket false path to
+//     reset pins (such as -to */RESETN) and none from the raw reset ports beyond this net.
+//     Clear arcs (RESETN -> Q): sta_preset_clear_arcs_enabled is 0 by default in this OpenSTA, so these arcs are not in
+//     the timing graph and no assertion path through a flop's clear is timed at all; this text assumes nothing about
+//     the setting. With it set to 1, wrst_n -> clear arc of wgray / wbin[AW] -> wgray_r1 D and rrst_n -> rgray /
+//     rbin[AW] -> rgray_w1 D appear as cross-clock paths; they end at the Gray endpoints and the endpoint form above
+//     covers them. Checked with both settings.
 //   - Minimum pulse width. A low pulse on arst_n must clear all four reset-synchronizer flops; a runt that clears one
 //     domain and not the other brings back phantom words. The cell limit is small (ASAP7 DFFASRHQNx1 RESETN low
 //     pulse: 25.6 ps at TT with a fast input slew, more with a slow one), but this OpenSTA does not check it:
 //     set_min_pulse_width on a RESETN pin is accepted and never reported (only clock pins are checked). So it is a
 //     rule on the reset sources: wr_rst_n / rd_rst_n come from a register or another glitch-free source, and each
 //     low pulse lasts at least one period of the slower clock.
-//   - Synchronizer flops (wgray_r1/r2, rgray_w1/w2, wr_rs0/wrst_n, rd_rs0/rrst_n), the Gray source registers (wgray,
-//     rgray) and the arst_n gate: keep afifo as a hierarchy (ORFS SYNTH_KEEP_MODULES) so these names survive, never
-//     list it in SYNTH_RETIME_MODULES, and set_dont_touch these instances in OpenROAD (no resizing, buffering or
-//     removal). The pinned ORFS has no variable for dont-touch, so Phase 6 adds it in the design's floorplan script.
+//   - Names and synthesis. The constraints above name only the wgray_r1 / rgray_w1 flops, the mem registers and the
+//     arst_n net, and these survive flattening (ORFS flat: u_f.wgray_r1[i], u_f.mem[j][k], and u_f.arst_n still
+//     drives exactly the four synchronizer RESETN pins after CTS), so a kept hierarchy is optional. To keep one anyway,
+//     ORFS SYNTH_KEEP_MODULES must be *afifo: the module elaborates as $paramod$<hash>\afifo, and "afifo" matches
+//     nothing (Yosys warns 'Selection "afifo" did not match any module' and flattens it). Never list it in
+//     SYNTH_RETIME_MODULES. set_dont_touch in OpenROAD (no resizing, buffering or removal): the synchronizer flops
+//     (wgray_r1/r2, rgray_w1/w2, wr_rs0/wrst_n, rd_rs0/rrst_n), the Gray source flops (wgray[AW-1:0] and wbin[AW],
+//     rgray[AW-1:0] and rbin[AW]; there is no wgray[AW] / rgray[AW] flop, see above) and the arst_n net. The pinned
+//     ORFS has no variable for dont-touch, so Phase 6 adds it in the design's floorplan script.
 //
 // Latency and throughput: a word pushed at a wr_clk edge shows on rd_valid two rd_clk edges after the edge that
 // registers the write pointer into the read domain's synchronizer; a freed entry reaches wr_ready two wr_clk edges
