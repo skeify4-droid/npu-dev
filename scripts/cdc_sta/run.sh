@@ -7,14 +7,20 @@
 #     recovery / removal is gone at the reset synchronizers and kept at wrst_n -> wbin, rbin -> consumer is an
 #     ordinary rd_clk path, and the Gray MSB is merged as the header says.
 # Each check runs with sta_preset_clear_arcs_enabled 0 and 1. Results: build/cdc_sta/summary.txt.
-# Not covered: post-CTS netlists, set_dont_touch, kept hierarchy (see docs/reports/status.md, Phase 3).
-# Usage: scripts/cdc_sta/run.sh [name:kind:WIDTH:DEPTH ...]   (default: the six configurations below)
+# cts*: one configuration through ORFS floorplan and CTS (hold margin 40 ps) with the header text as the flow's SDC and
+#   its set_dont_touch commands in PRE_FLOORPLAN_TCL / POST_CTS_TCL (gen.py): the header's checks again on 4_cts.odb /
+#   4_cts.sdc, no repair_timing run on the crossing endpoints, no buffers on the synchronizer nets, dont_touch flags
+#   in the database. Controls: ctsc (SDC with the two clocks only: floorplan / CTS repair the 12 false violations),
+#   ctsn (no dont_touch: hold buffers on the synchronizer nets), ctsi (instance dont_touch from floorplan: CTS-0137).
+# Not covered: kept hierarchy, steps after CTS (see docs/reports/status.md, Phase 3).
+# Usage: scripts/cdc_sta/run.sh [name:kind:WIDTH:DEPTH ...]   (default: the configurations below)
 # Memory: the VM is the heavy job; do not run Verilator, Yosys-flat or formal at the same time.
 set -euo pipefail
 R=$(cd "$(dirname "$0")/../.." && pwd)
 source /Volumes/EVO970PLUS/claude/env_setup/env.sh
 CFGS=("$@")
-[ ${#CFGS[@]} -gt 0 ] || CFGS=(w8d8:top:8:8 w8d2:top:8:2 w8d16:top:8:16 w1d8:top:1:8 w64d8:top:64:8 blk_w8d8:blk:8:8)
+[ ${#CFGS[@]} -gt 0 ] || CFGS=(w8d8:top:8:8 w8d2:top:8:2 w8d16:top:8:16 w1d8:top:1:8 w64d8:top:64:8 blk_w8d8:blk:8:8
+      w8d8cts:cts:8:8 w8d8ctsc:ctsc:8:8 w8d8ctsn:ctsn:8:8 w8d8ctsi:ctsi:8:8)
 mkdir -p "$R/logs"
 cd "$R"
 rc=0

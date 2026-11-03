@@ -57,15 +57,20 @@ module afifo_formal #(
   // both inputs high in the step before, words inside and at least one pop done, so a one-sided reset of it is not
   // the tail of the initial reset.
   //   c0  a word goes through;
-  //   c1  the FIFO fills: wr_ready has been high since the last reset input assertion and is low now, no reset since;
+  //   c1  the FIFO fills: wr_ready has been high since the last reset input assertion and is low now, no reset since
+  //       (nothing needs an rd_clk edge: this trace can fill the FIFO with rd_clk never edging);
   //   c2  the write input alone asserts while the reader shows a word (rd_valid in the step before);
   //   c3  the read input alone asserts while the reader shows a word (rd_valid in the step before);
   //   c4  a word pushed at a wr_clk edge after which the read domain is still in reset (f_rdq < 2, so rrst_n is still
   //       low: strictly before it rises, not on the rd_clk edge that releases it) is popped later, no reset between;
   //   c5  a word goes through after a write-only reset of a running FIFO;
-  //   c6  a word goes through after a read-only reset of a running FIFO.
+  //   c6  a word goes through after a read-only reset of a running FIFO;
+  //   c7  the FIFO fills and wr_ready returns, no reset input asserted in between: a pop has crossed back through
+  //       rgray_w1 / rgray_w2 (c1 does not need that).
   reg f_wr_up = 0;                               // c1: wr_ready seen high, no reset input asserted since
   always @($global_clock) f_wr_up <= arst_n && (f_wr_up || wr_ready);
+  reg f_full = 0;                                // c7: c1 seen (full), no reset input asserted since
+  always @($global_clock) f_full <= arst_n && (f_full || (f_wr_up && !wr_ready));
   reg          f_arst_q = 0, f_rdv_q = 0;        // c2, c3, c5, c6: values in the step before
   reg [CW-1:0] f_occ_q = 0, f_npush_q = 0, f_npop_q = 0;
   always @($global_clock) begin
@@ -92,5 +97,6 @@ module afifo_formal #(
     cover (f_early && rd_valid && rd_ready && npop == f_eidx);                 // c4
     cover (f_wo && arst_n && rd_valid && rd_ready);                            // c5
     cover (f_ro && arst_n && rd_valid && rd_ready);                            // c6
+    cover (f_full && wr_ready && arst_n);                                      // c7
   end
 endmodule

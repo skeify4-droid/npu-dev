@@ -6,6 +6,10 @@
 #   endpoints, mem startpoints, the arst_n net), leaving one out for the negative controls, and report the
 #   wr_clk <-> rd_clk endpoints that are left. excl_none must leave none; each control must bring back its category.
 # MODE text: the header commands as written; every crossing endpoint must be in the path-delay group for max and min.
+# MODE post (top only): the same checks on the ORFS result after floorplan and CTS (ODB, SDC: 4_cts.odb / 4_cts.sdc, the
+#   SDC as the flow wrote it back, propagated clocks), plus: no crossing endpoint violated, buffers on the synchronizer
+#   nets (EXPECT_HB 0: none; 1: some, for the controls), EXPECT_VIOL (0, or some for the clocks-only control), dont_touch flags in the database (EXPECT_DT nets|nets+inst|none).
+#   With POST_BASIC set (controls without the header SDC) only the last two are checked.
 # Each check prints "RESULT <name> PASS|FAIL <detail>".
 set P $::env(FLOW_HOME)/platforms/asap7
 read_lef $P/lef/asap7_tech_1x_201209.lef
@@ -13,12 +17,21 @@ read_lef $P/lef/asap7sc7p5t_28_R_1x_220121a.lef
 foreach l {SEQ_RVT_TT_nldm_220123.lib INVBUF_RVT_TT_nldm_220122.lib.gz AO_RVT_TT_nldm_211120.lib.gz
            OA_RVT_TT_nldm_211120.lib.gz SIMPLE_RVT_TT_nldm_211120.lib.gz} { read_liberty $P/lib/NLDM/asap7sc7p5t_$l }
 set KIND $::env(KIND); set MODE $::env(MODE)
-read_verilog $::env(NETLIST)
-link_design [expr {$KIND eq "top" ? "afifo_top" : "afifo"}]
+if {$MODE eq "post"} {
+  read_db $::env(ODB)
+  read_sdc $::env(SDC)
+} else {
+  read_verilog $::env(NETLIST)
+  link_design [expr {$KIND eq "top" ? "afifo_top" : "afifo"}]
+}
 if {[info exists ::env(CLR)]} { set ::sta_preset_clear_arcs_enabled 1 }
-create_clock -name wr_clk -period 667 [get_ports wr_clk]
-create_clock -name rd_clk -period 833 [get_ports rd_clk]
-if {$KIND eq "top"} {
+if {$MODE ne "post"} {
+  create_clock -name wr_clk -period 667 [get_ports wr_clk]
+  create_clock -name rd_clk -period 833 [get_ports rd_clk]
+}
+if {$MODE eq "post"} {
+  set HS {u_f\.}
+} elseif {$KIND eq "top"} {
   set HS {u_f\.}
   set_input_delay 0 -clock wr_clk [get_ports {wr_rst_n wr_valid_i wr_data_i*}]
   set_input_delay 0 -clock rd_clk [get_ports {rd_rst_n rd_ready_i}]
@@ -27,27 +40,9 @@ if {$KIND eq "top"} {
   set_input_delay 0 -clock wr_clk [get_ports {wr_rst_n wr_valid wr_data*}]
   set_input_delay 0 -clock rd_clk [get_ports {rd_rst_n rd_ready}]
 }
-set AW 0; while {(1 << $AW) < $::env(DEPTH)} { incr AW }
 
-# flops by instance-name regexp (ASAP7 DFF cells only, so tie cells named after a flop are not picked up)
-proc FF {re} {
-  set l {}
-  foreach c [get_cells *] {
-    if {[regexp $re [get_full_name $c]] && [string match DFF* [get_property $c ref_name]]} { lappend l $c }
-  }
-  return $l
-}
-proc PinsNamed {cells lp} {
-  set o {}
-  foreach c $cells { foreach p [get_pins -of_objects $c] { if {[get_property $p lib_pin_name] eq $lp} { lappend o $p } } }
-  return $o
-}
-set wg_r1 [FF "^${HS}wgray_r1\\\["]; set rg_w1 [FF "^${HS}rgray_w1\\\["]
-set wg    [FF "^${HS}wgray\\\["];    set rg    [FF "^${HS}rgray\\\["]
-set mem   [FF "^${HS}mem\\\["];      set rbin  [FF "^${HS}rbin\\\["];  set wbin [FF "^${HS}wbin\\\["]
-set sync  [FF "^${HS}(wr_rs0|wrst_n|rd_rs0|rrst_n)\\\$"]
-set ARST  [get_nets -quiet [expr {$KIND eq "top" ? "u_f.arst_n" : "arst_n"}]]
-set WR1D  [PinsNamed $wg_r1 D]; set RW1D [PinsNamed $rg_w1 D]
+set DEPTH $::env(DEPTH)
+source [file join [file dirname [info script]] sel.tcl]
 if {$KIND eq "top"} { set cons [FF {^q(\[|\$)}]; set ncons [llength $cons] } else { set ncons [llength [get_ports rd_data*]] }
 puts "SETS mode=$MODE clr=$::sta_preset_clear_arcs_enabled AW=$AW wg=[llength $wg] wg_r1=[llength $wg_r1] rg=[llength $rg] rg_w1=[llength $rg_w1] mem=[llength $mem] cons=$ncons sync=[llength $sync]"
 
@@ -75,7 +70,7 @@ proc groups {args} {
 proc all_eps {d} { set o {}; dict for {g l} $d { lappend o {*}$l }; return $o }
 proc count_re {l re} { set n 0; foreach e $l { if {[regexp $re $e]} { incr n } }; return $n }
 
-if {$KIND eq "top" && $MODE ne "text"} {
+if {$KIND eq "top" && [string match excl_* $MODE]} {
   set drop [string range $MODE 5 end]
   if {$drop ne "gray"} { set_false_path -to $WR1D; set_false_path -to $RW1D }
   if {$drop ne "mem"}  { set_false_path -from $mem }
@@ -95,25 +90,84 @@ if {$KIND eq "top" && $MODE ne "text"} {
   exit
 }
 
-# MODE text
+# MODE text / post
+if {$MODE eq "post" && [info exists ::env(POST_BASIC)]} {
+  set PFX post   ;# controls: only the buffer and dont_touch checks below
+} else {
+set PFX [expr {$MODE eq "post" ? "post" : "text"}]
 result msb_merge [expr {[llength $wg] == $AW && [llength $rg] == $AW && [llength $WR1D] == $AW + 1 && [llength $RW1D] == $AW + 1}] \
   "wgray flops [llength $wg], rgray flops [llength $rg], wgray_r1 D [llength $WR1D], rgray_w1 D [llength $RW1D] (AW $AW: header says AW Gray flops, AW+1 synchronizer bits)"
-source $::env(CONS)
+if {$MODE eq "text"} { source $::env(CONS) }
 foreach dly {max min} {
   set kind [expr {$dly eq "max" ? "max_delay/setup:path delay" : "min_delay/hold:path delay"}]
   set d [groups -from [get_clocks wr_clk] -to [get_clocks rd_clk] -path_delay $dly]
   set n [expr {[dict exists $d $kind] ? [llength [dict get $d $kind]] : 0}]
   set exp [expr {[llength $WR1D] + $ncons}]
-  result "text_wr_rd_$dly" [expr {[dict size $d] == 1 && $n == $exp}] "groups {[dict keys $d]}, path delay $n (expect $exp: [llength $WR1D] wgray_r1 + $ncons consumer)"
+  result "${PFX}_wr_rd_$dly" [expr {[dict size $d] == 1 && $n == $exp}] "groups {[dict keys $d]}, path delay $n (expect $exp: [llength $WR1D] wgray_r1 + $ncons consumer)"
   set d [groups -from [get_clocks rd_clk] -to [get_clocks wr_clk] -path_delay $dly]
   set n [expr {[dict exists $d $kind] ? [llength [dict get $d $kind]] : 0}]
-  result "text_rd_wr_$dly" [expr {[dict size $d] == 1 && $n == [llength $RW1D]}] "groups {[dict keys $d]}, path delay $n (expect [llength $RW1D] rgray_w1)"
+  result "${PFX}_rd_wr_$dly" [expr {[dict size $d] == 1 && $n == [llength $RW1D]}] "groups {[dict keys $d]}, path delay $n (expect [llength $RW1D] rgray_w1)"
 }
 set n 0; foreach c $sync { incr n [llength [all_eps [groups -to [PinsNamed $c RESETN] -path_delay min_max]]] }
-result text_sync_recovery [expr {[llength $sync] == 4 && $n == 0}] "$n recovery/removal checks left at the 4 synchronizer flops (expect 0)"
+result ${PFX}_sync_recovery [expr {[llength $sync] == 4 && $n == 0}] "$n recovery/removal checks left at the 4 synchronizer flops (expect 0)"
 set n [llength [all_eps [groups -from [FF "^${HS}wrst_n\\\$"] -to [PinsNamed $wbin RESETN] -path_delay min_max]]]
-result text_wrst_wbin [expr {$n > 0}] "wrst_n -> wbin RESETN checks $n (expect > 0: same-clock recovery/removal kept)"
+result ${PFX}_wrst_wbin [expr {$n > 0}] "wrst_n -> wbin RESETN checks $n (expect > 0: same-clock recovery/removal kept)"
 set to [expr {$KIND eq "top" ? $cons : [get_ports rd_data*]}]
 set d [groups -from $rbin -to $to -path_delay max]
-result text_rbin_cons [expr {[dict keys $d] eq "max_delay/setup:rd_clk"}] "rbin -> consumer groups {[dict keys $d]} (expect an ordinary rd_clk path)"
+result ${PFX}_rbin_cons [expr {[dict keys $d] eq "max_delay/setup:rd_clk"}] "rbin -> consumer groups {[dict keys $d]} (expect an ordinary rd_clk path)"
+}
+if {$KIND eq "blk"} {
+  # block level: the min output delay must make the rbin -> rd_data hold check a real one (required time > 0 here)
+  set fn $::env(TMPD)/req_[pid].txt
+  report_checks -from $rbin -to [get_ports rd_data*] -path_delay min -format full -digits 1 > $fn
+  set f [open $fn]; set t [read $f]; close $f; file delete $fn
+  set req ""; regexp {([-0-9.]+)\s+data required time} $t -> req
+  result blk_rbin_min_required [expr {$req ne "" && $req > 0}] "rbin -> rd_data hold: data required time $req (expect > 0; -300 with a plain set_output_delay 300)"
+}
+if {$MODE eq "post"} {
+  # crossing endpoints violated, max and min, with the clock propagated (EXPECT_VIOL 0: none; some: the related-clock
+  # setup violations of the clocks-only control, max only)
+  foreach dly {max min} {
+    set n 0
+    foreach {a b} {wr_clk rd_clk rd_clk wr_clk} {
+      set fn $::env(TMPD)/vio_[pid].txt
+      report_checks -from [get_clocks $a] -to [get_clocks $b] -path_delay $dly -group_path_count 100000 -endpoint_path_count 1 -format end > $fn
+      set f [open $fn]; set t [read $f]; close $f; file delete $fn
+      incr n [regexp -all {VIOLATED} $t]
+    }
+    if {$::env(EXPECT_VIOL) eq "some"} {
+      if {$dly eq "max"} { result post_viol_max [expr {$n > 0}] "$n violated crossing endpoints (expect some: clocks-only SDC, related-clock paths)" }
+    } else {
+      result post_viol_$dly [expr {$n == 0}] "$n violated crossing endpoints (expect 0)"
+    }
+  }
+  # buffers on the synchronizer-internal nets
+  set nb 0; set nets 0
+  foreach n $SYNCN {
+    incr nets
+    foreach p [get_pins -of_objects $n] {
+      set rn [get_property [get_cells -of_objects $p] ref_name]
+      if {[regexp {^(HB|BUF)} $rn]} { incr nb }
+    }
+  }
+  set eh $::env(EXPECT_HB)
+  result post_sync_buffers [expr {$eh ? $nb > 0 : $nb == 0}] "$nb buffer pins on the $nets synchronizer nets (expect [expr {$eh ? {some} : 0}])"
+  # dont_touch flags in the database
+  proc norm {x} { return [string map {\\ {}} $x] }
+  set blk [ord::get_db_block]
+  array set dtn {}; array set dti {}
+  foreach n [$blk getNets] { if {[$n isDoNotTouch]} { set dtn([norm [$n getName]]) 1 } }
+  foreach i [$blk getInsts] { if {[$i isDoNotTouch]} { set dti([norm [$i getName]]) 1 } }
+  set wantn [concat $SYNCN $ARST]; set missn 0
+  foreach n $wantn { if {![info exists dtn([norm [get_full_name $n]])]} { incr missn } }
+  set missi 0
+  foreach c $SYNCFF { if {![info exists dti([norm [get_full_name $c]])]} { incr missi } }
+  set ed $::env(EXPECT_DT)
+  switch $ed {
+    nets      { set ok [expr {$missn == 0 && $missi == [llength $SYNCFF]}] }
+    nets+inst { set ok [expr {$missn == 0 && $missi == 0}] }
+    none      { set ok [expr {$missn == [llength $wantn] && $missi == [llength $SYNCFF]}] }
+  }
+  result post_dont_touch $ok "dont_touch missing on $missn of [llength $wantn] nets, $missi of [llength $SYNCFF] flops (expect $ed)"
+}
 exit

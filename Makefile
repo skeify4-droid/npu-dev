@@ -97,7 +97,8 @@ syn: $(BUILD)
 	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module> [PARAMS=\"P=v ...\"]"; exit 2; }
 	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -sv $(RTL_DIR)/common/$(BLOCK).sv; hierarchy -top $(BLOCK); $(foreach p,$(PARAMS),chparam -set $(word 1,$(subst =, ,$(p))) $(word 2,$(subst =, ,$(p))) $(BLOCK); )synth -top $(BLOCK) -flatten; tee -o $(BUILD)/syn_$(BLOCK).stat stat; stat" 
 
-# CDC constraint check of the afifo header text (OrbStack VM: ORFS ASAP7 synthesis + OpenSTA, six configurations).
+# CDC constraint check of the afifo header text (OrbStack VM: ORFS ASAP7 synthesis + OpenSTA, six configurations, and
+# one through floorplan and CTS with three controls).
 # Results in build/cdc_sta/summary.txt. Heavy: nothing else (Verilator, flat Yosys, formal) at the same time.
 cdc-sta: $(BUILD)
 	scripts/memrun cdc_sta scripts/cdc_sta/run.sh $(CDC_CFGS) || { tail -20 logs/cdc_sta.log; exit 1; }
