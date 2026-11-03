@@ -18,7 +18,8 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
 - Simulator (Icarus) and Verilator run on macOS. Yosys and Icarus take `sv2v` output for complex SV.
 - OpenROAD: `eda-run` / `orfs-make` (VM). Do not change the pinned OpenROAD/ORFS/Yosys commits.
 - afifo CDC constraints: `make cdc-sta` (VM: ORFS ASAP7 synthesis of six configurations, then OpenSTA checks of the
-  header text taken literally; `scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`). Run it after any change to
+  header text taken literally, plus one configuration through floorplan and CTS with three controls; about 2 min, 0.4 GB
+  in the VM; `scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`). Run it after any change to
   the afifo RTL or its constraint text.
 
 ## RTL conventions
