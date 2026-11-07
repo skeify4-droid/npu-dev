@@ -23,6 +23,11 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
   guard their own selections (set sizes) and values (max/min delay bounds), and time the post-flow results at the flow's
   corner with placement parasitics. Run it after any change to the afifo RTL or its constraint text. `CDC_SRC` / `CDC_B`
   point `scripts/cdc_sta/run.sh` at another afifo.sv and work directory (mutation runs).
+- afifo mutants (`scripts/afifo_mutants/`, outputs in `build/afifo_mutants/`): `mk_rtl_mutants.py` + `run_rtl_mutants.sh` (25 RTL
+  mutants against the eight afifo sby tasks and `tb_afifo`, a few minutes, no VM) and `mk_header_mutants.py` +
+  `run_header_mutants.sh` (25 header / netlist mutants against `make cdc-sta`, about 18 minutes in the VM). Run them under
+  `scripts/memrun` and one at a time, after any change to the afifo header, RTL, FORMAL block, `afifo.sby`, `tb_afifo` or
+  `scripts/cdc_sta/`. Every mutant must fail except `n_allow_paths` (passes) and `r_keep_msb` (survives, see status.md).
 
 ## RTL conventions
 - Synthesizable SV: packages, structs, enums, and parameters are allowed. No classes or interfaces in synthesizable code.

@@ -722,7 +722,7 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     tasks `l2` / `l4` (L1 / L2) and `tb_afifo`'s throughput check (`afifo_thr`: DEPTH 2 / 4 give 0.4 / 0.8 at zero phase
     instead of 1/3 / 2/3), and still passes `d2` / `d4` / `d8`, `ph2` / `ph4`, `cov4`. The same stage taken as the flag
     source (`rd_valid` from `wgray_r1`, `wr_ready` from `rgray_w1`) fails `d2` / `d4` / `d8`, `l2` / `l4` and the throughput
-    check. Full set of 25 mutants (`afifo_review2/mut/`, eight sby tasks and `tb_afifo` each; the `c7_w1_*` runs used the
+    check. Full set of 25 mutants (`scripts/afifo_mutants/mk_rtl_mutants.py`, `run_rtl_mutants.sh`; eight sby tasks and `tb_afifo` each; the `c7_w1_*` runs used the
     unit tb from before the throughput check): none survives. `c7_w*_freeze`, `c7_w2_hold` and `r_r*_freeze[_rst]`
     fail `cov4` only (and the unit tb); the reset-synchronizer mutants fail `d*` (and `l*`); the mask and flag mutants
     fail `d*`.
@@ -934,7 +934,8 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
      `lat/`), the TT-only failure of the 4 `wgray_r1` in the clocks-only run, the 60 ps hold-margin buffer runs and
      RSZ-3006 at `max_fanout` 10 (`rev2_sta*`), the minimum-pulse-width numbers and the unreported `set_min_pulse_width`
      (`claims/mpw.log`), the output-delay arithmetic (1641 -> 1341 ps), the `rd_data` capture-pattern simulation (`rdq/`).
-     The harness itself was run against 25 header and RTL mutants (`afifo_review2/hmut/`): every one fails except
+     The harness itself was run against 25 header and netlist mutants (`scripts/afifo_mutants/mk_header_mutants.py`,
+     `run_header_mutants.sh`): every one fails except
      `n_allow_paths` (expected to pass: `-allow_paths` keeps both bounds) and `r_keep_msb` (`(* keep *)` on `wgray` still
      merges the MSB; not checked whether it is equivalent). The three reset mutants `n_fp_wbin_rst`, `n_fp_rbin_rst`,
      `n_fp_rgray_w1_rst` (false path to part of a reset set) now all fail the `rst_*` checks; before only the first did.
