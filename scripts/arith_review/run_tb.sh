@@ -6,7 +6,7 @@
 # ARITH_LOCK=0 skips that check (for deliberately different vectors, e.g. gbound.py's).
 # Prints "<tb> PASS|FAIL|COMPILE" and the first mismatch lines. Scratch files go
 # to a temporary directory under $TMPDIR (default build/arith_review) and are removed.
-RTL=$1; CWD=$2; shift 2
+RTL=$(cd "$1" && pwd); CWD=$(cd "$2" && pwd); shift 2   # absolute: the compile runs in $CWD/arith
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 if [ "${ARITH_LOCK:-1}" != 0 ] && ! python3 "$ROOT/scripts/arith_lock.py" verify "$CWD/arith" >/dev/null 2>&1; then
   for tb in "$@"; do echo "$tb FAIL (vectors differ from scripts/arith_vectors.lock)"; done
@@ -16,7 +16,8 @@ BASE=${TMPDIR:-$ROOT/build/arith_review}
 mkdir -p "$BASE"
 TMP=$(mktemp -d "$BASE/rtb.XXXXXX")
 for tb in "$@"; do
-  if ! iverilog -g2012 -I "$CWD/arith" -o "$TMP/$tb" "$ROOT/tb/unit/tb_$tb.sv" "$RTL"/*.sv 2>"$TMP/$tb.cmp"; then
+  # compiled inside vec_cwd/arith: Icarus finds `include "counts.svh"` in the compile directory before any -I
+  if ! (cd "$CWD/arith" && iverilog -g2012 -o "$TMP/$tb" "$ROOT/tb/unit/tb_$tb.sv" "$RTL"/*.sv) 2>"$TMP/$tb.cmp"; then
     echo "$tb COMPILE"; grep -v "sorry: constant selects" "$TMP/$tb.cmp" | head -3; continue
   fi
   (cd "$CWD" && vvp -n "$TMP/$tb") >"$TMP/$tb.out" 2>&1

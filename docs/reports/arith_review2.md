@@ -383,3 +383,103 @@ In `scripts/arith_review/` (README there); outputs in `build/arith_review/`.
 - `attack_infra.sh`: scenarios S1-S5. `--make` adds the full `make unit` run on S1.
 - `spec_cases2.py`: the 77 cases of part 3.
 - `netlist_int.sh`: Yosys gate netlists of `cvt_fp32_int` for the five types, run on every vector row.
+
+## Re-check of the fixes (`64e4a96`)
+
+Checked 2026-11-08 from the code and the diff of `64e4a96`, not from its commit message. Nothing was changed except this
+section, and nothing was committed. The commit changes no file in `rtl/`. Every heavy run was under `scripts/memrun`
+(logs `logs/rev3_*`), one at a time, after `rm build/arith/.stamp`.
+
+### Runs
+
+| Check | Result |
+|---|---|
+| `make unit` | ALL PASS, 94 s, 0.20 GB. The regenerated `build/arith` matches the committed lock (42 files), so the lock reproduces on this NumPy. `acc_update` 20,012 rows; `fold_quant` prints `fold_amax N = 3, 5, 48, 100, 255` |
+| `make pytest` | 263 passed, 44 s |
+| `run_arith_mutants.py` | 39 as expected (35 killed, 4 equivalent), 217 s |
+| `my_mutants.py` | 44 as predicted (36 killed, 8 equivalent), 504 s |
+| `my_mutants2.py` | 35 as predicted (**30 killed**, 5 equivalent), 753 s |
+| `attack_infra.sh --make` | S1, S3 and S4 all "attack fails (caught)". S2 and S6 fail as expected. The S1 `make unit` stops in `arith-vec` (rc 2, 0 PASS lines). 58 s |
+| `check_files.py`, `handpicked.py`, `spec_cases2.py` | 0 disagreements on 2,368,493 rows (41 files); 283 hand cases, 0 disagreements; 78 cases agree, 0 ambiguous |
+
+### The six survivors of part 2: all killed
+
+| Mutant | Status | Evidence |
+|---|---|---|
+| `acc2_inf_as_nan` | killed | hand row `arith_hand_cases.py:210` (acc = Inf, part = Inf, cs = 0) |
+| `acc2_pinf_as_nan` | killed | hand row `arith_hand_cases.py:211` (acc = Inf, rowscale 0, RESCALE, part = Inf) |
+| `acc2_inv_supp` | killed, by the decision on A1 | flags 9 row `arith_hand_cases.py:212`; the presence of these rows is asserted in `test_arith.py:315` and below |
+| `pe2_fdot_ovf_norst` | killed | `reset_case("DOT_OVERFLOW", ...)` `tb_mxu_pe.sv:123` (`7F7F × 7F7F`, the add adds no flag) |
+| `pe2_mask_first` | killed | `first_cycle_case` `tb_mxu_pe.sv:74-84`, `:125` (expects OVERFLOW in the first registered cycle after release) |
+| `fold2_pad_ones` | killed | `amax_chk` at N = 3, 5, 48, 100, 255 against a behavioural max, `tb_fold_quant.sv:97-136`, `:140-144` |
+
+### S1, S3 and S4 now fail
+
+- The mechanism:
+  - `arith_lock.py verify` checks the row count and SHA-256 of every file, flags missing and extra files, checks each `CNT_*` against the locked rows, and rejects zero counts.
+  - It runs in `make arith-vec` (`Makefile:58`) and therefore in `make unit`, and in `run_arith_mutants.py:97`.
+  - The generator refuses an empty file (`gen_arith_vectors.py:76`). Every testbench also rejects `MAXN < 1` (for example `tb_fp32_add.sv:27`).
+- **Caveat about the evidence:** the fix commit also edited the reviewer's scripts.
+  - `run_tb.sh:11` now runs the same lock check before it simulates, so `attack_infra.sh` reports S1, S3 and S4 as caught by that gate, not by a testbench. Its S4 line "old vectors, current `cvt_fp32_fp.sv`" now fails at the lock as well.
+  - To check independently of the edited scripts, I ran the attacks through the Makefile itself, on scratch copies with a fresh stamp:
+    - S3 (`CNT_FP32_ADD 0` and a 2-row file): `make arith-vec` rc 2.
+    - S4 (the `815acb1` vectors, with the files that set lacks copied in from the current set and a matching `counts.svh`, so nothing is regenerated): rc 2, 23 files differ from the lock.
+    - Without the copied files, `arith-vec` regenerates the stale set ("output missing"), which is also correct.
+  - S1 through `make unit` is the `--make` line above.
+- Residuals:
+  - A stray `counts.svh` in the repo root still shadows `-I build/arith` (S5: 44). This is documented at arith.md:189-190, and none exists.
+  - A generator change that drops a group of rows is now visible only as a diff of the lock in review. No per-group minimum was added (part 2's second suggestion). Acceptable.
+
+### C1-C8
+
+| # | Status | Evidence |
+|---|---|---|
+| C1 | resolved | numerics.md:259 MXU row: Inf from the accumulation, and in BF16 mode from an Inf operand or a dot product that overflows |
+| C2 | resolved | numerics.md:274 (`SATURATE` includes an integer clamp), consistent with :97 |
+| C3 | resolved | numerics.md:45 (BF16 min subnormal 2^-133, kept by copies and conversions) and :47 (FP32) |
+| C4 | resolved | numerics.md:94: BF16 subnormals come only from raw FP32 through the DMA; FP16 subnormals come from normal FP32 values below 2^-14 |
+| C5 | **partly** | Fixed: the isa.md citation is now true (numerics.md:117 → isa.md:236, :260-261). The DMA multiply and its flags are stated (numerics.md:115-118, arith.md:149-150, microarch.md:568-569). **Wrong new sentence:** numerics.md:119-120 and arith.md:151 say a power of two times an FP32 "never rounds: exact, Inf with OVERFLOW, or 0". Round-then-flush (the principles, numerics.md:26-29) breaks that just below 2^-126: `arith_ref.fp32_mul(0x08FFFFFF, 0x37000000)`, i.e. (2−2^-23)·2^-110 × 2^-17, gives `0x00800000` = 2^-126 with flags 0. The error was in this report's own C5 text and was copied from it. Fix: "exact, Inf with OVERFLOW, 0, or 2^-126 when it rounds up to the minimum normal". It needs `T < 2^-108`, so it is unreachable in practice |
+| C6 | **partly** | Stated in numerics.md:121-124, arith.md:112-115 and contract item 6 (arith.md:148-149). But numerics.md:124 says "N-8 exempts them", and N-8 (:370-378) has no such exemption. It requires the fold and the MXU to be bit-exact against the golden model, with no carve-out for `amax < 2^-118`. Add the exemption to N-8 or drop the claim |
+| C7 | resolved | numerics.md:86-90 names the E4M3, E5M2 and E2M1 ties and their flags (agrees with R4) |
+| C8 | resolved | numerics.md:152-155 (VQUANT detects NaN and Inf from its inputs; NaN gives `NAN_IN`; Inf without NaN gives `INVALID`); arith.md:158-160 |
+
+### A1-A7 across numerics.md, arith.md, isa.md and microarch.md
+
+| # | Decision | Evidence | Consistent |
+|---|---|---|---|
+| A1 | INVALID per multiply or add: flags 9 | numerics.md:272; arith.md:96-98, :143-144; hand row `arith_hand_cases.py:212` | yes |
+| A2 | OVERWRITE copy of a NaN: no NAN_IN, bits kept | numerics.md:275; arith.md:99-100, :142; `arith_hand_cases.py:213`; `acc2_ow_nan` killed | yes |
+| A3 | padding is element 0 with a finite scale; the integrator drops its `v` and flags | numerics.md:109-111; arith.md:109-111, :145-147; microarch.md:568-569; spec case (`spec_cases2.py`, A3) | yes (an integrator rule; no RTL test possible) |
+| A4 | `MAX_F32` of a DAZ'd subnormal gives the zero | numerics.md:263; arith.md:100-101 | yes |
+| A5 | write-add operands DAZ | numerics.md:262, :281-282; arith.md:153; microarch.md:580 | yes |
+| A6 | every converter raises NAN_IN | numerics.md:97, :275; arith.md:100; RTL `cvt_dec.sv:55`, `mx_dequant_bf16.sv:29` | yes |
+| A7 | the target core's `FP_STATUS` | numerics.md:265-266, :282; arith.md:126-129; microarch.md:580-581 | yes; isa.md (:439, `isa.yaml:179`) says nothing that contradicts it |
+
+The integration contract is arith.md:120-160, items 1-8, with pointers at microarch.md:92-93 (§2.2, items 1-5), :568-569 (§2.5, items
+1, 6, 8) and :580-581 (§2.6, items 1, 7). I-1 to I-10 all map to an item. Remaining I-1 gap: the microarch.md interface tables still have no
+flag signal or CSR path, only the pointers. That is acceptable until `core/*` is specified.
+
+### Stale text
+
+- arith.md:117 (68,445) and the count tables are right.
+- **status.md:969-970 and :1048** say the fixes of this re-review are "in the working tree, not committed". They are commit
+  `64e4a96`. This is the same slip as F13.
+
+### Verdict
+
+- Every survivor listed in part 2 is killed, and the equivalent ones are unchanged.
+- S1, S3 and S4 fail, both through the reviewer's script and independently through `make arith-vec` / `make unit`.
+- C1-C4, C7, C8 and A1-A7 are resolved and consistent across the four specs.
+- Open, all documentation only:
+  - C5: the "never rounds" sentence, numerics.md:119-120 and arith.md:151.
+  - C6: the missing N-8 exemption, numerics.md:124 against :370-378.
+  - status.md:969 and :1048 wording.
+
+**Follow-up (same day, after the re-check; documentation only):**
+- C5 corrected in numerics.md N-2 step 4 and arith.md contract item 6.
+- C6 closed with an exemption in N-8.
+- status.md wording fixed.
+- The I-1 gap closed: `fp_flags` ports and the `FP_STATUS` path in the microarch.md §5 tables.
+- The S5 residual closed: the arith testbenches compile inside `build/arith`, so a stray `counts.svh` elsewhere is never
+  found. `attack_infra.sh` S5 now shows both forms.
+- GSRAM decided as its own target on router port 6 (status.md, "Second review").

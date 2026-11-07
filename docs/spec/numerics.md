@@ -116,8 +116,11 @@ blocks; the last tile may be shorter):
    - **NVFP4:** the DMA engine multiplies it by `R[ts_reg]` with one `fp32_mul` (RNE, DAZ/FTZ) and ORs that multiply's flags
      into `FP_STATUS` (OVERFLOW for a huge `T`, NAN_IN for a NaN `T`). The operand is named in isa.md §5; the multiply, its
      flags and the raw write of `T` for `NVFP4_BF16` are in the "Integration contract" of arith.md.
-   - The product of a power of two and an FP32 never rounds: it is exact, or Inf with `OVERFLOW` (above the FP32 range), or a
-     zero (below 2^-126, or a subnormal `T` read as 0 by DAZ).
+   - The product of a power of two and a normal FP32 is exact while it stays in the normal range; above it, it is Inf with
+     `OVERFLOW`. Below 2^-126 it is rounded, then flushed (principles): a zero, except the single value `2^-126 − 2^-150` (a
+     `T` whose significand is all ones), which is a rounding tie and goes up to 2^-126 (`fp32_mul(0x08FFFFFF, 2^-17)` =
+     `0x00800000`, no flag). A subnormal `T` reads as 0 (DAZ). With `c ≥ −18` (NVFP4) the product goes below 2^-126 only
+     for `T < 2^-108`.
    - **MX formats:** `cs = 2^c` is written as is. For `c < −126` (a tile with `amax < 2^-118`; no real weight reaches it)
      `2^c` is an FP32 subnormal, which the ACC's column-scale multiplier reads as 0 (DAZ), so the tile contributes 0. The golden
      model (`numerics.fold_e4m3`, `mxu_mm`) keeps such a scale and multiplies by it, so **golden and RTL differ for these
@@ -263,7 +266,7 @@ Rows shorter than 256 leave slots at +0. Max and min are exact. The order does n
 | `MAX_F32` | NaN wins; the result is the canonical NaN (a NaN that is only copied, N-1, keeps its bits) | ordered | DAZ: a subnormal operand reads as a zero of its sign, and a result that is such an operand is that zero (`max(2^-149, −1) = +0`) | `max(−0, +0) = +0` |
 
 `FP_STATUS` CSR (per core, sticky, write 1 to clear) is set by any unit of the core, including the DMA conversions. A write-add or max
-at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is in the target's network interface), not of the initiator.
+at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is at the target: the core's network interface for SPM, the slice itself for GSRAM), not of the initiator.
 A flag belongs to one **operation**: one multiply, one add, one dot product, one conversion. A lane that chains two (the ACC lane
 multiplies, then adds) reports the flags of each:
 
@@ -375,9 +378,13 @@ Kahan-style compensation are needed.
   - Converters: every 8-bit and 4-bit source code. For FP32 → FP8/FP4/BF16: random values, plus every rounding midpoint, `max + ½ ulp`,
     and the subnormal and normal boundaries.
   - Fold: random MXFP4, MXFP8 and NVFP4 tiles, plus tiles with a 14-binade and a 15-binade block-exponent spread.
+  - **Exemption: MX fold tiles with `amax < 2^-118`.** Their column scale `2^c` (`c < −126`) is an FP32 subnormal. `fold_c`
+    writes it exactly, as the golden model does, but the ACC's column-scale multiplier reads it as 0 (DAZ) while
+    `numerics.fold_e4m3` / `mxu_mm` multiply by it (N-2 step 4). From the ACC on, golden and RTL differ for these tiles, so
+    bit-exact tests of the ACC and the MXU keep tiles out of that range. No real weight reaches it.
 - Reference libraries: `ml_dtypes` agrees with the golden model on FP32 inputs. It rounds float64 inputs twice (through float32), so
   tests compare on FP32 values, which is all the hardware ever converts.
-- **MXU, bit-exact** against `mxu_mm` for the same tiling.
+- **MXU, bit-exact** against `mxu_mm` for the same tiling, except the fold tiles exempted above.
 - **SFU:** the ulp bounds of N-4.
 - **Fused VPU instructions:**
   - FP32 outputs within the composed bound: the sum of the SFU bounds used plus 1 ulp per lane operation, against a golden model that

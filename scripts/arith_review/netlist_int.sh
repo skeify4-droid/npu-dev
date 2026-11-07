@@ -31,5 +31,5 @@ EOF
 done
 echo '  initial begin #100000000; if (e == 0) $display("PASS netlist cvt_fp32_int (%0d rows)", n); else $display("FAIL netlist cvt_fp32_int: %0d errors", e); $finish; end' >> "$TB"
 echo 'endmodule' >> "$TB"
-iverilog -g2012 -I "$ROOT/build/arith" -o "$W/sim" "$TB" "$W"/net_*.v || exit 1
+(cd "$ROOT/build/arith" && iverilog -g2012 -o "$W/sim" "$TB" "$W"/net_*.v) || exit 1   # counts.svh from the compile directory
 (cd "$ROOT/build" && vvp -n "$W/sim")

@@ -83,7 +83,9 @@ def run(name, edits, tb, expect, note):
         open(p, "w").write(s.replace(old, new, 1))
     exe = os.path.join(d, "sim")
     srcs = sorted(os.path.join(d, x) for x in os.listdir(d) if x.endswith(".sv"))
-    r = subprocess.run(["iverilog", "-g2012", "-I", os.path.join(ROOT, "build", "arith"), "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs, capture_output=True, text=True)
+    # compiled inside build/arith: Icarus finds `include "counts.svh"` in the compile directory first, i.e. the locked file
+    r = subprocess.run(["iverilog", "-g2012", "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs,
+                       cwd=os.path.join(ROOT, "build", "arith"), capture_output=True, text=True)
     if r.returncode:
         return "COMPILE-ERROR " + r.stderr[-300:]
     r = subprocess.run(["vvp", "-n", exe], cwd=os.path.join(ROOT, "build"), capture_output=True, text=True)

@@ -125,8 +125,9 @@ are in numerics.md N-2, N-3, N-5 and N-6.
 
 1. **Flags.** `flags` is per operation, not sticky and not valid-qualified. AND it with the valid of the data it belongs to,
    carry it through your pipeline registers with that data, and OR it into the `FP_STATUS` of the core that executes the
-   instruction. A write-add or max at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is in the target's
-   network interface), not of the initiator (decision A7).
+   instruction. A write-add or max at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is at the target:
+   the core's network interface for SPM, the GSRAM slice for GSRAM), not of the initiator (decision A7). The `fp_flags` ports, their valid qualification and their
+   ordering against completion semaphores and acks are in microarch.md §5 ("Floating-point flags").
 2. **Reset.** Only `mxu_pe`'s flag registers reset. Mask flags after reset until valid data has propagated: `REG_DOT + REG_OUT`
    cycles for one PE, `REG_DOT + 64 * REG_OUT` plus the A skew for a column. (`tb_mxu_pe` drives benign inputs at release and
    also a flagging row in the first cycle; real inputs are not benign.)
@@ -148,7 +149,8 @@ are in numerics.md N-2, N-3, N-5 and N-6.
    - MX formats: write `fold_c.cs` as is. For c < -126 it is an FP32 subnormal, which the ACC reads as 0 (the golden model
      keeps it; numerics.md N-2 step 4).
    - NVFP4: write `fp32_mul(fold_c.cs, R[ts_reg])` and OR that multiply's flags (OVERFLOW for a large T, `NAN_IN` for a NaN T).
-     The product never rounds: it is exact, Inf with OVERFLOW, or 0.
+     The product is exact, Inf with OVERFLOW, or flushed to 0, except the single value 2^-126 - 2^-150 (a T with an all-ones
+     significand), which rounds up to 2^-126 (numerics.md N-2 step 4).
    - NVFP4 -> BF16: write `R[ts_reg]` unchanged as the column scale.
 7. **Write-add.** All operands are DAZ and results FTZ.
    - `ADD_F32` is `fp32_add`.
@@ -180,14 +182,14 @@ are in numerics.md N-2, N-3, N-5 and N-6.
 | `tb_fold_quant` | `fold_key` + `fold_amax` + `fold_c` + `fold_quant` on 64-element tiles (random, narrow, 14- and 15-binade spreads, extreme scale codes, NaN, all-zero, the hand tiles) and on 256-element tiles (the spec's tile and the default of `fold_amax`: random, plus one tile per position with a single non-zero element); `fold_quant` alone with `c` below, at and above the element's own; `fold_amax` alone with N = 3, 5, 48, 100, 255 (not powers of two: all-zero tile, one key at every position, 400 random tiles each, against a behavioural maximum) | 1,503-1,508 tiles of 64, 556 tiles of 256 (per format); 24,576 / 96,000 / 24,576 single-element rows; `fold_amax`: 1 + N + 400 checks per N |
 
 Every vector file has an exact row count. `scripts/gen_arith_vectors.py` writes `build/arith/counts.svh` (one `` `define CNT_<file> <rows> `` per file);
-each testbench includes it (`include "counts.svh"`, `-I build/arith`), sizes its memory with it and requires exactly that many rows, never zero.
+each testbench includes it (`include "counts.svh"`, compiled inside `build/arith`), sizes its memory with it and requires exactly that many rows, never zero.
 `scripts/arith_vectors.lock` (committed; written by `scripts/gen_arith_vectors.py --lock`) holds the row count and SHA-256 of every
 file of `build/arith`, `counts.svh` included. `make arith-vec` (so `make unit`) and `run_arith_mutants.py` verify the directory against it
 (`scripts/arith_lock.py verify`) and stop on any difference, so a truncated or edited file with a matching `counts.svh`, a zero count, an
 old but self-consistent vector set or a stale copy of `build/` cannot pass, and a change of the generator, the reference or the hand
 cases shows up as a diff of the lock. NumPy's `default_rng` stream is not guaranteed across versions: after an upgrade the lock
-mismatches (correctly); re-check the vectors, then `--lock`. A stray `counts.svh` in the directory the compile runs from (the repo root)
-would still shadow the real one; the lock does not see it. `make unit` also fails on the
+mismatches (correctly); re-check the vectors, then `--lock`. The compile runs inside `build/arith` (Icarus looks in the compile
+directory before any `-I`), so a stray `counts.svh` elsewhere, for example in the repo root, cannot shadow the locked one. `make unit` also fails on the
 simulator's `Unable to open`, `Not enough words` and `Too many words`, and `make arith-vec` regenerates when an output file is
 missing, so a missing, short or long file cannot pass. The hand-derived cases (`scripts/arith_hand_cases.py`, 283 of them: inputs
 and expected bits worked out by hand) are in the vectors with the expected values of `arith_ref`; `test_arith.py` asserts that

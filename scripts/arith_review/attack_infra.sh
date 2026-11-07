@@ -92,15 +92,19 @@ D=$W/rtl_pre_f6; rm -rf "$D"; cp -R "$RTL" "$D"; (cd "$ROOT" && git show 815acb1
 tb "S4 old cvt_fp32_*.hex, pre-F6 cvt_fp32_fp.sv (BF16 flush)" "$D" "$W/old" cvt_fp32_fp PASS
 tb "S4 old cvt_fp32_*.hex, current cvt_fp32_fp.sv" "$RTL" "$W/old" cvt_fp32_fp FAIL
 
-# ---- S5: which counts.svh does `include "counts.svh"` pick? Makefile: cwd = repo root, -I build/arith. The pre-lock testbenches
-# included "arith/counts.svh", for which a stray arith/counts.svh in the cwd won; now that file is not looked at.
+# ---- S5: which counts.svh does `include "counts.svh"` pick? Icarus searches the compile directory first, then -I. The
+# Makefile, run_arith_mutants.py and run_tb.sh now compile inside build/arith (the locked directory), so a stray copy in the
+# directory make or the script is started from (the repo root), or next to the testbench, is never reached.
+# History: the first testbenches included "arith/counts.svh" with -I build (a stray ./arith/counts.svh won); 64e4a96 used
+# "counts.svh" with -I build/arith from the repo root (a stray ./counts.svh in the repo root won).
 mkdir -p "$W/inc/root/arith" "$W/inc/ipath"
-echo '`define CNT_FP32_ADD 11' > "$W/inc/root/arith/counts.svh"     # a stray arith/counts.svh in the cwd of the compile
-echo '`define CNT_FP32_ADD 33' > "$W/inc/ipath/counts.svh"          # the -I directory (build/arith in the Makefile)
-mxn() { (cd "$W/inc/root" && iverilog -g2012 -I "$W/inc/ipath" -E -o "$W/inc/pp.sv" "$ROOT/tb/unit/tb_fp32_add.sv" 2>/dev/null); grep -m1 -E 'localparam int MAXN' "$W/inc/pp.sv" | grep -oE '[0-9]+' | head -1; }
-echo "S5 stray ./arith/counts.svh (11) next to the real one in -I (33): MAXN = $(mxn)   [33 = the -I copy: no longer shadowed]"
-echo '`define CNT_FP32_ADD 44' > "$W/inc/root/counts.svh"           # a stray counts.svh in the cwd itself
-echo "S5 stray ./counts.svh (44) in the compile directory: MAXN = $(mxn)   [44 = shadowed: the residual, only the repo root counts]"
+echo '`define CNT_FP32_ADD 11' > "$W/inc/root/arith/counts.svh"     # a stray arith/counts.svh where the run is started
+echo '`define CNT_FP32_ADD 44' > "$W/inc/root/counts.svh"           # a stray counts.svh where the run is started
+echo '`define CNT_FP32_ADD 33' > "$W/inc/ipath/counts.svh"          # the vector directory (build/arith in the Makefile)
+mxn_old() { (cd "$W/inc/root" && iverilog -g2012 -I "$W/inc/ipath" -E -o "$W/inc/pp.sv" "$ROOT/tb/unit/tb_fp32_add.sv" 2>/dev/null); grep -m1 -E 'localparam int MAXN' "$W/inc/pp.sv" | grep -oE '[0-9]+' | head -1; }
+mxn_new() { (cd "$W/inc/root" && (cd "$W/inc/ipath" && iverilog -g2012 -E -o "$W/inc/pp.sv" "$ROOT/tb/unit/tb_fp32_add.sv") 2>/dev/null); grep -m1 -E 'localparam int MAXN' "$W/inc/pp.sv" | grep -oE '[0-9]+' | head -1; }
+echo "S5 64e4a96 form (started in the repo root, -I vector dir), strays 11 and 44 present: MAXN = $(mxn_old)   [44 = shadowed: the old residual]"
+echo "S5 current form (compiled inside the vector dir), same strays: MAXN = $(mxn_new)   [33 = the locked copy: not shadowed]"
 rm -f "$W/inc/root/counts.svh"
 
 # ---- S6: the testbench's own zero-count guard (the lock is bypassed with ARITH_LOCK=0): CNT 0 and a 2-row file

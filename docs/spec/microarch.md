@@ -57,9 +57,9 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
                ┌──────── SPM 4 MiB: 32 banks x 128 KiB, 64 B wide, 1R1W ────────┐
                └────────────────────────────────────────────────────────────────┘
                     ▲
-          NETWORK INTERFACE (2 planes; initiator for DMA, target for SPM / GSRAM / CORECTL; write-add ALU)
+          NETWORK INTERFACE (2 planes; initiator for DMA, target for SPM / CORECTL; write-add ALU)
                     │
-          ROUTER (N, S, E, W, core, GSRAM ports) ── GSRAM slice 1 MiB
+          ROUTER (N, S, E, W, core, GSRAM ports) ── GSRAM slice 1 MiB (its own target and write-add ALU)
 ```
 
 ### 2.1 Front end and queues
@@ -575,8 +575,13 @@ isa.md §5) a cheap multiply at the ACC input.
   takes plain writes only.
 
 ### 2.6 Network interface and semaphores
-- The interface is an initiator for the DMA and a target for SPM, GSRAM and CORECTL (IMEM, DTAB, semaphores, CSRs).
-- Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
+- The interface is an initiator for the DMA and a target for SPM and CORECTL (IMEM, DTAB, semaphores, CSRs).
+  - The tile's GSRAM slice is **not** behind the interface. It is a target of its own on the router's sixth port (§3), so
+    GSRAM traffic uses neither the interface nor the router's core port.
+  - The slice implements the same SRAM-target rules as the SPM target below: write-add/max with its own ALU, ack
+    coalescing, the epoch copy, and `rsem` to the owning tile's semaphores. In RTL both are one SRAM-target module,
+    instantiated in `core/ni` (SPM) and in `die/gsram`.
+- Each SRAM target (SPM here, GSRAM in its slice) handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
   - How the ALU composes `ADD_F32`, `ADD_BF16` and `MAX_F32` (DAZ operands, FTZ results), and whose `FP_STATUS` its flags go to
     (the target core's): arith.md "Integration contract", items 1 and 7.
   - A read response is 1 flit when the request's bytes in its granule lie in one 128 B half, else 2 (noc.md §2, review
@@ -600,7 +605,9 @@ isa.md §5) a cheap multiply at the ACC input.
 - **GSRAM:** 32 slices of 1 MiB, one per core tile, on the router's sixth port.
   - Software-managed and slice-contiguous: no hardware interleave.
   - Uses: collective staging, KV and expert prefetch, broadcast sources.
-  - Same target functions as SPM (write-add, semaphores on the owning tile).
+  - Each slice is its own network target, on the router's sixth port, with the same functions as the SPM target in the
+    network interface (§2.6): reads, writes, write-add/max with its own ALU, ack coalescing, the epoch copy, and
+    semaphores (`rsem`) on the owning tile. A write-add's flags go to the owning tile's `FP_STATUS`.
 - **Command processor:**
   - Loads IMEM/DTAB images through CORECTL, writes start registers, collects `IRQ`/`HALT` interrupts.
   - Owns page tables (KV pages) and the n-gram hash (hyper_connections.md G-2).
@@ -645,6 +652,18 @@ Conventions:
 - Widths are for `FULL`.
 - All ports crossing a block boundary are packed vectors (CLAUDE.md).
 - `flit_t` is 1024 data bits + 128 header bits + 3-bit VC + head/tail (noc.md §3).
+- **Floating-point flags** (numerics.md N-5; arith.md "Integration contract", items 1-3):
+  - Every block that does floating-point arithmetic or conversion has an `fp_flags` output: 4 bits in the `FP_STATUS` bit
+    order (`INVALID`, `OVERFLOW`, `SATURATE`, `NAN_IN`), pulse, one cycle per operation group.
+  - The block ANDs the `rtl/arith` flags with the valid of the data they belong to. This covers pipeline bubbles, unused
+    lanes, columns and rows, short-tile padding and the cycles after reset. It then ORs them across lanes. The output is
+    therefore valid-qualified, unlike the raw `rtl/arith` flags.
+  - `core/seq` ORs the `fp_flags` inputs into the sticky `FP_STATUS` CSR.
+  - Ordering: a block drives an instruction's flags no later than that instruction's completion `sem_inc`. A target drives
+    a write-add's flags no later than its ack. So a program that waits for completion and then reads `FP_STATUS` sees every
+    flag of the work it waited for.
+  - A write-add or max at an SRAM target sets the `FP_STATUS` of the core that owns the target (SPM: the core of the NI;
+    GSRAM: the core of the slice's tile), never the initiator's.
 
 **Front end (`core/seq`)**
 
@@ -655,6 +674,7 @@ Conventions:
 | sem_if | in/out | 64 x 32 | register file, 1 write port per engine + network | wait conditions, signals |
 | spm_scalar | out/in | addr 22, data 64 | valid/ready | `LD` / `ST` |
 | csr_if | in/out | addr 12, data 64 | 1-cycle | CSRs |
+| fp_flags_in | in | 6 x 4 | pulse | `fp_flags` of DMA, MXU, ACC, VPU, NI target and the tile's GSRAM slice, ORed into the sticky `FP_STATUS` CSR (write 1 to clear) |
 | ctl | in | start, start_pc[11:0] | level | from CORECTL |
 | irq | out | 32 | pulse | to CP via network write |
 
@@ -668,6 +688,7 @@ Conventions:
 | ni_req | out | flit_t | valid/ready | read requests, write packets |
 | ni_rsp | in | flit_t | valid/ready, 4-flit buffer; ready depends only on the converter and the SPM ports, because scales are staged before their data (§2.5, review finding V-1) | read data, scales, acks |
 | sem_inc | out | 6 + 4 | pulse | completion signals |
+| fp_flags | out | 4 | pulse, valid-qualified | conversions (`cvt_dec`, `cvt_fp32_fp`, `mx_dequant_bf16`, fold), in-range elements only, and the NVFP4 column-scale `fp32_mul` (arith.md contract items 6, 8) |
 
 **MXU (`core/mxu`)**
 
@@ -680,6 +701,7 @@ Conventions:
 | scale_rd | out/in | 64 B/cycle | valid/ready | rowscale / colscale |
 | acc_rmw | out/in | 64 x 32 read + 64 x 32 write per cycle | fixed latency | ACC update |
 | sem_inc | out | 6 + 4 | pulse | completion |
+| fp_flags | out | 4 | pulse, valid-qualified | `mxu_pe` flags at the bottom of each column, for rows `< M` and columns `< N` only, masked for `REG_DOT + 64·REG_OUT` cycles plus the A skew after reset (arith.md contract items 2-4) |
 
 **VPU (`core/vpu`, incl. SFU and top-k)**
 
@@ -690,6 +712,7 @@ Conventions:
 | acc_rd | out/in | 4 rows x 64 x 32 | fixed latency | ACC epilogues |
 | dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant (review finding V-9) | operand shapes when an instruction starts |
 | sem_inc | out | 6 + 4 | pulse | completion |
+| fp_flags | out | 4 | pulse, valid-qualified | VPU and SFU arithmetic and conversions, including `VQUANT` (Inf and NaN in a block detected from its inputs; arith.md contract item 8) |
 
 **SPM (`core/spm`)**
 
@@ -704,8 +727,9 @@ Conventions:
 |---|---|---|---|---|
 | rtr_out[2] / rtr_in[2] | out/in | flit_t | credit per VC | one per plane |
 | init_req / init_rsp | in/out | flit_t | valid/ready | from/to DMA |
-| tgt_spm / tgt_gsram / tgt_ctl | out/in | 128 B/cycle | valid/ready | target accesses incl. write-add |
+| tgt_spm / tgt_ctl | out/in | 128 B/cycle | valid/ready | target accesses incl. write-add (GSRAM is not behind the NI: it is its own target, `die/gsram`) |
 | sem_add | out | 6 + 32 | pulse | `rsem` byte counts, remote `SIGNAL` |
+| fp_flags | out | 4 | pulse, valid-qualified | write-add / max at the SPM target (`ADD_F32`, `ADD_BF16`, `MAX_F32`; arith.md contract item 7), to this core's `FP_STATUS` |
 
 **Router (`noc/router`)**
 
@@ -741,8 +765,9 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| noc | in/out | flit_t | credit per VC | router port 6 |
+| noc | in/out | flit_t | credit per VC | router port 6. The slice is an SRAM target with the rules of §2.6: write-add/max ALU, ack coalescing, epoch copy |
 | sem_add | out | 6 + 32 | pulse | to the tile's semaphore file |
+| fp_flags | out | 4 | pulse, valid-qualified | write-add / max at this slice, to the owning tile's `FP_STATUS` (`core/seq`) |
 
 **DTAB (`core/dtab`)**, 256 x 256 bits
 
@@ -758,6 +783,7 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 | mxu_rmw | in/out | 64 x 32 read + 64 x 32 write per cycle, row index 11 | fixed latency (read 2 cycles) | K-tile accumulation, `rowscale` / `colscale` at the input |
 | vpu_rd / vpu_wr | in/out | 4 rows x 64 x 32 per cycle | fixed latency | epilogues; ACC as a VPU operand or destination (space `ACC`) |
 | conflict | out | 1 | level | same-row MXU write and VPU access in one cycle: the VPU stalls (semaphores make this rare) |
+| fp_flags | out | 4 | pulse, valid-qualified | `acc_update` lanes (rowscale, colscale, add) of the columns `< N` (arith.md contract item 5) |
 
 **Leaf router (`noc/leaf`)**, 24 per die
 

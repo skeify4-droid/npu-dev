@@ -60,18 +60,20 @@ $(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py scripts/arith_hand_cases.py 
 	$(PY) scripts/gen_arith_vectors.py $(BUILD)/arith >/dev/null && touch $@
 
 # Unit tests: one iverilog simulation per tb_*.sv, paired with the RTL it names (rtl/common/<dut>.sv, or rtl/arith/<dut>.sv
-# compiled together with every arith file). Simulations run from build/ so the arith testbenches find arith/*.hex; they
-# include counts.svh from -I build/arith (a plain name, so that a stray arith/counts.svh in the compile directory cannot
-# shadow it; arith-vec has checked it against the lock). A testbench fails unless every vector file has exactly the row count of counts.svh (not zero), and the
-# simulator's warnings about a missing, short or long file (Unable to open, Not enough words, Too many words) fail it too.
+# compiled together with every arith file). Simulations run from build/ so the arith testbenches find arith/*.hex. The
+# compile runs inside build/arith, with absolute paths: Icarus looks for `include "counts.svh"` in the compile directory
+# first (before any -I), so the file it finds is the one arith-vec has checked against the lock, and a stray counts.svh
+# anywhere else cannot shadow it. A testbench fails unless every vector file has exactly the row count of counts.svh (not
+# zero), and the simulator's warnings about a missing, short or long file (Unable to open, Not enough words, Too many
+# words) fail it too.
 unit: $(BUILD) arith-vec
 	@for tb in $(UNIT_TB); do \
 	  name=$$(basename $$tb .sv); dut=$${name#tb_}; \
 	  echo "== unit $$name"; \
-	  if [ -f $(RTL_DIR)/common/$$dut.sv ]; then src=$(RTL_DIR)/common/$$dut.sv; \
-	  elif [ -f $(RTL_DIR)/arith/$$dut.sv ]; then src="$(ARITH_SV)"; \
+	  if [ -f $(RTL_DIR)/common/$$dut.sv ]; then src=$(ROOT)/$(RTL_DIR)/common/$$dut.sv; \
+	  elif [ -f $(RTL_DIR)/arith/$$dut.sv ]; then src="$(abspath $(ARITH_SV))"; \
 	  else echo "unit: no RTL for $$name"; exit 1; fi; \
-	  iverilog -g2012 -I $(BUILD)/arith -o $(BUILD)/$$name $$tb $$src 2>$(BUILD)/$$name.cmp; rc=$$?; \
+	  (cd $(abspath $(BUILD))/arith && iverilog -g2012 -o $(abspath $(BUILD))/$$name $(ROOT)/$$tb $$src) 2>$(BUILD)/$$name.cmp; rc=$$?; \
 	  grep -v "sorry: constant selects" $(BUILD)/$$name.cmp; [ $$rc -eq 0 ] || { echo "unit FAILED (compile): $$name"; exit 1; }; \
 	  (cd $(BUILD) && vvp -n $$name) 2>&1 | tee $(BUILD)/$$name.out; \
 	  if grep -qE "Unable to open|Not enough words|Too many words" $(BUILD)/$$name.out; then \

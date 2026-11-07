@@ -966,8 +966,7 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 
 Branch `p3-arith` (commits `95d918d` to `2cb3258`: blocks, spec, review). The fixes of the independent review
 ([arith_review.md](arith_review.md), F1-F13) are commit `51f8cbe`; its re-review ([arith_review2.md](arith_review2.md), commit
-`4898eb9`) found them fixed or partly fixed, and the fixes of that re-review (below, "Second review") are in the working tree,
-not committed (CLAUDE.md: commit only when asked).
+`4898eb9`) found them fixed or partly fixed, and the fixes of that re-review (below, "Second review") are commit `64e4a96`.
 `make lint`, `make unit` and `make pytest` (`test_arith.py`: 32 tests) are green. The spec for the blocks is
 [arith.md](../spec/arith.md); numerics.md N-2, N-3, N-5 and N-6 now state the nine places where it was silent or inconsistent.
 
@@ -982,7 +981,7 @@ tested through the blocks that instantiate them)
 - DMA fold: `fold_key`, `fold_amax`, `fold_c`, `fold_quant`.
 
 Other changes: `make unit` also builds the arith testbenches (all `rtl/arith` files per testbench, run from `build/`, vectors from
-the new `make arith-vec`, `-I build/arith` for `counts.svh`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
+the new `make arith-vec`, compiled inside `build/arith` for `counts.svh`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
 BLOCK=<arith block>` reads the whole directory; `make pytest` includes `test_arith.py`. `sw/npumodel/arith_ref.py` is the exact
 integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vectors.py` writes the vectors.
 
@@ -1045,7 +1044,7 @@ The independent review ([arith_review.md](arith_review.md)) found no wrong resul
 The independent oracle `scripts/arith_review/indep.py` has two changes after the review, both approved: the F3 flag rule and the F6
 decision (line 249, FP32 -> BF16 keeps subnormals). `check_files.py` reports 0 disagreements on every row of `build/arith`.
 
-### Second review (re-review of `51f8cbe`, [arith_review2.md](arith_review2.md)): fixes in the working tree
+### Second review (re-review of `51f8cbe`, [arith_review2.md](arith_review2.md)): fixes in `64e4a96`
 The re-review found the 13 findings fixed (9) or partly fixed (4), 6 surviving mutants, an infrastructure that did not bind the vectors to
 the generator, and 8 stale or contradictory spec sentences. Decisions of the integrator: A1 `INVALID` stays when the ACC lane also has a
 NaN input ("operation" = one multiply or add); A2 an `OVERWRITE` copy of a NaN `part` sets no `NAN_IN`; A3 short-tile padding is element 0
@@ -1066,6 +1065,22 @@ behaviour the RTL, reference and oracle already had; numerics.md states them now
   guard, and `make unit` on the truncated S1 copy stops in `arith-vec`.
 - Results: `make lint` (53 runs), `make unit` (all pass, 81 s), `make pytest` (263 passed), the 39 + 44 + 35 mutants as predicted,
   `check_files.py` 0 disagreements on 2,368,493 rows of 41 files, `handpicked.py` 283 cases and `spec_cases2.py` 78 cases agree.
+- Re-check of `64e4a96` (arith_review2.md, last section): every survivor killed, S1 / S3 / S4 fail (also through the Makefile),
+  C1-C4, C7, C8 and A1-A7 resolved. The three documentation items it left open are closed:
+  - C5: the NVFP4 scale product rounds up to 2^-126 for the single value 2^-126 − 2^-150 (numerics.md N-2 step 4, arith.md contract item 6);
+  - C6: N-8 now exempts MX tiles with `amax < 2^-118` from the bit-exact ACC / MXU rule;
+  - the commit wording above.
+  The integration gap I-1 is closed too: microarch.md §5 has `fp_flags` ports on DMA, MXU, ACC, VPU, NI and GSRAM, with
+  `fp_flags_in` on `core/seq`, and states their valid qualification and their ordering against completion semaphores and acks.
+- Stray `counts.svh` (S5 residual): the arith testbenches are now compiled inside `build/arith` (Makefile `unit`,
+  `run_arith_mutants.py`, `run_tb.sh`, `netlist_int.sh`). Icarus searches the compile directory before any `-I`, so the locked
+  file is the one found. `make unit` with an all-ones `counts.svh` planted in the repo root still passes with the real counts.
+- GSRAM attachment (found while adding the flag ports; it predates the arith work): microarch.md described the slice both as
+  its own endpoint on router port 6 and as a target behind the core's network interface (`tgt_gsram`). Decided: the slice is
+  its own SRAM target on port 6, with its own write-add ALU, ack coalescing and epoch copy, built from the same SRAM-target
+  module as the NI's SPM target. The NI is a target for SPM and CORECTL only. Edited: microarch.md §2 diagram, §2.6, §3, the
+  NI and GSRAM tables; numerics.md N-5; arith.md contract item 1; PLAN.md `core/ni`. noc.md, which already has the six-port
+  router, is unchanged.
 
 ### Next
 - `core/mxu` instantiates `mxu_pe` (skew, shadow weights, stationary load) and `core/acc` instantiates `acc_update`; the MXU test
