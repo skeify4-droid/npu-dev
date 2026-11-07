@@ -720,7 +720,8 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     (survived `cov4` with the port-level cover alone; now fails `cov4` at c8). A bypassed data-pointer
     stage (`wgray_r2 <= wgray`, `rgray_w2 <= rgray` or both) passed all six tasks and the unit tb; it now fails the latency
     tasks `l2` / `l4` (L1 / L2) and `tb_afifo`'s throughput check (`afifo_thr`: DEPTH 2 / 4 give 0.4 / 0.8 at zero phase
-    instead of 1/3 / 2/3), and still passes `d2` / `d4` / `d8`, `ph2` / `ph4`, `cov4`. The same stage taken as the flag
+    instead of 1/3 / 2/3 for a single bypass, `sync_w_bypass` or `sync_r_bypass` (400 / 800 pops per 1000 `rd_clk` edges); the double
+    bypass, `sync_wr_bypass`, gives 0.5 / 1.0 (500 / 1000)), and still passes `d2` / `d4` / `d8`, `ph2` / `ph4`, `cov4`. The same stage taken as the flag
     source (`rd_valid` from `wgray_r1`, `wr_ready` from `rgray_w1`) fails `d2` / `d4` / `d8`, `l2` / `l4` and the throughput
     check. Full set of 25 mutants (`scripts/afifo_mutants/mk_rtl_mutants.py`, `run_rtl_mutants.sh`; eight sby tasks and `tb_afifo` each; the `c7_w1_*` runs used the
     unit tb from before the throughput check): none survives. `c7_w*_freeze`, `c7_w2_hold` and `r_r*_freeze[_rst]`
@@ -767,7 +768,7 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     pushes, one `rd_clk` pop, two `wr_clk` edges carrying the read pointer into `rgray_w1` then `rgray_w2`, then
     `wr_ready` high. With an assumption that no step has both clocks rising, a scratch run reaches all eight port-level covers at
     the same steps. c9 is the read-side mirror of c8 (the FIFO drains, `wgray_r1` and `wgray_r2` each change, `rd_valid`
-    returns; step 19), c10 a second fill (`wr_ready` returns twice with no reset input in between; step 14). The read-side
+    returns; step 14), c10 a second fill (`wr_ready` returns twice with no reset input in between; step 19). The read-side
     freezes (`r_r1_freeze`, `r_r2_freeze`, `r_r12_freeze` and the reset-clearing `r_r1_freeze_rst`, `r_r2_freeze_rst`)
     fail c9, `c7_w2_hold` fails c10. Before review the fill cover was `!wr_ready && wr_rst_n`, reached
     at step 1 by the reset synchronizer alone. In the next review the old read-only cover fired with the read domain
