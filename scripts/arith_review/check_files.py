@@ -67,9 +67,9 @@ def chk_row(args):
         el, sc, y, fl = fields(line, [8, 8, 16, 4])
         got = I.mx_dequant_bf16(el, sc, *es)
         return None if got == (y, fl) else (line, got)
-    if name.startswith("fold_"):
-        es = {"mxfp4": (0, 0), "mxfp8": (1, 0), "nvfp4": (0, 1)}[name[5:]]
-        N = 64
+    if name.startswith("fold_") or name.startswith("fold256_"):
+        N = 256 if name.startswith("fold256_") else 64
+        es = {"mxfp4": (0, 0), "mxfp8": (1, 0), "nvfp4": (0, 1)}[name.split("_", 1)[1]]
         f = fields(line, [8] * N + [8] * N + [17, 10, 32] + [8] * N + [4] * N)
         els = list(reversed(f[0:N]))
         scs = list(reversed(f[N:2 * N]))
@@ -81,6 +81,17 @@ def chk_row(args):
         amax, c, cs, vs, fl = I.fold(els, scs, *es)
         ok = c == c_exp and cs == cs_exp and vs == v_exp and fl == fl_exp
         return None if ok else (line[:40], (c, c_exp, cs, cs_exp, [i for i in range(N) if vs[i] != v_exp[i] or fl[i] != fl_exp[i]]))
+    if name.startswith("foldq_"):               # fold_quant alone: el sc c v flags (c is 10-bit two's complement)
+        es = {"mxfp4": (0, 0), "mxfp8": (1, 0), "nvfp4": (0, 1)}[name[6:]]
+        el, sc, c, v, fl = fields(line, [8, 8, 10, 8, 4])
+        c = c - 1024 if c >= 512 else c
+        val = I.mx_val(el, sc, *es)
+        if val[0] == "nan":
+            got = (0x7F, I.NANIN)
+        else:
+            code, _, sa = I.rne(val[1], val[2] / I.F(2) ** c, I.E4M3, sat=True)
+            got = (code, I.SAT if sa else 0)
+        return None if got == (v, fl) else (line, got)
     if name == "fp8_mul":
         a, b, neg, nan, mag = fields(line, [8, 8, 1, 1, 36])
         A, B = I.decode(a, I.E4M3), I.decode(b, I.E4M3)

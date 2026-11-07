@@ -2,11 +2,12 @@
 // (E2M1 x E4M3 scale), exhaustive over every (element, scale) pair, bit-exact against sw/npumodel/arith_ref.py
 // (checked against numerics.mx_dequant and ml_dtypes by test_arith.py).
 `timescale 1ns/1ps
+`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module mx_chk #(
   parameter int    ELEM  = 0,
   parameter int    SCALE = 0,
   parameter string FILE  = "",
-  parameter int    MAXN  = 70000
+  parameter int    MAXN  = 1              // exact row count of FILE
 ) (
   output int errors, output int n
 );
@@ -28,14 +29,15 @@ module mx_chk #(
         if (errors <= 5) $display("MISMATCH ELEM=%0d SCALE=%0d el=%h sc=%h y=%h flags=%h  exp y=%h flags=%h", ELEM, SCALE, el, sc, y, flags, mem[i][19:4], mem[i][3:0]);
       end
     end
+    if (n != MAXN) begin errors++; $display("ELEM=%0d SCALE=%0d: expected %0d vectors, read %0d", ELEM, SCALE, MAXN, n); end
   end
 endmodule
 
 module tb_mx_dequant_bf16;
   int e [3], n [3];
-  mx_chk #(.ELEM(0), .SCALE(0), .FILE("arith/mx_dequant_mxfp4.hex")) c0 (.errors(e[0]), .n(n[0]));
-  mx_chk #(.ELEM(1), .SCALE(0), .FILE("arith/mx_dequant_mxfp8.hex")) c1 (.errors(e[1]), .n(n[1]));
-  mx_chk #(.ELEM(0), .SCALE(1), .FILE("arith/mx_dequant_nvfp4.hex")) c2 (.errors(e[2]), .n(n[2]));
+  mx_chk #(.ELEM(0), .SCALE(0), .FILE("arith/mx_dequant_mxfp4.hex"), .MAXN(`CNT_MX_DEQUANT_MXFP4)) c0 (.errors(e[0]), .n(n[0]));
+  mx_chk #(.ELEM(1), .SCALE(0), .FILE("arith/mx_dequant_mxfp8.hex"), .MAXN(`CNT_MX_DEQUANT_MXFP8)) c1 (.errors(e[1]), .n(n[1]));
+  mx_chk #(.ELEM(0), .SCALE(1), .FILE("arith/mx_dequant_nvfp4.hex"), .MAXN(`CNT_MX_DEQUANT_NVFP4)) c2 (.errors(e[2]), .n(n[2]));
   initial begin
     #100000000;
     if (e[0] + e[1] + e[2] == 0 && n[0] == 4096 && n[1] == 65536 && n[2] == 4096)

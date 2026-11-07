@@ -1,8 +1,9 @@
 // Self-checking testbench for acc_update (iverilog -g2012): RESCALE / column scale / OVERWRITE / accumulate, bit-exact
 // against sw/npumodel/arith_ref.py (vectors: scripts/gen_arith_vectors.py).
 `timescale 1ns/1ps
+`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module tb_acc_update;
-  localparam int MAXN = 25000;
+  localparam int MAXN = `CNT_ACC_UPDATE;      // exact row count of the file
   logic [166:0] mem [0:MAXN-1];
   logic [31:0] acc, part, rs, cs, y;
   logic rescale, use_cs, overwrite;
@@ -25,7 +26,7 @@ module tb_acc_update;
         if (errors <= 10) $display("MISMATCH acc=%h part=%h rs=%h cs=%h ctl=%b%b%b y=%h f=%h exp y=%h f=%h", acc, part, rs, cs, rescale, use_cs, overwrite, y, flags, mem[i][35:4], mem[i][3:0]);
       end
     end
-    if (n < 1000) begin errors++; $display("too few vectors: %0d", n); end
+    if (n != MAXN) begin errors++; $display("expected %0d vectors, read %0d", MAXN, n); end
     if (errors == 0) $display("PASS acc_update (%0d vectors)", n);
     else $display("FAIL acc_update: %0d errors of %0d", errors, n);
     $finish;

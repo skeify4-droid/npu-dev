@@ -1,6 +1,6 @@
 """Targeted vectors for the fp_addu guard-bit bound: one-bit cancellation (big = 1.000..x, opposite sign), exponent
 differences 2..60, small mantissas that put the exact result on / next to a rounding tie. Expected from indep.py.
-Writes OUT/arith/fp32_add.hex and OUT/arith/bf16_dot2.hex."""
+Writes OUT/arith/fp32_add.hex, OUT/arith/bf16_dot2.hex and OUT/arith/counts.svh (the row counts the testbenches require)."""
 import os
 import random
 import sys
@@ -44,6 +44,7 @@ rnd.shuffle(rows)
 rows = rows[:150000]
 open(os.path.join(OUT, "arith", "fp32_add.hex"), "w").write("\n".join(rows) + "\n")
 print("fp32_add rows", len(rows))
+COUNTS = {"FP32_ADD": len(rows)}
 
 
 # ---- bf16_dot2: p0 = 1.x * 1.y * 2^E (x, y few bits), p1 = -(1.u * 1.v) * 2^(E - d)
@@ -72,3 +73,7 @@ rnd.shuffle(rows)
 rows = rows[:140000]
 open(os.path.join(OUT, "arith", "bf16_dot2.hex"), "w").write("\n".join(rows) + "\n")
 print("bf16_dot2 rows", len(rows))
+COUNTS["BF16_DOT2"] = len(rows)
+with open(os.path.join(OUT, "arith", "counts.svh"), "w") as f:
+    for k, v in COUNTS.items():
+        f.write("`define CNT_%s %d\n" % (k, v))

@@ -23,12 +23,11 @@ NAN16 = 0x7FC0
 F32 = (8, 23, 0, False, True)
 F32_NOFTZ = (8, 23, 0, False, False)
 BF16 = (8, 7, 0, False, False)
-BF16_FTZ = (8, 7, 0, False, True)
 FP16 = (5, 10, 0, False, False)
 E4M3 = (4, 3, 1, True, False)
 E5M2 = (5, 2, 0, True, False)
 E2M1 = (2, 1, 2, True, False)
-SPEC = {"BF16": BF16_FTZ, "FP16": FP16, "E4M3": E4M3, "E5M2": E5M2, "E2M1": E2M1}
+SPEC = {"BF16": BF16, "FP16": FP16, "E4M3": E4M3, "E5M2": E5M2, "E2M1": E2M1}
 FMT_ID = {"BF16": 0, "FP16": 1, "E4M3": 2, "E5M2": 3, "E2M1": 4}
 
 
@@ -185,6 +184,8 @@ def fp32_max(a: int, b: int):
 
 
 def acc_update(acc, part, rowscale, cs, rescale, use_cs, overwrite):
+    """One ACC lane. flags = OR of the three operations' flags, but NAN_IN only for a NaN among the lane's external
+    operands that it uses (a NaN made by its own multiplier is INVALID there and is not consumed again)."""
     fl = 0
     acc_r = acc
     if rescale:
@@ -197,6 +198,9 @@ def acc_update(acc, part, rowscale, cs, rescale, use_cs, overwrite):
     if overwrite:
         return p, fl
     y, f = fp32_add(acc_r, p)
+    f &= ~NANIN
+    if (not rescale and dec32(acc)[0] == "nan") or (not use_cs and dec32(part)[0] == "nan"):
+        f |= NANIN
     return y, fl | f
 
 

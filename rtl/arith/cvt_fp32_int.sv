@@ -28,7 +28,7 @@ module cvt_fp32_int #(
     else if (sh >= 0) m = (sh > 36) ? 64'hFFFF_FFFF_FFFF_FFFF : (64'(frac_m) << sh);
     else begin
       rs = -sh;
-      if (rs > 25) m = 64'd0;                                   // below one half of the LSB
+      if (rs > 24) m = 64'd0;                                   // below one half of the LSB (frac_m < 2^24, so rs - 1 <= 23 below)
       else begin
         m = 64'(frac_m >> rs);
         if (frac_m[rs-1] && ((|(frac_m & ((24'd1 << (rs-1)) - 24'd1))) || m[0])) m = m + 64'd1;

@@ -2,8 +2,9 @@
 //   FMT 0 BF16, 1 FP16, 2 E4M3, 3 E5M2, 4 E2M1. The result is y[WO-1:0] = {sign, exp, mantissa}; the upper bits are 0.
 //   - RNE. E4M3, E5M2, E2M1 saturate (|x| above the largest finite value after rounding and +-Inf give +-max);
 //     BF16 and FP16 overflow to +-Inf.
-//   - BF16 results below 2^-126 flush to a signed zero (N-2), but a result that rounds up to 2^-126 is kept. FP16
-//     keeps subnormals; FP8 and FP4 keep subnormals.
+//   - Subnormal results are kept for every target (N-2, N-5): the value is rounded onto the destination's subnormal grid
+//     (BF16 2^-133, FP16 2^-24, ...), and an FP32 subnormal input is converted, not read as zero (DAZ applies to
+//     arithmetic units only). A BF16 result that rounds up to 2^-126 is the minimum normal.
 //   - NaN in -> the canonical NaN of the target (BF16 0x7FC0, FP16 0x7E00, E4M3 0x7F, E5M2 0x7E). E2M1 has no NaN:
 //     y = 0 and `nan_in` tells the block-quantizer (N-2: FP4 -> block NaN scale).
 //   - flags = {nan_in, sat, ovf, invalid}: sat = a finite input saturated, ovf = a finite input overflowed to Inf.
@@ -18,7 +19,7 @@ module cvt_fp32_fp #(
   localparam int MB   = (FMT == 0) ? 7 : (FMT == 1) ? 10 : (FMT == 2) ? 3 : (FMT == 3) ? 2 : 1;
   localparam int KIND = (FMT == 2) ? 1 : (FMT == 4) ? 2 : 0;
   localparam bit SAT  = (FMT >= 2);
-  localparam bit FTZ  = (FMT == 0);
+  localparam bit FTZ  = 1'b0;                   // conversions keep subnormals
   localparam int WO   = 1 + EB + MB;
   localparam logic [15:0] NANC = (FMT == 0) ? 16'h7FC0 : (FMT == 1) ? 16'h7E00 : (FMT == 2) ? 16'h007F :
                                  (FMT == 3) ? 16'h007E : 16'h0000;

@@ -7,7 +7,7 @@ unit testbench that should notice, and compare with the expected outcome.
            correct design
 
 Usage (one at a time, a few minutes, no VM): scripts/memrun arith_mutants python3 scripts/arith_mutants/run_arith_mutants.py [name ...]
-Needs build/arith/*.hex (make arith-vec). Exit code 1 if any outcome differs from the expectation.
+Needs build/arith/*.hex and counts.svh (make arith-vec); a mutant run that finds a vector file missing, short or long is an ERROR, not a kill. Exit code 1 if any outcome differs from the expectation.
 """
 import os
 import shutil
@@ -53,11 +53,14 @@ MUTANTS = [
     ("add_no_daz", [("fp32_add.sv", "a_z   = (a[30:23] == 8'h00);", "a_z   = (a == 32'h0) || (a == 32'h80000000);")], "fp32_add", "kill", "DAZ"),
     ("mul_elsb", [("fp32_mul.sv", "- 12'sd300;", "- 12'sd299;")], "fp32_mul", "kill", "exponent"),
     ("acc_flags", [("acc_update.sv", "(use_cs ? f_cs : 4'd0)", "(use_cs ? f_rs : 4'd0)")], "acc_update", "kill", "flag source"),
+    ("acc_nan_made", [("acc_update.sv", "{f_add[3] & nan_add, f_add[2:0]}", "f_add")], "acc_update", "kill", "NAN_IN for a NaN the lane's own multiplier made (F3)"),
+    ("acc_nan_part", [("acc_update.sv", "(!rescale && acc_nan) || (!use_cs && part_nan)", "(!use_cs && part_nan)")], "acc_update", "kill", "NaN acc added without NAN_IN"),
+    ("int_rs24_off", [("cvt_fp32_int.sv", "if (rs > 24)", "if (rs > 23)")], "cvt_fp32_int", "kill", "values in [0.25, 0.5) rounding (rs = 24 is a real rounding case)"),
     ("max_zero", [("fp32_max.sv", "a_ge = ~a[31] | b[31];", "a_ge = 1'b1;")], "fp32_max", "kill", "max(-0, +0)"),
     ("max_nan", [("fp32_max.sv", "if (a_nan | b_nan) y = 32'h7FC00000;", "if (a_nan) y = 32'h7FC00000; else if (b_nan) y = b;")], "fp32_max", "kill", "NaN result"),
     ("max_daz", [("fp32_max.sv", "am    = (a[30:23] == 8'h00) ? 31'd0 : a[30:0];", "am    = a[30:0];")], "fp32_max", "kill", "DAZ"),
     # converters, dequantizer, fold
-    ("bf16_noftz", [("cvt_fp32_fp.sv", "localparam bit FTZ  = (FMT == 0);", "localparam bit FTZ  = 1'b0;")], "cvt_fp32_fp", "kill", "BF16 flush"),
+    ("bf16_ftz", [("cvt_fp32_fp.sv", "localparam bit FTZ  = 1'b0;", "localparam bit FTZ  = (FMT == 0);")], "cvt_fp32_fp", "kill", "BF16 subnormals flushed (F6: kept)"),
     ("sat_off_e4m3", [("cvt_fp32_fp.sv", "localparam bit SAT  = (FMT >= 2);", "localparam bit SAT  = (FMT >= 3);")], "cvt_fp32_fp", "kill", "E4M3 saturation"),
     ("dec_bias", [("cvt_dec.sv", "- 12'(BIAS + MB);", "- 12'(BIAS + MB + 1);")], "cvt_dec", "kill", "decode exponent"),
     ("mx_exp", [("mx_exact.sv", "- 10'sd10;\n      e_nan = (el[6:0] == 7'h7F);", "- 10'sd9;\n      e_nan = (el[6:0] == 7'h7F);")], "mx_dequant_bf16", "kill", "E4M3 element exponent"),
@@ -80,16 +83,19 @@ def run(name, edits, tb, expect, note):
         open(p, "w").write(s.replace(old, new, 1))
     exe = os.path.join(d, "sim")
     srcs = sorted(os.path.join(d, x) for x in os.listdir(d) if x.endswith(".sv"))
-    r = subprocess.run(["iverilog", "-g2012", "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs, capture_output=True, text=True)
+    r = subprocess.run(["iverilog", "-g2012", "-I", os.path.join(ROOT, "build"), "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs, capture_output=True, text=True)
     if r.returncode:
         return "COMPILE-ERROR " + r.stderr[-300:]
     r = subprocess.run(["vvp", "-n", exe], cwd=os.path.join(ROOT, "build"), capture_output=True, text=True)
     shutil.rmtree(d, ignore_errors=True)
+    if any(w in r.stdout + r.stderr for w in ("Unable to open", "Not enough words", "Too many words")):
+        return "ERROR vector file missing, short or long (make arith-vec; make unit)"
     return "survive" if any(l.startswith("PASS") for l in r.stdout.splitlines()) else "kill"
 
 
 def main():
-    if not os.path.exists(os.path.join(ROOT, "build", "arith", "fp32_add.hex")):
+    if subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "gen_arith_vectors.py"), "--check",
+                       os.path.join(ROOT, "build", "arith")]).returncode:
         sys.exit("run `make arith-vec` first")
     sel = set(sys.argv[1:])
     bad = 0

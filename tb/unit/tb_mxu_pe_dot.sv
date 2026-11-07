@@ -1,8 +1,9 @@
 // Self-checking testbench for mxu_pe_dot (iverilog -g2012): the mode mux over fp8_dot4 / bf16_dot2, bit-exact against
 // sw/npumodel/arith_ref.py (vectors: scripts/gen_arith_vectors.py, FP8 rows then BF16 rows).
 `timescale 1ns/1ps
+`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module tb_mxu_pe_dot;
-  localparam int MAXN = 20000;
+  localparam int MAXN = `CNT_MXU_PE_DOT;      // exact row count of the file
   logic [100:0] mem [0:MAXN-1];
   logic mode;
   logic [31:0] a, w, d;
@@ -24,7 +25,7 @@ module tb_mxu_pe_dot;
         if (errors <= 10) $display("MISMATCH mode=%b a=%h w=%h d=%h flags=%h  exp d=%h flags=%h", mode, a, w, d, flags, mem[i][35:4], mem[i][3:0]);
       end
     end
-    if (n8 < 1000 || n16 < 1000) begin errors++; $display("too few vectors: fp8 %0d bf16 %0d", n8, n16); end
+    if (n != MAXN || n8 < 1000 || n16 < 1000) begin errors++; $display("expected %0d vectors, read %0d (fp8 %0d, bf16 %0d)", MAXN, n, n8, n16); end
     if (errors == 0) $display("PASS mxu_pe_dot (%0d fp8 + %0d bf16 vectors)", n8, n16);
     else $display("FAIL mxu_pe_dot: %0d errors of %0d", errors, n);
     $finish;

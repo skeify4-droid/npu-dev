@@ -10,8 +10,10 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "sw"))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
 from npumodel import arith_ref as R  # noqa: E402
 from npumodel import numerics as nm  # noqa: E402
+import arith_hand_cases as H  # noqa: E402
 
 RNG = np.random.default_rng(11)
 ML = {"E4M3": md.float8_e4m3fn, "E5M2": md.float8_e5m2, "E2M1": md.float4_e2m1fn, "BF16": md.bfloat16, "FP16": np.float16}
@@ -24,6 +26,13 @@ def f32bits(x):
 
 def bits32(b):
     return float(np.uint32(b).view(np.float32))
+
+
+def same(got, want):
+    """Equal values with equal sign of zero, or both NaN (-0 and +0 are different results)."""
+    got, want = np.asarray(got, dtype=np.float64), np.asarray(want, dtype=np.float64)
+    both_nan = np.isnan(got) & np.isnan(want)
+    return bool(np.all(both_nan | ((got == want) & (np.signbit(got) == np.signbit(want)))))
 
 
 def val(kind_s_m_k):
@@ -79,17 +88,17 @@ def test_cvt_dec_matches_ml_dtypes(fmt):
 def test_cvt_fp32_fp_matches_golden_and_ml_dtypes(fmt):
     eb, mb, kind, sat, ftz = R.SPEC[fmt]
     f = NMF[fmt]
-    e = RNG.integers(max(1, 127 + f.emin - mb - 3), min(254, 127 + int(np.log2(f.max)) + 3), 40000)
+    e = RNG.integers(max(0, 127 + f.emin - mb - 3), min(254, 127 + int(np.log2(f.max)) + 3), 40000)   # field 0: FP32 subnormals
+    e[:200] = 0                                                                                         # and plenty of them
     x = np.array([(int(RNG.integers(0, 2)) << 31) | (int(ei) << 23) | int(RNG.integers(0, 1 << 23)) for ei in e], dtype=np.uint32)
     xf = x.view(np.float32)
     got = np.array([R.cvt_fp32_fp(int(b), fmt)[0] for b in x], dtype=np.int64)
-    # golden: numerics.round_to + encode (FTZ for the BF16 conversion, N-2)
-    want = nm.encode(nm.round_to(xf.astype(np.float64), f, ftz=(fmt == "BF16")), f)
+    # golden: numerics.round_to + encode; BF16 through the named DMA conversion (subnormals kept, N-2 / N-5)
+    rounded = nm.cvt_fp32_bf16(xf.astype(np.float64)) if fmt == "BF16" else nm.round_to(xf.astype(np.float64), f)
+    want = nm.encode(rounded, f)
     assert np.array_equal(got, want)
-    # ml_dtypes agrees wherever it does not overflow to NaN / Inf (and, for BF16, below the flush)
+    # ml_dtypes agrees wherever it does not overflow to NaN / Inf
     ok = np.abs(xf) <= f.max
-    if fmt == "BF16":
-        ok &= np.abs(xf) >= 2.0 ** -126
     if fmt in ("E4M3", "E5M2", "E2M1"):
         dt = ML[fmt]
         ref = xf[ok].astype(dt)
@@ -112,8 +121,9 @@ def test_cvt_fp32_fp_specials():
     assert R.cvt_fp32_fp(f32bits(480.0), "E4M3") == (0x7E, R.SAT)          # would be the NaN code without saturation
     assert R.cvt_fp32_fp(f32bits(1e5), "FP16") == (0x7C00, R.OVF)
     assert R.cvt_fp32_fp(f32bits(7.0), "E2M1") == (0x7, R.SAT)
-    assert R.cvt_fp32_fp(0x007FFFFF, "BF16")[0] == 0x0080                # a subnormal that rounds up to 2^-126 is kept
-    assert R.cvt_fp32_fp(0x00400000, "BF16")[0] == 0x0000                # still subnormal -> flushed
+    assert R.cvt_fp32_fp(0x007FFFFF, "BF16")[0] == 0x0080                # rounds up to 2^-126
+    assert R.cvt_fp32_fp(0x00400000, "BF16")[0] == 0x0040                # a BF16 subnormal: kept (F6)
+    assert R.cvt_fp32_fp(0x80010000, "BF16")[0] == 0x8001                # the smallest BF16 subnormal, negative
     assert R.cvt_fp32_fp(0x7FC00000, "E2M1") == (0, R.NANIN)
 
 
@@ -130,16 +140,15 @@ def test_cvt_fp32_int_matches_numpy():
 def test_rnd_matches_golden_round_to():
     for spec, f, ftz in ((R.F32, nm.FP32, True), (R.BF16, nm.BF16, False), (R.E4M3, nm.E4M3, False), (R.FP16, nm.FP16, False)):
         for _ in range(3000):
-            m = int(RNG.integers(1, 1 << int(RNG.integers(1, 60))))
+            m = int(RNG.integers(1, 1 << int(RNG.integers(1, 54))))          # m < 2^53: m * 2^k is exact in float64
             k = int(RNG.integers(-190, 140))
             s = int(RNG.integers(0, 2))
             code, ovf, sat = R.rnd(s, m, k, spec)
-            exact = np.float64(m) * 2.0 ** k if m < (1 << 53) else None
-            if exact is None or not np.isfinite(exact):
-                continue
+            exact = np.float64(m) * 2.0 ** k
+            assert np.isfinite(exact)
             want = nm.round_to(-exact if s else exact, f, ftz=ftz)
             got = nm.decode(np.array([code]), f)[0] if f.bits <= 16 else bits32(code)
-            assert (np.isnan(want) and np.isnan(got)) or got == want, (spec, m, k, s)
+            assert same(got, want), (spec, m, k, s)
 
 
 def test_fp8_exhaustive_products_match_ml_dtypes():
@@ -168,7 +177,7 @@ def test_fp8_dot4_chain_matches_mxu_mm():
         A = nm.decode(a, nm.E4M3)[None, :]
         W = nm.decode(w, nm.E4M3)[:, None]
         want = nm.mxu_mm(A, W, "FP8")[0, 0]
-        assert bits32(part) == want or (bits32(part) == 0 and want == 0)
+        assert same(bits32(part), want)
 
 
 def test_bf16_dot2_chain_matches_mxu_mm():
@@ -182,7 +191,7 @@ def test_bf16_dot2_chain_matches_mxu_mm():
             d, _ = R.bf16_dot2(list(ac[2 * r:2 * r + 2]), list(wc[2 * r:2 * r + 2]))
             part, _ = R.fp32_add(part, d)
         want = nm.mxu_mm(a[None, :], w[:, None], "BF16")[0, 0]
-        assert bits32(part) == want or (bits32(part) == 0 and want == 0)
+        assert same(bits32(part), want)
 
 
 def test_fp32_add_mul_match_numpy_float32():
@@ -198,7 +207,7 @@ def test_fp32_add_mul_match_numpy_float32():
         ym, _ = R.fp32_mul(int(a[i]), int(b[i]))
         sa = int(s[i])
         if (sa & 0x7FFFFFFF) >= 0x00800000 or sa & 0x7FFFFFFF == 0:       # normal result (else FTZ differs from IEEE)
-            assert ya == sa or (sa & 0x7FFFFFFF == 0 and ya & 0x7FFFFFFF == 0)
+            assert ya == sa                                                  # including the sign of a zero sum
         pm = int(p[i])
         if (pm & 0x7FFFFFFF) >= 0x00800000:
             assert ym == pm
@@ -222,13 +231,13 @@ def test_mx_dequant_matches_golden(elem, scale, kind):
         v_el = nm.decode(np.array([el]), f_el)[0]
         for sc in range(256):
             y, fl = R.mx_dequant_bf16(el, sc, elem, scale)
-            if scale == 0:
-                v_sc = np.nan if sc == 255 else 2.0 ** (sc - 127)
-            else:
-                v_sc = nm.decode(np.array([sc]), nm.E4M3)[0]
-            want = nm.round_to(np.float64(v_el) * v_sc, nm.BF16) if not (np.isnan(v_el) or np.isnan(v_sc)) else np.nan
+            if scale == 0:                                           # E8M0 block scale: numerics.mx_dequant (X = code - 127)
+                prod = nm.mx_dequant(np.array([[v_el]]), np.array([sc - 127]))[0, 0]
+            else:                                                    # E4M3 block scale, tensor scale 1: numerics.nvfp4_dequant
+                prod = nm.nvfp4_dequant(np.array([[v_el]]), nm.decode(np.array([sc]), nm.E4M3), 1.0)[0, 0]
+            want = nm.round_to(prod, nm.BF16)                          # subnormals kept (I-15)
             got = nm.decode(np.array([y]), nm.BF16)[0]
-            assert (np.isnan(want) and np.isnan(got)) or got == want, (kind, el, sc)
+            assert same(got, want), (kind, el, sc)
 
 
 @pytest.mark.parametrize("elem,scale", [(0, 0), (1, 0), (0, 1)])
@@ -240,15 +249,19 @@ def test_fold_matches_golden_fold_e4m3(elem, scale):
         if scale == 0:
             base = int(RNG.integers(30, 200))
             scs = base + RNG.integers(0, 15, N)                        # spread <= 14 binades of block scale
+            if t % 4 == 1:
+                scs[32:] = 255                                         # a block with the E8M0 NaN scale
         else:
             scs = RNG.integers(0x08, 0x7E, N)
+            if t % 4 == 1:
+                scs[16:32] = 0x7F                                      # a block with the E4M3 NaN scale
+        if t % 4 == 2 and elem == 1:
+            els[int(RNG.integers(0, N))] = 0x7F                        # a NaN element (MXFP8; E2M1 has no NaN)
         vals = []
         for e, s in zip(els, scs):
             sg, nan, zero, sig, elsb = R.mx_exact(int(e), int(s), elem, scale)
-            vals.append(np.copysign(sig * 2.0 ** elsb, -1.0 if sg else 1.0))
+            vals.append(np.nan if nan else np.copysign(sig * 2.0 ** elsb, -1.0 if sg else 1.0))
         w = np.array(vals)
-        if np.isnan(nm.decode(els, f_el)).any():
-            continue
         v_g, cs_g = nm.fold_e4m3(w[None, :], ktile=N)
         keys = [R.fold_key(int(e), int(s), elem, scale) for e, s in zip(els, scs)]
         c = R.fold_c(max(keys))
@@ -258,5 +271,48 @@ def test_fold_matches_golden_fold_e4m3(elem, scale):
         # signed zeros: the golden encode keeps the sign of -0 as well
         assert np.array_equal(np.array(got), want)
         assert R.fold_cs(c) == f32bits(cs_g[0, 0])
-        if scale == 0 and elem == 0:                                   # MXFP4 with a spread <= 14 binades: exact (N-2)
+        if scale == 0 and elem == 0 and not np.isnan(w).any():         # MXFP4 with a spread <= 14 binades: exact (N-2)
             assert np.array_equal(nm.unfold(v_g, cs_g, ktile=N)[0], w)
+
+
+# ------------------------------------------------------------------ hand-derived cases (scripts/arith_hand_cases.py)
+# The literals were worked out by hand from numerics.md and are independent of arith_ref. gen_arith_vectors.py puts these
+# inputs into the RTL vectors with the expected values of arith_ref, so this test is what ties the RTL's hand cases to the
+# hand values.
+def test_hand_cases_equal_arith_ref():
+    n = 0
+    for a, b, y, f in H.ADD:
+        assert R.fp32_add(a, b) == (y, f), ("add", hex(a), hex(b))
+    for a, b, y, f in H.MUL:
+        assert R.fp32_mul(a, b) == (y, f), ("mul", hex(a), hex(b))
+    for a, b, y, f in H.MAX:
+        assert R.fp32_max(a, b) == (y, f), ("max", hex(a), hex(b))
+    for a, w, y, f in H.DOT8:
+        assert R.fp8_dot4(a, w) == (y, f), ("dot8", a, w)
+    for a, w, y, f in H.DOT16:
+        assert R.bf16_dot2(a, w) == (y, f), ("dot16", a, w)
+    for fmt, x, y, f in H.CVT:
+        assert R.cvt_fp32_fp(x, fmt) == (y, f), ("cvt", fmt, hex(x))
+    for bits, sg, x, y, f in H.CINT:
+        assert R.cvt_fp32_int(x, bits, bool(sg)) == (y, f), ("int", bits, sg, hex(x))
+    for fmt, tb, c, y, f in H.DEC:
+        assert R.cvt_dec(c, fmt, bool(tb)) == (y, f), ("dec", fmt, tb, hex(c))
+    for e, s, el, sc, y, f in H.MXD:
+        assert R.mx_dequant_bf16(el, sc, e, s) == (y, f), ("mxd", e, s, hex(el), hex(sc))
+    for acc, part, rs, cs, rsc, ucs, ow, y, f in H.ACC:
+        assert R.acc_update(acc, part, rs, cs, rsc, ucs, ow) == (y, f), ("acc", hex(acc), hex(part), rsc, ucs, ow)
+    for spec in H.FOLD:
+        elem, scale, _, _, c_h, cs_h, vh = spec
+        els, scs = H.tile_of(spec)
+        c = R.fold_c(max(R.fold_key(e, s, elem, scale) for e, s in zip(els, scs)))
+        assert (c, R.fold_cs(c)) == (c_h, cs_h), ("fold", spec[:2], sorted(spec[2].items())[:2])
+        for i, (v, f) in vh.items():
+            assert R.fold_quant(els[i], scs[i], c, elem, scale) == (v, f), ("fold", spec[:2], i)
+    n = sum(len(x) for x in (H.ADD, H.MUL, H.MAX, H.DOT8, H.DOT16, H.CVT, H.CINT, H.DEC, H.MXD, H.ACC, H.FOLD))
+    assert n == 279          # 265 cases of the review, 8 ACC_UPDATE cases (F3), 6 BF16 subnormal conversions (F6)
+
+
+def test_hand_cases_cover_the_review_findings():
+    """The cases that the vector gaps of the review (F3, F5) need are among the literals."""
+    assert ([0x7E] * 4, [0x7E] * 4, 0x49440000, 0) in H.DOT8                       # 4 x 448^2, the top of the 39-bit sum
+    assert any(r[7:] == (R.NAN32, R.INV) and r[4:7] == (0, 1, 0) for r in H.ACC)   # NaN made by the column scale: no NAN_IN

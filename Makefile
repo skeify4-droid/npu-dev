@@ -47,13 +47,19 @@ lint:
 	  verilator --lint-only -Wall --top-module $$top $$opts $(ARITH_SV) || exit 1; \
 	done
 
-# Test vectors of the arith testbenches (exact reference sw/npumodel/arith_ref.py -> build/arith/*.hex, about 12 s).
+# Test vectors of the arith testbenches (exact reference sw/npumodel/arith_ref.py -> build/arith/*.hex and counts.svh, about
+# 15 s). Regenerated when a generator input changed (stamp) or when an expected output file is missing (`--check`). A file
+# that is present but short or damaged is not regenerated: make unit fails on it (row counts in counts.svh).
 arith-vec: $(BUILD)/arith/.stamp
-$(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py sw/npumodel/arith_ref.py sw/npumodel/numerics.py
+	@$(PY) scripts/gen_arith_vectors.py --check $(BUILD)/arith >/dev/null 2>&1 || { echo "arith-vec: output missing, regenerating"; \
+	  $(PY) scripts/gen_arith_vectors.py $(BUILD)/arith >/dev/null && touch $<; }
+$(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py scripts/arith_hand_cases.py sw/npumodel/arith_ref.py sw/npumodel/numerics.py
 	$(PY) scripts/gen_arith_vectors.py $(BUILD)/arith >/dev/null && touch $@
 
 # Unit tests: one iverilog simulation per tb_*.sv, paired with the RTL it names (rtl/common/<dut>.sv, or rtl/arith/<dut>.sv
-# compiled together with every arith file). Simulations run from build/ so the arith testbenches find arith/*.hex.
+# compiled together with every arith file). Simulations run from build/ so the arith testbenches find arith/*.hex and
+# arith/counts.svh (-I build). A testbench fails unless every vector file has exactly the row count of counts.svh, and the
+# simulator's warnings about a missing, short or long file (Unable to open, Not enough words, Too many words) fail it too.
 unit: $(BUILD) arith-vec
 	@for tb in $(UNIT_TB); do \
 	  name=$$(basename $$tb .sv); dut=$${name#tb_}; \
@@ -61,9 +67,11 @@ unit: $(BUILD) arith-vec
 	  if [ -f $(RTL_DIR)/common/$$dut.sv ]; then src=$(RTL_DIR)/common/$$dut.sv; \
 	  elif [ -f $(RTL_DIR)/arith/$$dut.sv ]; then src="$(ARITH_SV)"; \
 	  else echo "unit: no RTL for $$name"; exit 1; fi; \
-	  iverilog -g2012 -o $(BUILD)/$$name $$tb $$src 2>$(BUILD)/$$name.cmp; rc=$$?; \
+	  iverilog -g2012 -I $(BUILD) -o $(BUILD)/$$name $$tb $$src 2>$(BUILD)/$$name.cmp; rc=$$?; \
 	  grep -v "sorry: constant selects" $(BUILD)/$$name.cmp; [ $$rc -eq 0 ] || { echo "unit FAILED (compile): $$name"; exit 1; }; \
-	  (cd $(BUILD) && vvp -n $$name) 2>&1 | grep -v "Not enough words" | tee $(BUILD)/$$name.out; \
+	  (cd $(BUILD) && vvp -n $$name) 2>&1 | tee $(BUILD)/$$name.out; \
+	  if grep -qE "Unable to open|Not enough words|Too many words" $(BUILD)/$$name.out; then \
+	    echo "unit FAILED (vector file missing, short or long): $$name"; exit 1; fi; \
 	  grep -q "^PASS" $(BUILD)/$$name.out || { echo "unit FAILED: $$name"; exit 1; }; \
 	done
 	@echo "unit: ALL PASS"

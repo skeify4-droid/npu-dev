@@ -38,7 +38,7 @@ M = [
     ("int_sat_inf", [("cvt_fp32_int.sv", "clamp & !is_inf & !is_nan", "clamp & !is_nan")], ["cvt_fp32_int"], "kill"),
     ("bf16_inv_nanin", [("bf16_dot2.sv", "inv     = !(|in_nan) &&", "inv     = 1'b1 &&")], ["bf16_dot2"], "kill"),
     ("dq_ovf_off", [("mx_dequant_bf16.sv", "{nan, 1'b0, ovf & !nan, 1'b0}", "{nan, 1'b0, 1'b0, 1'b0}")], ["mx_dequant_bf16"], "kill"),
-    ("foldq_sat_off", [("fold_quant.sv", "sat & !nan", "1'b0")], ["fold_quant"], "unreachable"),
+    ("foldq_sat_off", [("fold_quant.sv", "sat & !nan", "1'b0")], ["fold_quant"], "kill"),     # F10: fold_quant alone, c below the element's own
     # mxu_pe pipeline alignment and reset
     ("pe_noalign", [("mxu_pe.sv", ".b(d_q)", ".b(d)")], ["mxu_pe"], "kill"),
     ("pe_flag_skew", [("mxu_pe.sv", "{f_dot_q[3], 1'b0,", "{f_dot[3], 1'b0,")], ["mxu_pe"], "kill"),
@@ -47,7 +47,7 @@ M = [
     ("pe_mode_dot_q", [("mxu_pe_dot.sv", "assign flags = mode_bf16 ? f16 : f8;", "assign flags = f16 | f8;")], ["mxu_pe_dot", "mxu_pe"], "kill"),
     # acc_update control combinations
     ("acc_ow_part", [("acc_update.sv", "assign y     = overwrite ? p : sum;", "assign y     = overwrite ? part : sum;")], ["acc_update"], "kill"),
-    ("acc_ow_flags", [("acc_update.sv", "(overwrite ? 4'd0 : f_add)", "f_add")], ["acc_update"], "kill"),
+    ("acc_ow_flags", [("acc_update.sv", "(overwrite ? 4'd0 : {f_add[3] & nan_add, f_add[2:0]})", "{f_add[3] & nan_add, f_add[2:0]}")], ["acc_update"], "kill"),
     ("acc_rs_flags", [("acc_update.sv", "(rescale ? f_rs : 4'd0)", "f_rs")], ["acc_update"], "kill"),
     ("acc_rs_mux_ow", [("acc_update.sv", "assign acc_r = rescale ? acc_m : acc;", "assign acc_r = (rescale | overwrite) ? acc_m : acc;")], ["acc_update"], "equiv"),
     ("acc_rs_ow_flags", [("acc_update.sv", "(rescale ? f_rs : 4'd0)", "((rescale & !overwrite) ? f_rs : 4'd0)")], ["acc_update"], "kill"),
@@ -56,7 +56,7 @@ M = [
     ("int_smax", [("cvt_fp32_int.sv", ": ((64'd1 << (BITS - 1)) - 64'd1);", ": (64'd1 << (BITS - 1));")], ["cvt_fp32_int"], "kill"),
     ("int_umax", [("cvt_fp32_int.sv", "((64'd1 << BITS) - 64'd1);", "((64'd1 << BITS) - 64'd2);")], ["cvt_fp32_int"], "kill"),
     ("int_uneg", [("cvt_fp32_int.sv", "lim = neg ? 64'd0", "lim = neg ? 64'd1")], ["cvt_fp32_int"], "kill"),
-    ("int_rs24", [("cvt_fp32_int.sv", "if (rs > 25)", "if (rs > 24)")], ["cvt_fp32_int"], "equiv"),
+    ("int_rs25", [("cvt_fp32_int.sv", "if (rs > 24)", "if (rs > 25)")], ["cvt_fp32_int"], "equiv"),     # the pre-F9 RTL (reads frac_m[24])
     ("int_sh40", [("cvt_fp32_int.sv", "(sh > 36)", "(sh > 44)")], ["cvt_fp32_int"], "kill"),
     # BF16 PE details
     ("bf16_daz", [("bf16_dot2.sv", "x_z   = (x[14:7] == 8'h00);", "x_z   = (x[14:0] == 15'h0);")], ["bf16_dot2"], "kill"),

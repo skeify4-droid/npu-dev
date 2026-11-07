@@ -90,6 +90,12 @@ def bf16(x, ftz: bool = False) -> np.ndarray:
     return round_to(x, BF16, ftz=ftz)
 
 
+def cvt_fp32_bf16(x) -> np.ndarray:
+    """DMA `FP32_BF16` (N-2): RNE, IEEE overflow to Inf, subnormals kept (RNE onto the BF16 subnormal grid 2^-133; an FP32
+    subnormal input is converted, not read as zero)."""
+    return round_to(x, BF16, ftz=False)
+
+
 # ------------------------------------------------------------------ bit patterns
 def decode_table(f: Fmt) -> np.ndarray:
     """Value of every code of an 8-bit-or-smaller format (index = code)."""
@@ -232,8 +238,9 @@ def fold_e4m3(w_exact, ktile: int = KTILE_FP8):
     """Fold block-scaled weights (exact values, tensor scale excluded) into E4M3 + one FP32 power-of-two column
     scale per (row, K tile). w_exact: [N, K] (HF [out, in] layout). Returns (E4M3 values [N, K], cs [N, K/ktile])."""
     t = _blocks(w_exact, ktile)
-    c = fold_exponent(np.max(np.abs(t), axis=-1))
-    v = round_to(t / np.ldexp(1.0, c)[..., None], E4M3, sat=True)
+    a = np.abs(t)
+    c = fold_exponent(np.max(np.where(np.isnan(a), 0.0, a), axis=-1))     # NaN elements do not take part in amax (N-2)
+    v = round_to(t / np.ldexp(1.0, c)[..., None], E4M3, sat=True)             # and stay NaN (code 0x7F)
     return v.reshape(np.shape(w_exact)), np.ldexp(1.0, c)
 
 

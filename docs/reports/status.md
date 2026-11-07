@@ -964,9 +964,10 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 
 ## Phase 3: arith (2026-11-07)
 
-Working tree on `main`, not committed (CLAUDE.md: commit only when asked). `make lint`, `make unit` and `make pytest`
-(`test_arith.py`: 30 tests) are green. `docs/spec/numerics.md` is unchanged; the spec for the blocks is
-[arith.md](../spec/arith.md), which also lists nine places where numerics.md was silent or inconsistent and what the RTL does.
+Branch `p3-arith` (commits `95d918d` to `2cb3258`: blocks, spec, review). The fixes of the independent review
+([arith_review.md](arith_review.md), F1-F13) are in the working tree, not committed (CLAUDE.md: commit only when asked).
+`make lint`, `make unit` and `make pytest` (`test_arith.py`: 32 tests) are green. The spec for the blocks is
+[arith.md](../spec/arith.md); numerics.md N-2, N-3, N-5 and N-6 now state the nine places where it was silent or inconsistent.
 
 ### Blocks (`rtl/arith/`, 20 files, each with a `tb/unit/tb_<name>.sv` except the helpers `fp_round`, `fp_addu`, `mx_exact`,
 tested through the blocks that instantiate them)
@@ -979,7 +980,7 @@ tested through the blocks that instantiate them)
 - DMA fold: `fold_key`, `fold_amax`, `fold_c`, `fold_quant`.
 
 Other changes: `make unit` also builds the arith testbenches (all `rtl/arith` files per testbench, run from `build/`, vectors from
-the new `make arith-vec`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
+the new `make arith-vec`, `-I build` for `arith/counts.svh`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
 BLOCK=<arith block>` reads the whole directory; `make pytest` includes `test_arith.py`. `sw/npumodel/arith_ref.py` is the exact
 integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vectors.py` writes the vectors.
 
@@ -987,18 +988,25 @@ integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vec
 | Test | Vectors |
 |---|---|
 | `fp8_mul` exhaustive, expected from `ml_dtypes` | 65,536 pairs |
-| `fp8_dot4` / `bf16_dot2` | 196,792 / 150,000 |
-| `fp32_add` / `fp32_mul` / `fp32_max` | 138,229 / 125,729 / 55,729 |
-| `mxu_pe_dot`, `mxu_pe` (three pipeline variants), `acc_update` | 20,000, 20,000 rows, 20,000 |
-| `cvt_fp32_fp` (BF16, FP16, E4M3, E5M2, E2M1) | 286k, 280k, 91k, 91k, 90k |
-| `cvt_fp32_int` (5 types) | 42,795 each |
+| `fp8_dot4` / `bf16_dot2` | 200,908 / 168,075 |
+| `fp32_add` / `fp32_mul` / `fp32_max` | 138,254 / 125,750 / 55,749 |
+| `mxu_pe_dot`, `mxu_pe` (four pipeline variants, reset tests), `acc_update` | 26,937, 26,937 rows, 20,008 |
+| `cvt_fp32_fp` (BF16, FP16, E4M3, E5M2, E2M1) | 285,889, 280,501, 90,805, 90,780, 90,089 |
+| `cvt_fp32_int` (INT8, UINT8, INT16, INT32, UINT32) | 42,810, 42,800, 42,798, 42,800, 42,800 |
 | `cvt_dec`, `mx_dequant_bf16` | every code / every (element, scale) pair |
-| `fold_*` | 1,500 tiles of 64 per format (MXFP4, MXFP8, NVFP4) |
+| `fold_*` (64-element tiles), `fold256_*` (256-element tiles) | 1,504 / 1,508 / 1,503 and 556 per format (MXFP4, MXFP8, NVFP4) |
+| `foldq_*` (`fold_quant` alone, SATURATE reachable) | 24,576 / 96,000 / 24,576 rows |
 
-All bit-exact against the reference, including flags. `test_arith.py` ties the reference to `numerics.py` and `ml_dtypes`.
+These are exact row counts: `build/arith/counts.svh` is written by the generator, every testbench requires its count, and `make unit`
+fails on a missing, short or long vector file. 279 hand-derived cases (`scripts/arith_hand_cases.py`) are among the vectors.
+All bit-exact against the reference, including flags. `test_arith.py` ties the reference to `numerics.py` and `ml_dtypes`
+(signed zeros compared, FP32 subnormal inputs, NaN tiles in the fold, no skipped cases) and the hand literals to the reference.
 
-### Mutation check (`scripts/arith_mutants/run_arith_mutants.py`, 36 mutants, 4 min, 63 MB; run under `scripts/memrun`)
-32 mutants fail their testbench; four pass and are equivalent:
+### Mutation check (`scripts/arith_mutants/run_arith_mutants.py`, 39 mutants, 6 min, 0.2 GB; run under `scripts/memrun`)
+35 mutants fail their testbench; four pass and are equivalent (the three new ones, `acc_nan_made`, `acc_nan_part`, `int_rs24_off`,
+are killed; `bf16_noftz` became `bf16_ftz`, which re-introduces the flush that F6 removed). A mutant run that finds a vector
+file missing, short or long is reported as an ERROR, not as a kill. The reviewer's 44 mutants (`scripts/arith_review/my_mutants.py`):
+all as predicted (36 killed, including `dot_width38`, `pe_flags_norst`, `pe_fdot_norst`, `foldq_sat_off`; the eight equivalent ones survive).
 - `g_fp32_3`, `g_bf16_11`: the aligner at the proven bound `SW + G = 27` (the RTL runs one bit above it: `fp32_add` G = 4, `bf16_dot2`
   G = 12). One bit lower (`g_fp32_2`, `g_bf16_10`), or the sticky OR removed at either width, fails.
 - `foldc_hi`: a normalized significand of exactly 0xE1 cannot occur for the supported elements and scales.
@@ -1019,12 +1027,19 @@ At 6.6k cells a 64 x 64 array is about 27 M generic cells per core, so `FULL` st
 is synthesized hierarchically (capacity.md); the PE is the block to optimize in Phase 6. The first version of `fp32_add` had a
 26-bit guard field (1,855 cells; 5,186 for `mxu_pe_dot`); the test-backed minimum cut them to 1,455 and 4,505.
 
-### Findings
-- numerics.md N-2 says FP16 -> BF16 is exact; it is not (11-bit against 8-bit significand). `cvt_dec` rounds it (RNE).
-- N-2 (flush BF16 results below 2^-126) and N-5 ("BF16 kept" for DMA conversions) disagree for FP32 -> BF16; the RTL follows N-2.
-- The fold of a tile that contains a NaN is undefined in N-2; the RTL leaves NaNs out of `amax` and writes E4M3 NaN.
-- The remaining items (signed zeros, flag semantics, NVFP4 scale sign, fold scale range) are in arith.md "Decisions and gaps".
-These need a decision from the spec owner; none changes a frozen number.
+### Findings and their resolution
+The independent review ([arith_review.md](arith_review.md)) found no wrong result and 13 findings; the fixes are in the working tree.
+- Regression (F1, F2, F4, F5, F10): exact vector counts (`counts.svh`), `make unit` fails on a missing, short or long vector file,
+  corner 4-way FP8 sums up to 4 x 448^2, a real `mxu_pe` reset test, the `REG_DOT=1, REG_OUT=0` variant, 256-element fold tiles,
+  `fold_quant` tested alone so that SATURATE fires.
+- RTL (F3, F6, F9): `acc_update` takes `NAN_IN` from external operands only; `cvt_fp32_fp` keeps BF16 subnormals;
+  `cvt_fp32_int` has no out-of-range bit select (`rs > 24`).
+- Spec (F6, F7, F8, F12, F13): numerics.md N-2, N-3, N-5, N-6 and the principles now state FP16 -> BF16 rounds, FP32 -> BF16 keeps
+  subnormals, round-then-flush, the SATURATE / INVALID / NAN_IN / `MAX_F32` rules and the fold of a tile with NaN; the golden
+  model has `cvt_fp32_bf16` and a `fold_e4m3` that ignores NaN in `amax`; `c` is in [-144, 127].
+- Tests (F11): `test_arith.py` compares signed zeros, feeds FP32 subnormals, has no silent skips and ties the hand literals to `arith_ref`.
+The independent oracle `scripts/arith_review/indep.py` has two changes after the review, both approved: the F3 flag rule and the F6
+decision (line 249, FP32 -> BF16 keeps subnormals). `check_files.py` reports 0 disagreements on every row of `build/arith`.
 
 ### Next
 - `core/mxu` instantiates `mxu_pe` (skew, shadow weights, stationary load) and `core/acc` instantiates `acc_update`; the MXU test

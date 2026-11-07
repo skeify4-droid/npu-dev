@@ -175,6 +175,10 @@ def acc_update(acc, part, rs, cs, rescale, use_cs, overwrite):
     if overwrite:
         return p, fl
     y, f = fp32_add(a, p)
+    # F3 flag rule: NAN_IN only for a NaN among the lane's external operands that the add consumes
+    f &= ~NANIN
+    if (not rescale and decode(acc, FP32)[0] == "nan") or (not use_cs and decode(part, FP32)[0] == "nan"):
+        f |= NANIN
     return y, fl | f
 
 
@@ -242,7 +246,7 @@ def cvt_fp32_fp(x, fmt):
         if f.sat:
             return encode_val(X[1], f.max, f), 0           # spec: Inf -> max; SATURATE only for finite inputs
         return (X[1] << (f.eb + f.mb)) | (((1 << f.eb) - 1) << f.mb), 0
-    c, o, sa = rne(X[1], X[2], f, ftz=(fmt == "BF16"))     # N-2: BF16 results below 2^-126 flush
+    c, o, sa = rne(X[1], X[2], f, ftz=False)               # N-2/N-5 (F6): conversions keep subnormals
     return c, (OVF if o else 0) | (SAT if sa else 0)
 
 
