@@ -42,9 +42,9 @@ Principles:
 | E5M2 (OCP FP8) | 1/5/2 | 15 | 57344 | 2^-14 | 2^-16 | `S.11111.00` | `S.11111.{01,10,11}` | storage only (converted to BF16) |
 | E2M1 (OCP FP4) | 1/2/1 | 1 | 6 | 1 | 0.5 | none | none | MXFP4 / NVFP4 elements |
 | E8M0 (MX scale) | 0/8/0 | 127 | 2^127 | 2^-127 | - | none | `0xFF` | MX block scales (no zero, no sign) |
-| BF16 | 1/8/7 | 127 | 3.39e38 | 2^-126 | (flushed) | IEEE | IEEE | activations, stream, BF16 weights |
+| BF16 | 1/8/7 | 127 | 3.39e38 | 2^-126 | 2^-133 (kept by copies and conversions; read as 0 by arithmetic) | IEEE | IEEE | activations, stream, BF16 weights |
 | FP16 | 1/5/10 | 15 | 65504 | 2^-14 | 2^-24 | IEEE | IEEE | storage and conversion only |
-| FP32 | 1/8/23 | 127 | 3.40e38 | 2^-126 | (flushed) | IEEE | IEEE | all internal arithmetic, ACC, scales, state |
+| FP32 | 1/8/23 | 127 | 3.40e38 | 2^-126 | 2^-149 (kept by copies and conversions; read as 0 and never produced by arithmetic) | IEEE | IEEE | all internal arithmetic, ACC, scales, state |
 | INT8 / UINT8 / INT16 / INT32 | two's complement / unsigned | | | | | | | indices, counts, integer index math |
 
 - E2M1 values are ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}.
@@ -83,13 +83,18 @@ Notation:
   ±max, and NaN maps to the canonical NaN. A finite |x| that rounds to max is not saturation: for E4M3, |x| in (448, 464]
   gives 448 (464 is the tie, which goes to the even code) and sets no flag. `SATURATE` (N-5) is set only when a finite input
   would have rounded above max; ±Inf gives ±max and sets no flag.
+- The ties at the top follow from "as if the exponent range were unbounded": the next value above max is a value of the
+  unbounded range, even where the format has no such code. For E4M3 it is 480 (the code `S.1111.111`, which is the NaN),
+  so 464 is a tie between 448 and 480 and goes to the even 448: no flag. For E5M2 the tie 61440 lies between 57344 and
+  65536; the even neighbour is 65536, above max, so 61440 gives 57344 **with** `SATURATE`. For E2M1 the tie 7 lies between
+  6 and 8; the even neighbour is 8, so 7 gives 6 **with** `SATURATE` (6.5 gives 6 without it).
 
 | From → to | Where | Rule |
 |---|---|---|
-| FP32 → BF16, FP16 | DMA `FP32_BF16`, VPU outputs | `RNE`. IEEE overflow to ±Inf. Subnormal results are **kept**: RNE onto the destination's subnormal grid (BF16 2^-133, FP16 2^-24), and a result that rounds up to the minimum normal is the minimum normal. An FP32 subnormal input is converted, not read as zero. (VPU outputs are FTZ FP32 values, so for them the case does not arise; it concerns raw FP32 data through the DMA) |
+| FP32 → BF16, FP16 | DMA `FP32_BF16`, VPU outputs | `RNE`. IEEE overflow to ±Inf. Subnormal results are **kept**: RNE onto the destination's subnormal grid (BF16 2^-133, FP16 2^-24), and a result that rounds up to the minimum normal is the minimum normal. An FP32 subnormal input is converted, not read as zero. (VPU outputs are FTZ FP32 values: zero or at least 2^-126. For BF16 that rules out subnormal results, so BF16 subnormals arise only from raw FP32 subnormals through the DMA. For FP16 it does not: a normal FP32 below 2^-14 becomes an FP16 subnormal, or rounds to 0 or to the minimum normal.) |
 | FP32 → E4M3, E5M2 | VPU outputs, `VQUANT` | `RNE` + `sat` |
 | FP32 → E2M1 | `VQUANT` | `RNE` + `sat` to ±6 (NaN: block rule below) |
-| FP32 → INT* | VPU outputs | `RNE`, saturate to the integer range, NaN → 0. `SATURATE` is set when a finite input is clamped (also a negative input that rounds to a non-zero value, to an unsigned type; −0.5 → 0 is not a clamp); ±Inf clamps with no flag |
+| FP32 → INT* | VPU outputs | `RNE`, saturate to the integer range, NaN → 0 with `NAN_IN` (the conversion is an arithmetic unit that consumed a NaN, N-5). `SATURATE` is set when a finite input is clamped (also a negative input that rounds to a non-zero value, to an unsigned type; −0.5 → 0 is not a clamp); ±Inf clamps with no flag |
 | E4M3, E5M2, E2M1 → BF16 / FP32; BF16, FP16 → FP32 | DMA, VPU inputs | exact. E5M2 Inf stays Inf. A BF16/FP32 subnormal arriving at an arithmetic unit reads as ±0 |
 | FP16 → BF16 | DMA | `RNE`, **not exact**: an FP16 significand has 11 bits and BF16 holds 8 (relative error ≤ 2^-9). The result cannot overflow (the largest FP16, 65504, rounds to 65536 = 2^16, a normal BF16); FP16 subnormals are kept |
 | MXFP8, MXFP4, NVFP4 → BF16 | DMA `*_BF16` | exact: element × block scale. E2M1 × E4M3 has at most 6 significant bits, BF16 holds 8. The NVFP4 tensor scale (`R[ts_reg]`) is **not** applied to the elements; it becomes a column scale (one per 128-deep K tile). Results in the BF16 subnormal range are **kept** (RNE onto the subnormal grid, as every exact conversion, N-5; review finding I-15 removed the word "flush"); MXFP4 and NVFP4 products are always exact there; only MXFP8 products below 2^-130 can round. Overflow gives Inf (never seen in real weights) |
@@ -101,12 +106,22 @@ blocks; the last tile may be shorter):
    The DMA buffers one tile per row (≤ 256 elements) to know `amax` before it writes.
    A NaN element, and every element of a block whose scale is NaN, does not take part in `amax` and is written as the E4M3
    NaN `0x7F` (with `NAN_IN`); the other elements of the tile keep their accuracy. A tile with no non-NaN, non-zero element
-   has `c = 0`. The positions of a short last tile that hold no element are presented to the fold as zero elements.
+   has `c = 0`. The positions of a short last tile that hold no element are presented to the fold as element 0 with a finite
+   block scale (E8M0 127, E4M3 `0x38`), so they neither take part in `amax` nor turn into NaN (a zero element with a NaN scale is
+   written `0x7F` with `NAN_IN`). The DMA engine drops the written value and the flags of those positions.
 2. Choose `c`, the smallest integer with `amax ≤ 448 · 2^c` (`c = 0` for an all-zero tile).
 3. Write the elements `v = RNE_E4M3(w · 2^-c)` with `sat`. Because of step 2 it never saturates.
-4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). The product is an `fp32_mul`
-   (RNE, DAZ/FTZ), exact unless it leaves the normal FP32 range (above: rounds or overflows; below 2^-126: flushed). `fold_c`
-   (`rtl/arith`) produces `2^c`; the DMA engine applies the tensor-scale multiply with an `fp32_mul` instance (isa.md §5).
+4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). `fold_c` (`rtl/arith`) produces
+   `2^c`.
+   - **NVFP4:** the DMA engine multiplies it by `R[ts_reg]` with one `fp32_mul` (RNE, DAZ/FTZ) and ORs that multiply's flags
+     into `FP_STATUS` (OVERFLOW for a huge `T`, NAN_IN for a NaN `T`). The operand is named in isa.md §5; the multiply, its
+     flags and the raw write of `T` for `NVFP4_BF16` are in the "Integration contract" of arith.md.
+   - The product of a power of two and an FP32 never rounds: it is exact, or Inf with `OVERFLOW` (above the FP32 range), or a
+     zero (below 2^-126, or a subnormal `T` read as 0 by DAZ).
+   - **MX formats:** `cs = 2^c` is written as is. For `c < −126` (a tile with `amax < 2^-118`; no real weight reaches it)
+     `2^c` is an FP32 subnormal, which the ACC's column-scale multiplier reads as 0 (DAZ), so the tile contributes 0. The golden
+     model (`numerics.fold_e4m3`, `mxu_mm`) keeps such a scale and multiplies by it, so **golden and RTL differ for these
+     tiles**; N-8 exempts them and the unit tests stay out of that range.
 
 `MXU_MM` multiplies each tile's partial sum by `cs` (N-3).
 
@@ -134,6 +149,10 @@ reciprocal and must match within the tolerance of N-8.
 | `NVFP4` | tensor scale `T` from `p_reg`. The compiler passes `amax_tensor / (448 · 6)` for weights and activations, and a calibrated constant (or 1.0, DeepSeek) for KV. Block scale `s_b = RNE_E4M3(amax_b / 6 / T)`, sat | `RNE_E2M1(x / (s_b · T))`, sat; `s_b = 0` gives zero elements |
 
 A block that contains a NaN or Inf gets a NaN scale (`0xFF` for E8M0, `0x7F` for E4M3) and zero elements, following OCP MX.
+`VQUANT` finds the NaN or Inf in a block from the block's own inputs (the same pass that finds `amax`), not from the flags of
+`cvt_fp32_fp`, which saturates an Inf to ±max without a flag and gives a NaN input to E2M1 as code 0 with `NAN_IN`. Flags:
+a block with a NaN input sets `NAN_IN`; a block with an Inf and no NaN makes a NaN scale from non-NaN inputs and sets
+`INVALID` (N-5).
 
 ## N-3. MXU arithmetic
 
@@ -237,26 +256,30 @@ Rows shorter than 256 leave slots at +0. Max and min are exact. The order does n
 |---|---|---|---|---|
 | DMA copy, gather, scatter | bits kept | kept | kept | kept |
 | DMA conversions | canonical in the destination | kept (to BF16/FP32); never produced into E4M3 | kept in every destination (FP8, FP4, BF16, FP16, FP32; N-2) | kept |
-| MXU | propagates | from FP32 overflow only | FP8 kept; BF16 inputs DAZ; results FTZ | `+0` from an all-zero tile |
+| MXU | propagates | from FP32 overflow of the accumulation; in BF16 mode also an Inf operand and a dot product that overflows (N-3). E4M3 has no Inf | FP8 kept; BF16 inputs DAZ; results FTZ | `+0` from an all-zero tile |
 | VPU / SFU | propagates (IEEE); produced by invalid operations | IEEE | DAZ / FTZ | IEEE |
 | Conversions to FP8 / FP4 | canonical NaN; FP4 → block NaN scale | saturates to ±max | kept | kept |
-| Write-add (`ADD_F32`, `ADD_BF16`) | propagates | IEEE | FTZ | IEEE |
-| `MAX_F32` | NaN wins; the result is the canonical NaN (a NaN that is only copied, N-1, keeps its bits) | ordered | DAZ | `max(−0, +0) = +0` |
+| Write-add (`ADD_F32`, `ADD_BF16`) | propagates | IEEE | operands DAZ, results FTZ (like every arithmetic unit) | IEEE |
+| `MAX_F32` | NaN wins; the result is the canonical NaN (a NaN that is only copied, N-1, keeps its bits) | ordered | DAZ: a subnormal operand reads as a zero of its sign, and a result that is such an operand is that zero (`max(2^-149, −1) = +0`) | `max(−0, +0) = +0` |
 
-`FP_STATUS` CSR (per core, sticky, write 1 to clear) is set by any unit of the core, including the DMA conversions:
+`FP_STATUS` CSR (per core, sticky, write 1 to clear) is set by any unit of the core, including the DMA conversions. A write-add or max
+at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is in the target's network interface), not of the initiator.
+A flag belongs to one **operation**: one multiply, one add, one dot product, one conversion. A lane that chains two (the ACC lane
+multiplies, then adds) reports the flags of each:
 
 | Bit | Name | Set when |
 |---|---|---|
-| 0 | `INVALID` | an operation produced NaN from non-NaN inputs. Not set when the same operation also has a NaN input (the NaN wins: `NAN_IN` only; for example a dot product with a NaN operand and an Inf × 0) |
-| 1 | `OVERFLOW` | an FP32/BF16 result overflowed to Inf |
-| 2 | `SATURATE` | a conversion to FP8/FP4 saturated a finite value |
-| 3 | `NAN_IN` | an arithmetic unit consumed a NaN: a NaN among its external operands. A NaN made inside the unit is `INVALID` and is not consumed again (the ACC lane multiplies and then adds: Inf × 0 in the column scale gives `INVALID` only; the PE takes `NAN_IN` from its dot product only) |
+| 0 | `INVALID` | an operation produced NaN from non-NaN inputs. Not set when the same operation also has a NaN input (the NaN wins: `NAN_IN` only; for example a dot product with a NaN operand and an Inf × 0). "Operation" is one multiply or one add, not the ACC lane: a NaN `acc` added to an Inf × 0 of the column scale gives `INVALID` (the multiply) and `NAN_IN` (the add) |
+| 1 | `OVERFLOW` | an FP32/BF16 result overflowed to Inf (a finite exact value that rounded to Inf; an Inf operand does not set it) |
+| 2 | `SATURATE` | a conversion to FP8/FP4 saturated a finite value, or a conversion to an integer clamped one (N-2) |
+| 3 | `NAN_IN` | an arithmetic unit or converter consumed a NaN: a NaN among its external operands that its arithmetic uses. A NaN made inside the unit is `INVALID` and is not consumed again (the ACC lane multiplies and then adds: Inf × 0 in the column scale gives `INVALID` only; the PE takes `NAN_IN` from its dot product only). A copy consumes nothing: an `OVERWRITE` of a NaN partial sum without a column scale sets no `NAN_IN` (the PE column reported it) |
 
 The CP collects the flags after each kernel in debug runs. Nothing traps (isa.md §8).
 
 ## N-6. Write-add and collectives
 
-- `ADD_F32` computes `RNE_FP32(old + new)` per element.
+- `ADD_F32` computes `RNE_FP32(old + new)` per element. The operands are DAZ and the result FTZ, like every arithmetic unit
+  (`ADD_F32(2^-149, 2^-126)` is `2^-126`). The flags go to the `FP_STATUS` of the target's core (N-5).
 - `ADD_BF16` computes `RNE_BF16(RNE_FP32(old + new))`. That is two roundings, kept so that the target ALU stays an FP32 adder; the
   golden model does the same. The flags are those of one unit: `Inf − Inf` gives `INVALID` from the add, and the NaN it made
   must not set `NAN_IN` again in the FP32 → BF16 converter (`core/ni` composes `fp32_add` and `cvt_fp32_fp` and takes

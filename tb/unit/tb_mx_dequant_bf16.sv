@@ -2,7 +2,7 @@
 // (E2M1 x E4M3 scale), exhaustive over every (element, scale) pair, bit-exact against sw/npumodel/arith_ref.py
 // (checked against numerics.mx_dequant and ml_dtypes by test_arith.py).
 `timescale 1ns/1ps
-`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
+`include "counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module mx_chk #(
   parameter int    ELEM  = 0,
   parameter int    SCALE = 0,
@@ -29,7 +29,7 @@ module mx_chk #(
         if (errors <= 5) $display("MISMATCH ELEM=%0d SCALE=%0d el=%h sc=%h y=%h flags=%h  exp y=%h flags=%h", ELEM, SCALE, el, sc, y, flags, mem[i][19:4], mem[i][3:0]);
       end
     end
-    if (n != MAXN) begin errors++; $display("ELEM=%0d SCALE=%0d: expected %0d vectors, read %0d", ELEM, SCALE, MAXN, n); end
+    if (n != MAXN || MAXN < 1) begin errors++; $display("ELEM=%0d SCALE=%0d: expected %0d vectors, read %0d", ELEM, SCALE, MAXN, n); end
   end
 endmodule
 

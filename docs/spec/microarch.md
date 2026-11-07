@@ -89,6 +89,8 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
   - Two FP32 multipliers per column at the ACC input: `rowscale` rescales the existing ACC row (online-softmax `alpha`), and
     `colscale` scales a K tile's partial sum (block-scaled weights, NVFP4 tensor scale).
   - The VPU reads ACC directly (4 rows per cycle).
+  - Rules for the blocks that instantiate the arithmetic (`mxu_pe`, `acc_update`: flags, reset, unused lanes, PE alignment, ACC
+    lane controls): arith.md "Integration contract", items 1-5.
 
 Why weight-stationary and not output-stationary:
 
@@ -563,6 +565,8 @@ isa.md §5) a cheap multiply at the ACC input.
     element's scale is found from its row and its whole in-row offset (dims 0, 2 and 3; review finding V-4). The NVFP4 tensor
     scale comes from `ts_reg` (isa.md §5, memmap.md §6).
   - `cvt = NONE` moves only the bytes the TDs address, never the scales.
+  - Fold padding, the NVFP4 column-scale multiply (an `fp32_mul` on `fold_c.cs` and `R[ts_reg]`) and the flags of conversions:
+    arith.md "Integration contract", items 1, 6 and 8.
   - Quantization (KV, activations) is a VPU instruction (`VQUANT`), because it needs row maxima.
 - **Write packets *(review finding V-5)*:** a packet holds contiguous destination bytes. Adjacent runs are merged, including
   consecutive paged rows of one page, up to a 256 B granule boundary. `HBM_ALIGN` is checked per packet. So eight 4 B scale rows
@@ -573,6 +577,8 @@ isa.md §5) a cheap multiply at the ACC input.
 ### 2.6 Network interface and semaphores
 - The interface is an initiator for the DMA and a target for SPM, GSRAM and CORECTL (IMEM, DTAB, semaphores, CSRs).
 - Each target handles: reads, writes, write-add/max, and byte-counting semaphore adds attached to writes (`rsem`).
+  - How the ALU composes `ADD_F32`, `ADD_BF16` and `MAX_F32` (DAZ operands, FTZ results), and whose `FP_STATUS` its flags go to
+    (the target core's): arith.md "Integration contract", items 1 and 7.
   - A read response is 1 flit when the request's bytes in its granule lie in one 128 B half, else 2 (noc.md §2, review
     finding X-9); the target picks the half from the request.
   - Every response and ack copies the request's `epoch` (review finding X-13).

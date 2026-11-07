@@ -195,7 +195,8 @@ CINT = [
 ]
 
 # ---------------------------------------------------------------- acc_update: (acc, part, rowscale, cs, rescale, use_cs,
-#   overwrite, y, flags). NAN_IN only for a NaN among the external operands that the lane uses (review F3).
+#   overwrite, y, flags). NAN_IN only for a NaN among the external operands that the lane uses (review F3); an INVALID
+#   made by the lane's multiplier stays when the add consumes another NaN (A1); an OVERWRITE copy raises nothing (A2).
 ACC = [
     (0x3F800000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0, NAN, INV),         # Inf * 0 made by the column scale: INVALID only
     (0x7F800000, 0x3F800000, 0x00000000, 0x3F800000, 1, 0, 0, NAN, INV),         # Inf * 0 made by the rowscale: INVALID only
@@ -205,6 +206,11 @@ ACC = [
     (0x7FC00000, 0x3F800000, 0x40000000, 0x3F800000, 1, 0, 0, NAN, NANIN),       # NaN acc rescaled
     (0x7F800000, 0xFF800000, 0x3F800000, 0x3F800000, 0, 0, 0, NAN, INV),         # Inf + -Inf in the add: INVALID
     (0x3F800000, 0x40000000, 0x40000000, 0x40000000, 1, 1, 0, 0x40C00000, 0),    # 1*2 + 2*2 = 6
+    # Second review (arith_review2.md): which operands count as "external NaN" in the lane, and the decision on A1 / A2.
+    (0x7F800000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0, NAN, INV),         # acc = Inf is not a NaN; Inf * 0 made by cs: INVALID only
+    (0x7F800000, 0x7F800000, 0x00000000, 0x3F800000, 1, 0, 0, NAN, INV),         # part = Inf is not a NaN; Inf * 0 made by the rowscale: INVALID only
+    (0x7FC00000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0, NAN, INV | NANIN),  # A1: NaN acc added + Inf * 0 in cs: both flags (an operation is one multiply or add)
+    (0x3F800000, 0x7FC00001, 0x3F800000, 0x3F800000, 0, 0, 1, 0x7FC00001, 0),    # A2: OVERWRITE copies a NaN part (bits kept), no column scale: no NAN_IN
 ]
 
 # ---------------------------------------------------------------- cvt_dec: (fmt, to_bf16, code, y, flags)

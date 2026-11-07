@@ -2,7 +2,7 @@
 // against sw/npumodel/arith_ref.py (vectors: random FP32, every rounding midpoint of the target +- 1 FP32 ulp,
 // max + 1/2 ulp, subnormal / normal boundaries, NaN and Inf; test_arith.py checks the reference against ml_dtypes).
 `timescale 1ns/1ps
-`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
+`include "counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module cvt_fp_chk #(
   parameter int    FMT  = 0,
   parameter string FILE = "",
@@ -28,7 +28,7 @@ module cvt_fp_chk #(
         if (errors <= 5) $display("MISMATCH FMT=%0d x=%h y=%h flags=%h  exp y=%h flags=%h", FMT, x, y, flags, mem[i][19:4], mem[i][3:0]);
       end
     end
-    if (n != MAXN) begin errors++; $display("FMT=%0d: expected %0d vectors, read %0d", FMT, MAXN, n); end
+    if (n != MAXN || MAXN < 1) begin errors++; $display("FMT=%0d: expected %0d vectors, read %0d", FMT, MAXN, n); end
   end
 endmodule
 

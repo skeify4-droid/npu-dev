@@ -1,7 +1,7 @@
 // Self-checking testbench for cvt_dec (iverilog -g2012): every code of BF16, FP16, E4M3, E5M2 and E2M1 decoded to FP32 and
 // to BF16, bit-exact against sw/npumodel/arith_ref.py (itself checked against ml_dtypes by test_arith.py).
 `timescale 1ns/1ps
-`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
+`include "counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module cvt_dec_chk #(
   parameter int    FMT     = 2,
   parameter bit    TO_BF16 = 1'b0,
@@ -28,7 +28,7 @@ module cvt_dec_chk #(
         if (errors <= 5) $display("MISMATCH FMT=%0d BF16=%0d x=%h y=%h flags=%h  exp y=%h flags=%h", FMT, TO_BF16, x, y, flags, mem[i][35:4], mem[i][3:0]);
       end
     end
-    if (n != MAXN) begin errors++; $display("FMT=%0d BF16=%0d: expected %0d vectors, read %0d", FMT, TO_BF16, MAXN, n); end
+    if (n != MAXN || MAXN < 1) begin errors++; $display("FMT=%0d BF16=%0d: expected %0d vectors, read %0d", FMT, TO_BF16, MAXN, n); end
   end
 endmodule
 

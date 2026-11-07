@@ -309,10 +309,16 @@ def test_hand_cases_equal_arith_ref():
         for i, (v, f) in vh.items():
             assert R.fold_quant(els[i], scs[i], c, elem, scale) == (v, f), ("fold", spec[:2], i)
     n = sum(len(x) for x in (H.ADD, H.MUL, H.MAX, H.DOT8, H.DOT16, H.CVT, H.CINT, H.DEC, H.MXD, H.ACC, H.FOLD))
-    assert n == 279          # 265 cases of the review, 8 ACC_UPDATE cases (F3), 6 BF16 subnormal conversions (F6)
+    assert n == 283          # 265 cases of the review, 8 ACC_UPDATE cases (F3), 6 BF16 subnormal conversions (F6), 4 ACC cases (second review)
 
 
 def test_hand_cases_cover_the_review_findings():
     """The cases that the vector gaps of the review (F3, F5) need are among the literals."""
     assert ([0x7E] * 4, [0x7E] * 4, 0x49440000, 0) in H.DOT8                       # 4 x 448^2, the top of the 39-bit sum
     assert any(r[7:] == (R.NAN32, R.INV) and r[4:7] == (0, 1, 0) for r in H.ACC)   # NaN made by the column scale: no NAN_IN
+    # second review: Inf is not a NaN in the lane's NAN_IN rule (acc2_inf_as_nan, acc2_pinf_as_nan), A1 (acc2_inv_supp), A2
+    acc = lambda a, p, rs, cs, rsc, ucs, ow: next(r[7:] for r in H.ACC if r[:7] == (a, p, rs, cs, rsc, ucs, ow))  # noqa: E731
+    assert acc(0x7F800000, 0x7F800000, 0x3F800000, 0, 0, 1, 0) == (R.NAN32, R.INV)      # acc = Inf, part Inf, cs 0, use_cs
+    assert acc(0x7F800000, 0x7F800000, 0, 0x3F800000, 1, 0, 0) == (R.NAN32, R.INV)      # acc = Inf, rowscale 0, RESCALE, part Inf
+    assert acc(R.NAN32, 0x7F800000, 0x3F800000, 0, 0, 1, 0) == (R.NAN32, R.INV | R.NANIN)   # A1: flags 9
+    assert acc(0x3F800000, 0x7FC00001, 0x3F800000, 0x3F800000, 0, 0, 1) == (0x7FC00001, 0)   # A2

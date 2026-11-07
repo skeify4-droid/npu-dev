@@ -8,9 +8,11 @@
 // holds inputs whose dot and add raise flags (INVALID, NAN_IN, OVERFLOW), checks that the flags read 0 while rst_n is low
 // (reset applied at the start with flagging inputs, and in the middle of a run after the pipelines are full and flags
 // are non-zero), and that they stay 0 in the first cycles after release with benign inputs (stale dot flags would
-// otherwise reach the output flags).
+// otherwise reach the output flags). The DOT_OVERFLOW case overflows in the dot only (the dot's OVERFLOW register is
+// the one that carries it); FIRST_CYCLE releases the reset with a flagging row on the inputs and requires its flags in
+// the first cycle (the flags of that cycle must not be masked).
 `timescale 1ns/1ps
-`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
+`include "counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module tb_mxu_pe;
   localparam int MAXN = `CNT_MXU_PE;      // exact row count of the file
   logic [132:0] mem [0:MAXN-1];
@@ -65,6 +67,22 @@ module tb_mxu_pe;
     flags_zero({nm, ", second cycle after release"}, 0);
   endtask
 
+  // A flagging row in the first cycle after reset release must keep its flags (a design that drops the flags of the first
+  // cycle would pass the benign-input checks above). While rst_n is low the data registers still clock, so the dot
+  // register holds the overflowing dot when the reset ends; the add of the first cycle (psum_in + dot) overflows again.
+  // p11: flags (registered) of the first edge after release; p01: the same row with a/w and psum_in aligned.
+  task automatic first_cycle_case(string nm, logic m, logic [31:0] aa, logic [31:0] ww, logic [31:0] pp, logic [3:0] exp_f);
+    @(negedge clk);
+    rst_n = 0; mode = m; a = aa; w = ww; ps_d0 = pp; ps_d1 = pp;
+    repeat (3) @(negedge clk);                             // d_q of p11 / p10 now holds the dot of (aa, ww)
+    rst_n = 1;                                             // release, inputs unchanged
+    @(negedge clk);
+    if (f11 !== exp_f || f01 !== exp_f) begin
+      errors++; $display("RESET %s: flags of the first cycle after release: f11=%h f01=%h, expected %h", nm, f11, f01, exp_f);
+    end
+    @(negedge clk);
+  endtask
+
   initial begin
     $readmemh("arith/mxu_pe.hex", mem);
     for (int i = 0; i < MAXN; i++) begin if (^mem[i] === 1'bx) break; nrows++; end
@@ -100,7 +118,12 @@ module tb_mxu_pe;
     reset_case("NAN_IN",   1'b1, 32'h3F80_7FC0, 32'h3F80_3F80, 32'h0000_0000, 1'b0);
     reset_case("NAN_IN8",  1'b0, 32'h0000_007F, 32'h0000_0038, 32'h0000_0000, 1'b0);
     reset_case("OVERFLOW", 1'b1, 32'h0000_7F7F, 32'h0000_3F80, 32'h7F7F_FFFF, 1'b1);
-    if (nrows != MAXN) begin errors++; $display("expected %0d rows, read %0d", MAXN, nrows); end
+    // the BF16 dot itself overflows (max BF16 squared; the add of +0 and an Inf adds no flag): only the dot's OVERFLOW
+    // register carries the flag, so its reset is visible only through this case
+    reset_case("DOT_OVERFLOW", 1'b1, 32'h0000_7F7F, 32'h0000_7F7F, 32'h0000_0000, 1'b0);
+    // a flagging row right after release: dot = max BF16 (0x7F7F0000), psum_in the same: the add overflows
+    first_cycle_case("FIRST_CYCLE", 1'b1, 32'h0000_7F7F, 32'h0000_3F80, 32'h7F7F_0000, 4'h2);
+    if (nrows != MAXN || MAXN < 1) begin errors++; $display("expected %0d rows, read %0d", MAXN, nrows); end
     if (errors == 0) $display("PASS mxu_pe (%0d rows, four pipeline variants, reset tests)", nrows);
     else $display("FAIL mxu_pe: %0d errors of %0d rows", errors, nrows);
     $finish;

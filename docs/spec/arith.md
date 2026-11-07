@@ -93,7 +93,12 @@ them. Each is implemented and tested against the golden model; none changes a fr
      F3, fixed); `mxu_pe` takes `NAN_IN` from its dot product only. `core/ni` composes write-add `ADD_BF16` (`fp32_add`, then
      `cvt_fp32_fp #(FMT=0)`) and must take `NAN_IN` from the add only, for the same reason.
    - `INVALID` only when a NaN is made from non-NaN inputs (Inf - Inf, Inf x 0); it is suppressed when the same operation also
-     has a NaN input (`bf16_dot2([NaN, Inf], [1, 0])` gives `NAN_IN` only).
+     has a NaN input (`bf16_dot2([NaN, Inf], [1, 0])` gives `NAN_IN` only). An operation is one multiply or one add, not the ACC
+     lane: `acc_update` with a NaN `acc`, an Inf `part` and `cs = 0` gives `INVALID | NAN_IN` (flags 9; decision A1 of the
+     second review).
+   - An `OVERWRITE` copy of a NaN `part` without a column scale consumes nothing and sets no `NAN_IN`, and `y` carries the NaN's
+     bits (A2). Every converter, including `cvt_fp32_int` (NaN -> 0), raises `NAN_IN` for a NaN input (A6). `fp32_max` returns
+     the zero of a DAZ'd subnormal operand, not its bits (A4); write-add operands are DAZ (A5).
    - Conversion of a NaN to E2M1 (no NaN code) gives code 0 and `NAN_IN`, so the block quantizer can apply the "NaN scale,
      zero elements" rule of N-2.
    - `MAX_F32` returns the canonical NaN when an operand is NaN.
@@ -101,15 +106,58 @@ them. Each is implemented and tested against the golden model; none changes a fr
    (no cost, and a negative scale is then still exact).
 7. **Fold with NaN.** NaN elements and the elements of a NaN-scale block do not take part in `amax` and are written as E4M3 NaN
    (`0x7F`) with `NAN_IN`. The column scale of the tile is that of its other elements. The golden `numerics.fold_e4m3` does the
-   same (it used `np.max` and returned `cs = 1` for a tile with a NaN). The positions of a short last tile must be presented
-   to the fold as zero elements (key 0); the DMA integrator does that.
+   same (it used `np.max` and returned `cs = 1` for a tile with a NaN). The positions of a short last tile are presented
+   to the fold as element 0 with a finite scale (E8M0 127, E4M3 `0x38`), and the integrator drops their `v` and flags (A3; a
+   zero element with a NaN scale is written NaN, so the padding's scale must not be NaN). The Integration contract below states it.
 8. **Fold scale range.** `c` is in [-144, 127] (enumerated over every code: MXFP4 [-136, 121], MXFP8 [-144, 127], NVFP4 [-18,
    3]). The column scale `2^c` (`fold_c.cs`) is an exact FP32 down to c = -149 and 0 below. The ACC multiplier flushes a scale
-   below 2^-126, which needs `amax < 2^-118`; real weights do not reach it, the golden model keeps such a scale, and the tests
-   avoid that range. The NVFP4 tensor-scale product (`2^c x R[ts_reg]`) is an `fp32_mul` in the DMA engine, not part of `fold_c`.
+   below 2^-126, which needs `amax < 2^-118`; real weights do not reach it, the golden model keeps such a scale (golden and RTL
+   differ there, numerics.md N-2 step 4), and the tests avoid that range. The NVFP4 tensor-scale product (`2^c x R[ts_reg]`) is an `fp32_mul` in the DMA engine, not part of `fold_c`.
 9. **Fold rounding by format.** `fold_quant` saturation never fires when `c` comes from the tile's own `amax`, so the `SATURATE`
-   flag is tested with `fold_quant` alone, with `c` below, at and above the element's own (`foldq_*.hex`, about 46k saturating
+   flag is tested with `fold_quant` alone, with `c` below, at and above the element's own (`foldq_*.hex`, 68,445 saturating
    rows). NVFP4 rounds (the N-2 residual) and the unit tests check exactly that rounding.
+
+## Integration contract
+
+Rules every block that instantiates `rtl/arith` must follow (`core/mxu`, `core/acc`, `core/dma`, `core/ni`). The arith blocks
+assume them; nothing in the RTL checks them. microarch.md §2.2 (MXU, ACC), §2.5 (DMA) and §2.6 (NI) point here. The numerics
+are in numerics.md N-2, N-3, N-5 and N-6.
+
+1. **Flags.** `flags` is per operation, not sticky and not valid-qualified. AND it with the valid of the data it belongs to,
+   carry it through your pipeline registers with that data, and OR it into the `FP_STATUS` of the core that executes the
+   instruction. A write-add or max at an SRAM target sets the `FP_STATUS` of the target's core (the ALU is in the target's
+   network interface), not of the initiator (decision A7).
+2. **Reset.** Only `mxu_pe`'s flag registers reset. Mask flags after reset until valid data has propagated: `REG_DOT + REG_OUT`
+   cycles for one PE, `REG_DOT + 64 * REG_OUT` plus the A skew for a column. (`tb_mxu_pe` drives benign inputs at release and
+   also a flagging row in the first cycle; real inputs are not benign.)
+3. **Unused operands.** Lanes past K in the last K tile, columns past N and rows past M carry +0 in *both* `a` and `w` (or
+   their flags and results are masked): NaN x 0 is `NAN_IN` and Inf x 0 is `INVALID` (BF16), so zeroing one side is not
+   enough. A stale stationary weight may be NaN. The top PE row's `psum_in` is +0 (not -0, not X).
+4. **PE alignment.** With `REG_DOT = 1`, `a`, `w` and `mode_bf16` are presented one cycle before the `psum_in` they belong
+   to, and the stationary-weight swap follows `a`. The array uses `REG_OUT = 1`; `REG_OUT = 0` makes a column one
+   combinational chain.
+5. **ACC lane.** `rescale` only with the first K tile of `RESCALE`, `overwrite` only with the first K tile of `OVERWRITE`,
+   never both (the flags are then undefined); `use_cs` when `cs_reg` is set; `rowscale` per row (`rowscale[m]` broadcast
+   over the row), `cs` per (K tile, column). A NaN `acc` is reported by the lane (the ACC may have been loaded from memory).
+   A NaN `part` copied under `OVERWRITE` without a column scale is not reported again (the PE column did). An operation is
+   one multiply or one add: an Inf x 0 in the lane's multiplier keeps its `INVALID` when the add also has a NaN input
+   (`INVALID | NAN_IN`).
+6. **Fold.** Present each 256-element K tile (one per row and K tile) with the block scale replicated per element. Pad a
+   short last tile with element 0 and a finite, non-NaN scale (E8M0 127, E4M3 `0x38`), and drop the `v` and flags of the
+   padding. OR the flags of the in-range elements only. Column scale:
+   - MX formats: write `fold_c.cs` as is. For c < -126 it is an FP32 subnormal, which the ACC reads as 0 (the golden model
+     keeps it; numerics.md N-2 step 4).
+   - NVFP4: write `fp32_mul(fold_c.cs, R[ts_reg])` and OR that multiply's flags (OVERFLOW for a large T, `NAN_IN` for a NaN T).
+     The product never rounds: it is exact, Inf with OVERFLOW, or 0.
+   - NVFP4 -> BF16: write `R[ts_reg]` unchanged as the column scale.
+7. **Write-add.** All operands are DAZ and results FTZ.
+   - `ADD_F32` is `fp32_add`.
+   - `ADD_BF16` is `fp32_add` on the BF16 operands shifted left by 16, then `cvt_fp32_fp #(FMT=0)`, with flags =
+     `f_add | (f_cvt & ~NAN_IN)`.
+   - `MAX_F32` is `fp32_max` (a NaN operand gives the canonical NaN with `NAN_IN`).
+8. **Conversions.** OR the flags of every converted element that is in range. `cvt = NONE` raises nothing. `VQUANT` detects an
+   Inf or NaN in a block from the block's own inputs: `cvt_fp32_fp` gives an Inf input ±max without a flag, and an E2M1 NaN
+   input code 0 with `NAN_IN`.
 
 ## Verification
 
@@ -123,18 +171,25 @@ them. Each is implemented and tested against the golden model; none changes a fr
 | `tb_bf16_dot2` | specials cross products (zero, +-1, +-Inf, NaN in all four operands), random flavours, product exponents 0-40 apart, cancellation, power-of-two product minus a much smaller one (sticky and guard), sums that round up to 2^-126, sums near 2^-126 and the maximum, the hand cases | 168,075 |
 | `tb_fp32_add`, `tb_fp32_mul` | specials cross product, random flavours (subnormal, near 2^-126, near the maximum), alignment shifts 0-40, cancellation, power of two minus a smaller value, exponent sums at under- and overflow, all-ones mantissas, the hand cases | 138,254, 125,750 |
 | `tb_fp32_max` | the add vectors, the hand cases | 55,749 |
-| `tb_mxu_pe_dot`, `tb_mxu_pe` | both modes through the mux (15,638 FP8 + 11,299 BF16 rows); four pipeline variants (`REG_DOT` x `REG_OUT`) driven one row per clock; flag reset: inputs that raise INVALID, NAN_IN and OVERFLOW held during reset and in the middle of a run (asynchronous assert, flags must read 0 at once, while low and after release) | 26,937 rows each |
-| `tb_acc_update` | all control combinations, the hand cases (NAN_IN only from external operands) | 20,008 |
+| `tb_mxu_pe_dot`, `tb_mxu_pe` | both modes through the mux (15,638 FP8 + 11,299 BF16 rows); four pipeline variants (`REG_DOT` x `REG_OUT`) driven one row per clock; flag reset: inputs that raise INVALID, NAN_IN, OVERFLOW (in the add) and OVERFLOW (in the dot only) held during reset and in the middle of a run (asynchronous assert, flags must read 0 at once, while low and after release), and a flagging row on the inputs at release (its flags must appear in the first cycle) | 26,937 rows each |
+| `tb_acc_update` | all control combinations, the hand cases (NAN_IN only from external operands; Inf is not a NaN; INVALID and NAN_IN together; an OVERWRITE copy of a NaN) | 20,012 |
 | `tb_cvt_fp32_fp` | five formats: random FP32, every rounding midpoint of the target +- one FP32 ulp, max + 1/2 ulp, subnormal / normal boundaries (BF16 subnormals kept), NaN, Inf, the hand cases | 90k-286k each |
 | `tb_cvt_fp32_int` | five integer types: integers and +-0.25 / 0.5 / 0.75 around zero and the limits, one ulp either side, random, NaN, Inf | 43k each |
 | `tb_cvt_dec` | every code of BF16, FP16, E4M3, E5M2, E2M1 to FP32 and BF16 | exhaustive |
 | `tb_mx_dequant_bf16` | every (element, scale) pair of MXFP4, MXFP8, NVFP4 | exhaustive |
-| `tb_fold_quant` | `fold_key` + `fold_amax` + `fold_c` + `fold_quant` on 64-element tiles (random, narrow, 14- and 15-binade spreads, extreme scale codes, NaN, all-zero, the hand tiles) and on 256-element tiles (the spec's tile and the default of `fold_amax`: random, plus one tile per position with a single non-zero element); `fold_quant` alone with `c` below, at and above the element's own | 1,503-1,508 tiles of 64, 556 tiles of 256 (per format); 24,576 / 96,000 / 24,576 single-element rows |
+| `tb_fold_quant` | `fold_key` + `fold_amax` + `fold_c` + `fold_quant` on 64-element tiles (random, narrow, 14- and 15-binade spreads, extreme scale codes, NaN, all-zero, the hand tiles) and on 256-element tiles (the spec's tile and the default of `fold_amax`: random, plus one tile per position with a single non-zero element); `fold_quant` alone with `c` below, at and above the element's own; `fold_amax` alone with N = 3, 5, 48, 100, 255 (not powers of two: all-zero tile, one key at every position, 400 random tiles each, against a behavioural maximum) | 1,503-1,508 tiles of 64, 556 tiles of 256 (per format); 24,576 / 96,000 / 24,576 single-element rows; `fold_amax`: 1 + N + 400 checks per N |
 
 Every vector file has an exact row count. `scripts/gen_arith_vectors.py` writes `build/arith/counts.svh` (one `` `define CNT_<file> <rows> `` per file);
-each testbench includes it, sizes its memory with it and requires exactly that many rows. `make unit` also fails on the
+each testbench includes it (`include "counts.svh"`, `-I build/arith`), sizes its memory with it and requires exactly that many rows, never zero.
+`scripts/arith_vectors.lock` (committed; written by `scripts/gen_arith_vectors.py --lock`) holds the row count and SHA-256 of every
+file of `build/arith`, `counts.svh` included. `make arith-vec` (so `make unit`) and `run_arith_mutants.py` verify the directory against it
+(`scripts/arith_lock.py verify`) and stop on any difference, so a truncated or edited file with a matching `counts.svh`, a zero count, an
+old but self-consistent vector set or a stale copy of `build/` cannot pass, and a change of the generator, the reference or the hand
+cases shows up as a diff of the lock. NumPy's `default_rng` stream is not guaranteed across versions: after an upgrade the lock
+mismatches (correctly); re-check the vectors, then `--lock`. A stray `counts.svh` in the directory the compile runs from (the repo root)
+would still shadow the real one; the lock does not see it. `make unit` also fails on the
 simulator's `Unable to open`, `Not enough words` and `Too many words`, and `make arith-vec` regenerates when an output file is
-missing, so a missing, short or long file cannot pass. The hand-derived cases (`scripts/arith_hand_cases.py`, 279 of them: inputs
+missing, so a missing, short or long file cannot pass. The hand-derived cases (`scripts/arith_hand_cases.py`, 283 of them: inputs
 and expected bits worked out by hand) are in the vectors with the expected values of `arith_ref`; `test_arith.py` asserts that
 the hand literals equal `arith_ref`.
 
@@ -147,7 +202,9 @@ subnormal inputs included), the fold against `numerics.fold_e4m3` (tiles with Na
 spread of at most 14 binades unfolds exactly). Signed zeros are compared as such.
 
 Mutation check (`scripts/arith_mutants/run_arith_mutants.py`, 39 one-change copies of the RTL; the unit test must fail unless the change is equivalent): see
-[status.md](../reports/status.md), "Phase 3: arith". The reviewer's 44 mutants are in `scripts/arith_review/my_mutants.py`.
+[status.md](../reports/status.md), "Phase 3: arith". The reviewers' mutants are in `scripts/arith_review/`: `my_mutants.py` (44: 36 killed, 8 equivalent)
+and `my_mutants2.py` (35: 30 killed, 5 equivalent; the six that survived at `51f8cbe`, four vector gaps, one untested configuration and one
+unpinned spec choice, are killed by the vectors added for arith_review2.md). The three sets add up to 118 mutants: 101 killed, 17 equivalent.
 
 ## Open items
 - Timing and area (Phase 6): the stage cuts, the BF16 multiplier cost against sharing (N-3), whether the 29-bit aligner can be

@@ -965,7 +965,9 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 ## Phase 3: arith (2026-11-07)
 
 Branch `p3-arith` (commits `95d918d` to `2cb3258`: blocks, spec, review). The fixes of the independent review
-([arith_review.md](arith_review.md), F1-F13) are in the working tree, not committed (CLAUDE.md: commit only when asked).
+([arith_review.md](arith_review.md), F1-F13) are commit `51f8cbe`; its re-review ([arith_review2.md](arith_review2.md), commit
+`4898eb9`) found them fixed or partly fixed, and the fixes of that re-review (below, "Second review") are in the working tree,
+not committed (CLAUDE.md: commit only when asked).
 `make lint`, `make unit` and `make pytest` (`test_arith.py`: 32 tests) are green. The spec for the blocks is
 [arith.md](../spec/arith.md); numerics.md N-2, N-3, N-5 and N-6 now state the nine places where it was silent or inconsistent.
 
@@ -980,7 +982,7 @@ tested through the blocks that instantiate them)
 - DMA fold: `fold_key`, `fold_amax`, `fold_c`, `fold_quant`.
 
 Other changes: `make unit` also builds the arith testbenches (all `rtl/arith` files per testbench, run from `build/`, vectors from
-the new `make arith-vec`, `-I build` for `arith/counts.svh`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
+the new `make arith-vec`, `-I build/arith` for `counts.svh`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
 BLOCK=<arith block>` reads the whole directory; `make pytest` includes `test_arith.py`. `sw/npumodel/arith_ref.py` is the exact
 integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vectors.py` writes the vectors.
 
@@ -990,7 +992,7 @@ integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vec
 | `fp8_mul` exhaustive, expected from `ml_dtypes` | 65,536 pairs |
 | `fp8_dot4` / `bf16_dot2` | 200,908 / 168,075 |
 | `fp32_add` / `fp32_mul` / `fp32_max` | 138,254 / 125,750 / 55,749 |
-| `mxu_pe_dot`, `mxu_pe` (four pipeline variants, reset tests), `acc_update` | 26,937, 26,937 rows, 20,008 |
+| `mxu_pe_dot`, `mxu_pe` (four pipeline variants, reset tests), `acc_update` | 26,937, 26,937 rows, 20,012 |
 | `cvt_fp32_fp` (BF16, FP16, E4M3, E5M2, E2M1) | 285,889, 280,501, 90,805, 90,780, 90,089 |
 | `cvt_fp32_int` (INT8, UINT8, INT16, INT32, UINT32) | 42,810, 42,800, 42,798, 42,800, 42,800 |
 | `cvt_dec`, `mx_dequant_bf16` | every code / every (element, scale) pair |
@@ -998,15 +1000,17 @@ integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vec
 | `foldq_*` (`fold_quant` alone, SATURATE reachable) | 24,576 / 96,000 / 24,576 rows |
 
 These are exact row counts: `build/arith/counts.svh` is written by the generator, every testbench requires its count, and `make unit`
-fails on a missing, short or long vector file. 279 hand-derived cases (`scripts/arith_hand_cases.py`) are among the vectors.
+fails on a missing, short or long vector file; `scripts/arith_vectors.lock` (rows and SHA-256 of every file) binds `build/arith` to the generator. 283 hand-derived cases (`scripts/arith_hand_cases.py`) are among the vectors.
 All bit-exact against the reference, including flags. `test_arith.py` ties the reference to `numerics.py` and `ml_dtypes`
 (signed zeros compared, FP32 subnormal inputs, NaN tiles in the fold, no skipped cases) and the hand literals to the reference.
 
 ### Mutation check (`scripts/arith_mutants/run_arith_mutants.py`, 39 mutants, 6 min, 0.2 GB; run under `scripts/memrun`)
 35 mutants fail their testbench; four pass and are equivalent (the three new ones, `acc_nan_made`, `acc_nan_part`, `int_rs24_off`,
 are killed; `bf16_noftz` became `bf16_ftz`, which re-introduces the flush that F6 removed). A mutant run that finds a vector
-file missing, short or long is reported as an ERROR, not as a kill. The reviewer's 44 mutants (`scripts/arith_review/my_mutants.py`):
-all as predicted (36 killed, including `dot_width38`, `pe_flags_norst`, `pe_fdot_norst`, `foldq_sat_off`; the eight equivalent ones survive).
+file missing, short or long is reported as an ERROR, not as a kill, and a `build/arith` that differs from the lock stops the run. The first
+reviewer's 44 mutants (`scripts/arith_review/my_mutants.py`): all as predicted (36 killed, including `dot_width38`, `pe_flags_norst`,
+`pe_fdot_norst`, `foldq_sat_off`; the eight equivalent ones survive). The re-review's 35 (`my_mutants2.py`, 408 s): all as predicted, 30
+killed and 5 equivalent; the six that survived at `51f8cbe` are killed (below). 118 mutants in all: 101 killed, 17 equivalent.
 - `g_fp32_3`, `g_bf16_11`: the aligner at the proven bound `SW + G = 27` (the RTL runs one bit above it: `fp32_add` G = 4, `bf16_dot2`
   G = 12). One bit lower (`g_fp32_2`, `g_bf16_10`), or the sticky OR removed at either width, fails.
 - `foldc_hi`: a normalized significand of exactly 0xE1 cannot occur for the supported elements and scales.
@@ -1028,7 +1032,7 @@ is synthesized hierarchically (capacity.md); the PE is the block to optimize in 
 26-bit guard field (1,855 cells; 5,186 for `mxu_pe_dot`); the test-backed minimum cut them to 1,455 and 4,505.
 
 ### Findings and their resolution
-The independent review ([arith_review.md](arith_review.md)) found no wrong result and 13 findings; the fixes are in the working tree.
+The independent review ([arith_review.md](arith_review.md)) found no wrong result and 13 findings; the fixes are commit `51f8cbe`.
 - Regression (F1, F2, F4, F5, F10): exact vector counts (`counts.svh`), `make unit` fails on a missing, short or long vector file,
   corner 4-way FP8 sums up to 4 x 448^2, a real `mxu_pe` reset test, the `REG_DOT=1, REG_OUT=0` variant, 256-element fold tiles,
   `fold_quant` tested alone so that SATURATE fires.
@@ -1040,6 +1044,28 @@ The independent review ([arith_review.md](arith_review.md)) found no wrong resul
 - Tests (F11): `test_arith.py` compares signed zeros, feeds FP32 subnormals, has no silent skips and ties the hand literals to `arith_ref`.
 The independent oracle `scripts/arith_review/indep.py` has two changes after the review, both approved: the F3 flag rule and the F6
 decision (line 249, FP32 -> BF16 keeps subnormals). `check_files.py` reports 0 disagreements on every row of `build/arith`.
+
+### Second review (re-review of `51f8cbe`, [arith_review2.md](arith_review2.md)): fixes in the working tree
+The re-review found the 13 findings fixed (9) or partly fixed (4), 6 surviving mutants, an infrastructure that did not bind the vectors to
+the generator, and 8 stale or contradictory spec sentences. Decisions of the integrator: A1 `INVALID` stays when the ACC lane also has a
+NaN input ("operation" = one multiply or add); A2 an `OVERWRITE` copy of a NaN `part` sets no `NAN_IN`; A3 short-tile padding is element 0
+with a finite scale and the integrator drops its `v` and flags; A5 write-add operands are DAZ; A7 a write-add or max at an SRAM target
+sets the target core's `FP_STATUS`. A4 (`MAX_F32` returns the zero of a DAZ'd subnormal) and A6 (every converter raises `NAN_IN`) are the
+behaviour the RTL, reference and oracle already had; numerics.md states them now.
+- Spec: numerics.md N-1 (BF16 / FP32 subnormals), N-2 (the FP16 note, `sat` ties for E5M2 / E2M1, INT NaN flag, short-tile padding, fold
+  step 4: the NVFP4 multiply, the MX scale below 2^-126 against the golden model, the `VQUANT` Inf / NaN block rule and its flags), N-5
+  (MXU Inf, SATURATE, INVALID / NAN_IN per operation, write-add DAZ, `MAX_F32`, whose `FP_STATUS`), N-6; arith.md "Integration contract"
+  (8 rules for `core/mxu`, `core/acc`, `core/dma`, `core/ni`) with pointers in microarch.md §2.2, §2.5, §2.6; the two stale counts here and
+  in arith.md.
+- Vectors: four hand `acc_update` cases (Inf is not a NaN in the lane's `NAN_IN` rule, flags 9, an `OVERWRITE` copy of a NaN),
+  `tb_mxu_pe` reset cases (a dot that overflows alone; a flagging row in the first cycle after release), `fold_amax` with N = 3, 5, 48,
+  100, 255. They kill `acc2_inf_as_nan`, `acc2_pinf_as_nan`, `acc2_inv_supp`, `pe2_fdot_ovf_norst`, `pe2_mask_first`, `fold2_pad_ones`.
+- Infrastructure: `scripts/arith_vectors.lock` (committed rows and SHA-256 of all 42 files) is verified by `make arith-vec` / `make unit`
+  and by `run_arith_mutants.py`; zero counts are refused by the generator, the lock and every testbench; the testbenches include
+  `counts.svh` from `-I build/arith`. `attack_infra.sh` S1, S3 and S4 now all fail (caught by the lock), S6 shows the testbench's own zero
+  guard, and `make unit` on the truncated S1 copy stops in `arith-vec`.
+- Results: `make lint` (53 runs), `make unit` (all pass, 81 s), `make pytest` (263 passed), the 39 + 44 + 35 mutants as predicted,
+  `check_files.py` 0 disagreements on 2,368,493 rows of 41 files, `handpicked.py` 283 cases and `spec_cases2.py` 78 cases agree.
 
 ### Next
 - `core/mxu` instantiates `mxu_pe` (skew, shadow weights, stationary load) and `core/acc` instantiates `acc_update`; the MXU test

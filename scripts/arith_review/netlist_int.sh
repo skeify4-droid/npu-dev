@@ -10,7 +10,7 @@ rm -rf "$W"; mkdir -p "$W"
 SRC=$(echo "$ROOT"/rtl/arith/*.sv)
 TB=$W/tb.sv
 echo '`timescale 1ns/1ps' > "$TB"
-echo '`include "arith/counts.svh"' >> "$TB"
+echo '`include "counts.svh"' >> "$TB"
 echo 'module tb; int e = 0, n = 0;' >> "$TB"
 for cfg in "int8 8 1" "uint8 8 0" "int16 16 1" "int32 32 1" "uint32 32 0"; do
   set -- $cfg; tag=$1; bits=$2; sg=$3
@@ -31,5 +31,5 @@ EOF
 done
 echo '  initial begin #100000000; if (e == 0) $display("PASS netlist cvt_fp32_int (%0d rows)", n); else $display("FAIL netlist cvt_fp32_int: %0d errors", e); $finish; end' >> "$TB"
 echo 'endmodule' >> "$TB"
-iverilog -g2012 -I "$ROOT/build" -o "$W/sim" "$TB" "$W"/net_*.v || exit 1
+iverilog -g2012 -I "$ROOT/build/arith" -o "$W/sim" "$TB" "$W"/net_*.v || exit 1
 (cd "$ROOT/build" && vvp -n "$W/sim")

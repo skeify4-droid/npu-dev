@@ -1,6 +1,7 @@
 """Targeted vectors for the fp_addu guard-bit bound: one-bit cancellation (big = 1.000..x, opposite sign), exponent
 differences 2..60, small mantissas that put the exact result on / next to a rounding tie. Expected from indep.py.
-Writes OUT/arith/fp32_add.hex, OUT/arith/bf16_dot2.hex and OUT/arith/counts.svh (the row counts the testbenches require)."""
+Writes OUT/arith/fp32_add.hex, OUT/arith/bf16_dot2.hex and OUT/arith/counts.svh (the row counts the testbenches require).
+They are not the locked vectors: run them through run_tb.sh with ARITH_LOCK=0."""
 import os
 import random
 import sys

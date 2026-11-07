@@ -5,6 +5,8 @@ testbenches through run_tb.sh, which fails on a missing / short / long vector fi
 
 predicted: kill, equiv (cannot change any output; reason in the comment), gap (a real behaviour change that the current
 vectors are expected not to reach), cfg (only reachable in a parameter configuration that no testbench simulates).
+At the fixes of arith_review2.md every gap and the cfg mutant became a kill (the comment names the new vector), and
+acc2_inv_supp is a kill by the decision on A1; the equivalent ones are unchanged.
 
 Usage: scripts/memrun arith_review_mutants2 python3 scripts/arith_review/my_mutants2.py [VECDIR] [name ...]
 """
@@ -27,9 +29,9 @@ RO_MASK1 = ("    logic rq;\n    always_ff @(posedge clk) psum_out <= sum;\n    a
 M = [
     # ---- acc_update: the F3 NAN_IN rule
     ("acc2_inf_as_nan", [("acc_update.sv", "assign acc_nan  = (acc[30:23]  == 8'hFF) && (acc[22:0]  != 23'd0);",
-                          "assign acc_nan  = (acc[30:23]  == 8'hFF);")], ["acc_update"], "gap"),       # acc = Inf, part = NaN made by cs (Inf x 0)
+                          "assign acc_nan  = (acc[30:23]  == 8'hFF);")], ["acc_update"], "kill"),       # hand row: acc = Inf, part Inf, cs 0 (second-review fix)
     ("acc2_pinf_as_nan", [("acc_update.sv", "assign part_nan = (part[30:23] == 8'hFF) && (part[22:0] != 23'd0);",
-                           "assign part_nan = (part[30:23] == 8'hFF);")], ["acc_update"], "gap"),     # part = Inf, acc_r = NaN made by rowscale
+                           "assign part_nan = (part[30:23] == 8'hFF);")], ["acc_update"], "kill"),     # hand row: acc = Inf, rowscale 0, RESCALE, part Inf
     ("acc2_nanadd_norsc", [("acc_update.sv", "(!rescale && acc_nan)", "acc_nan")], ["acc_update"], "equiv"),   # rescaled NaN acc: f_rs has NAN_IN
     ("acc2_nanadd_nocs", [("acc_update.sv", "(!use_cs && part_nan)", "part_nan")], ["acc_update"], "equiv"),   # scaled NaN part: f_cs has NAN_IN
     ("acc2_nan_direct", [("acc_update.sv", "{f_add[3] & nan_add, f_add[2:0]}", "{nan_add, f_add[2:0]}")], ["acc_update"], "equiv"),  # nan_add implies f_add[3]
@@ -39,7 +41,7 @@ M = [
     ("acc2_rs_nan_unused", [("acc_update.sv", "(rescale ? f_rs : 4'd0)", "(rescale ? f_rs : {f_rs[3], 3'b000})")], ["acc_update"], "kill"),
     ("acc2_ow_nan", [("acc_update.sv", "(overwrite ? 4'd0 : {f_add[3] & nan_add, f_add[2:0]})",
                       "(overwrite ? {!use_cs && part_nan, 3'b000} : {f_add[3] & nan_add, f_add[2:0]})")], ["acc_update"], "kill"),  # N-5 literal: OVERWRITE copy of a NaN part is NAN_IN
-    ("acc2_inv_supp", [("acc_update.sv", FL_OLD, FL_INV_SUPP)], ["acc_update"], "kill"),     # "one unit": INVALID suppressed when NAN_IN
+    ("acc2_inv_supp", [("acc_update.sv", FL_OLD, FL_INV_SUPP)], ["acc_update"], "kill"),     # "one unit" reading of A1 rejected: hand row with flags 9
     # ---- cvt_fp32_fp: BF16 subnormals kept (F6)
     ("cvt2_sub_elsb", [("cvt_fp32_fp.sv", "elsb = -12'sd149;", "elsb = -12'sd150;")], ["cvt_fp32_fp"], "kill"),
     ("cvt2_sub_daz", [("cvt_fp32_fp.sv", "mag  = {1'b0, x[22:0]};", "mag  = 24'd0;")], ["cvt_fp32_fp"], "kill"),
@@ -54,7 +56,7 @@ M = [
     ("fold2_top_half", [("fold_amax.sv", "assign amax = g_lvl[L].v;", "assign amax = g_lvl[L-1].v[KW-1:0];")], ["fold_quant"], "kill"),
     ("fold2_n256_half", [("fold_amax.sv", "assign amax = g_lvl[L].v;", "assign amax = (N == 256) ? g_lvl[L-1].v[KW-1:0] : g_lvl[L].v;")], ["fold_quant"], "kill"),  # only fold256 sees it
     ("fold2_leaf255", [("fold_amax.sv", "assign v = keys;", "assign v = (N == 256) ? {{KW{1'b0}}, keys[(N-1)*KW-1:0]} : keys;")], ["fold_quant"], "kill"),
-    ("fold2_pad_ones", [("fold_amax.sv", "assign v = {{((NP - N)*KW){1'b0}}, keys};", "assign v = {{((NP - N)*KW){1'b1}}, keys};")], ["fold_quant"], "cfg"),  # N not a power of two: never simulated
+    ("fold2_pad_ones", [("fold_amax.sv", "assign v = {{((NP - N)*KW){1'b0}}, keys};", "assign v = {{((NP - N)*KW){1'b1}}, keys};")], ["fold_quant"], "kill"),  # amax_chk N = 3, 5, 48, 100, 255 (tb_fold_quant)
     ("fold2_signed_cmp", [("fold_amax.sv", "assign v[i*KW +: KW] = (lo >= hi) ? lo : hi;", "assign v[i*KW +: KW] = ($signed(lo) >= $signed(hi)) ? lo : hi;")], ["fold_quant"], "kill"),
     ("fold2_key_msb", [("fold_amax.sv", "(lo >= hi)", "(lo[KW-2:0] >= hi[KW-2:0])")], ["fold_quant"], "kill"),
     ("fold2_amax_gt", [("fold_amax.sv", "(lo >= hi)", "(lo > hi)")], ["fold_quant"], "equiv"),     # equal keys: same value either way
@@ -65,13 +67,13 @@ M = [
     ("dot2_sign37", [("fp8_dot4.sv", "s_out   = sum[38] |", "s_out   = sum[37] |")], ["fp8_dot4"], "kill"),
     ("dot2_amag37", [("fp8_dot4.sv", "amag    = sum[38] ? 38'(-sum) : sum[37:0];", "amag    = sum[38] ? 38'(-sum) : {1'b0, sum[36:0]};")], ["fp8_dot4"], "kill"),
     # ---- mxu_pe: reset of the flag registers (F4)
-    ("pe2_fdot_ovf_norst", [("mxu_pe.sv", "if (!rst_n) f_dot_q <= '0;", "if (!rst_n) f_dot_q <= {2'b00, f_dot[1], 1'b0};")], ["mxu_pe"], "gap"),  # no reset case has a dot that overflows
+    ("pe2_fdot_ovf_norst", [("mxu_pe.sv", "if (!rst_n) f_dot_q <= '0;", "if (!rst_n) f_dot_q <= {2'b00, f_dot[1], 1'b0};")], ["mxu_pe"], "kill"),  # reset case DOT_OVERFLOW (tb_mxu_pe)
     ("pe2_flags_b2", [("mxu_pe.sv", "if (!rst_n) flags <= '0;", "if (!rst_n) flags <= {1'b0, f_new[2], 2'b00};")], ["mxu_pe"], "equiv"),  # f_new[2] is constant 0
     ("pe2_flags_sync", [("mxu_pe.sv", "always_ff @(posedge clk or negedge rst_n) begin\n      if (!rst_n) flags <= '0;",
                          "always_ff @(posedge clk) begin\n      if (!rst_n) flags <= '0;")], ["mxu_pe"], "kill"),
     ("pe2_fdot_sync", [("mxu_pe.sv", "always_ff @(posedge clk or negedge rst_n) begin\n      if (!rst_n) f_dot_q <= '0;",
                         "always_ff @(posedge clk) begin\n      if (!rst_n) f_dot_q <= '0;")], ["mxu_pe"], "kill"),
-    ("pe2_mask_first", [("mxu_pe.sv", RO_OLD, RO_MASK1)], ["mxu_pe"], "gap"),     # output flags dropped in the first cycle after release
+    ("pe2_mask_first", [("mxu_pe.sv", RO_OLD, RO_MASK1)], ["mxu_pe"], "kill"),     # FIRST_CYCLE case (tb_mxu_pe)
 ]
 
 

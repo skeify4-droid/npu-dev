@@ -2,7 +2,7 @@
 // sw/npumodel/arith_ref.py (vectors: integers +- 0.25 / 0.5 / 0.75 around zero and the range limits, one FP32 ulp
 // either side, random magnitudes, NaN, Inf).
 `timescale 1ns/1ps
-`include "arith/counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
+`include "counts.svh"   // CNT_<file>: rows of each vector file (scripts/gen_arith_vectors.py)
 module cvt_int_chk #(
   parameter int    BITS   = 8,
   parameter bit    SIGNED = 1'b1,
@@ -28,7 +28,7 @@ module cvt_int_chk #(
         if (errors <= 5) $display("MISMATCH BITS=%0d SIGNED=%0d x=%h y=%h flags=%h  exp y=%h flags=%h", BITS, SIGNED, x, y, flags, mem[i][35:4], mem[i][3:0]);
       end
     end
-    if (n != MAXN) begin errors++; $display("BITS=%0d SIGNED=%0d: expected %0d vectors, read %0d", BITS, SIGNED, MAXN, n); end
+    if (n != MAXN || MAXN < 1) begin errors++; $display("BITS=%0d SIGNED=%0d: expected %0d vectors, read %0d", BITS, SIGNED, MAXN, n); end
   end
 endmodule
 

@@ -5,10 +5,16 @@ The expected values come from `sw/npumodel/arith_ref.py` (exact integer referenc
 and ml_dtypes by tb/unit/test_arith.py). One row per line, a hex word of the fields listed in FIELDS (MSB first).
 Deterministic: fixed seeds. Usage: gen_arith_vectors.py [OUTDIR]   (default build/arith)
                                   gen_arith_vectors.py --check [OUTDIR]  (exit 1 if an expected output file is missing)
+                                  gen_arith_vectors.py --lock [OUTDIR]   (generate, then write scripts/arith_vectors.lock)
 
 OUTDIR/counts.svh holds one `define CNT_<FILE> <rows>` per file. Every testbench includes it and requires exactly that many
 rows from its file(s), so a missing, short or long file fails `make unit`. The hand-derived cases of
 scripts/arith_hand_cases.py are appended to the per-block files (inputs from there, expected values from arith_ref).
+
+scripts/arith_vectors.lock (committed) holds the row count and SHA-256 of every file written here, counts.svh included.
+`make unit` and run_arith_mutants.py fail when build/arith differs from it (scripts/arith_lock.py verify), so a generator,
+reference or hand-case change shows up as a diff of the lock, and a stale or edited build/ cannot pass. After an intended
+change run `scripts/gen_arith_vectors.py --lock` and commit the lock. A file with zero rows is refused.
 """
 import itertools
 import os
@@ -22,8 +28,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from npumodel import arith_ref as R  # noqa: E402
 import arith_hand_cases as H  # noqa: E402
 
-CHECK = len(sys.argv) > 1 and sys.argv[1] == "--check"
-_args = [a for a in sys.argv[1:] if a != "--check"]
+CHECK = "--check" in sys.argv[1:]
+LOCK = "--lock" in sys.argv[1:]
+_args = [a for a in sys.argv[1:] if a not in ("--check", "--lock")]
 OUT = _args[0] if _args else os.path.join(ROOT, "build", "arith")
 RNG = np.random.default_rng(20261107)
 COUNTS = {}                                                     # file name -> rows written
@@ -66,6 +73,7 @@ def pack(*fields):
 
 
 def write(name, rows):
+    assert rows, f"{name}: no rows"                              # a zero count would make a testbench check nothing
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, name + ".hex"), "w") as f:
         f.write("\n".join(rows) + "\n")
@@ -514,3 +522,6 @@ if __name__ == "__main__":
     if CHECK:
         sys.exit(0 if check_outputs() else 1)
     main()
+    if LOCK:
+        import arith_lock
+        arith_lock.write_lock(OUT)

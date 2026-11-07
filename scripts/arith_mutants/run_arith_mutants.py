@@ -7,7 +7,7 @@ unit testbench that should notice, and compare with the expected outcome.
            correct design
 
 Usage (one at a time, a few minutes, no VM): scripts/memrun arith_mutants python3 scripts/arith_mutants/run_arith_mutants.py [name ...]
-Needs build/arith/*.hex and counts.svh (make arith-vec); a mutant run that finds a vector file missing, short or long is an ERROR, not a kill. Exit code 1 if any outcome differs from the expectation.
+Needs build/arith equal to scripts/arith_vectors.lock (make arith-vec; the run stops otherwise); a mutant run that finds a vector file missing, short or long is an ERROR, not a kill. Exit code 1 if any outcome differs from the expectation.
 """
 import os
 import shutil
@@ -83,7 +83,7 @@ def run(name, edits, tb, expect, note):
         open(p, "w").write(s.replace(old, new, 1))
     exe = os.path.join(d, "sim")
     srcs = sorted(os.path.join(d, x) for x in os.listdir(d) if x.endswith(".sv"))
-    r = subprocess.run(["iverilog", "-g2012", "-I", os.path.join(ROOT, "build"), "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs, capture_output=True, text=True)
+    r = subprocess.run(["iverilog", "-g2012", "-I", os.path.join(ROOT, "build", "arith"), "-o", exe, os.path.join(ROOT, "tb", "unit", f"tb_{tb}.sv")] + srcs, capture_output=True, text=True)
     if r.returncode:
         return "COMPILE-ERROR " + r.stderr[-300:]
     r = subprocess.run(["vvp", "-n", exe], cwd=os.path.join(ROOT, "build"), capture_output=True, text=True)
@@ -94,9 +94,9 @@ def run(name, edits, tb, expect, note):
 
 
 def main():
-    if subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "gen_arith_vectors.py"), "--check",
+    if subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "arith_lock.py"), "verify",
                        os.path.join(ROOT, "build", "arith")]).returncode:
-        sys.exit("run `make arith-vec` first")
+        sys.exit("build/arith differs from scripts/arith_vectors.lock: run `make arith-vec` first")
     sel = set(sys.argv[1:])
     bad = 0
     for name, edits, tb, expect, note in MUTANTS:

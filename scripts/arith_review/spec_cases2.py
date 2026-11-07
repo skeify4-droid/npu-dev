@@ -5,6 +5,11 @@ consulted for them). Each case is then
   - evaluated with arith_ref (called as a black box) and with the first review's oracle indep.py.
 Where the text admits two readings, `alt` holds the other one; the case is reported as AMBIGUOUS with both values.
 
+At the fixes of arith_review2.md the ambiguous rules A1-A7 were decided (docs/spec/numerics.md N-2, N-5, N-6 and the
+integration contract in docs/spec/arith.md state them), so the cases that carried an `alt` are agreed cases now: the
+expected value is the decision and `alt` is None (the old reading is kept in the note). The report's count was 70 agreeing and
+7 ambiguous over 77 cases; it is 78 agreeing and 0 ambiguous now (the A3 case became two). A7 (whose FP_STATUS a remote write-add sets) is a core-level rule and has no case here.
+
 Usage: python3 scripts/arith_review/spec_cases2.py
 """
 import os
@@ -62,7 +67,7 @@ C = [
     ("R5 int", "int", (8, False, 0x437F8000), (0xFF, SAT), None, "255.5 -> 256 -> 255"),
     ("R5 int", "int", (32, True, 0x4F000000), (0x7FFFFFFF, SAT), None, "2^31"),
     ("R5 int", "int", (8, True, 0x7F800000), (0x7F, 0), None, "+Inf, no flag"),
-    ("R5 int", "int", (8, True, 0x7FC00000), (0x00, NANIN), (0x00, 0), "NaN -> 0; N-2 names no flag, arith.md: converters raise NAN_IN"),
+    ("R5 int", "int", (8, True, 0x7FC00000), (0x00, NANIN), None, "A6: NaN -> 0 with NAN_IN (N-2 now names it; before: no flag named)"),
     # R6  N-2 fold step 1 (256-element MXFP8 / MXFP4 tiles): NaN out of amax, NaN-scale blocks, all-NaN tile, padding
     ("R6 fold", "fold", (1, 0, {0: (0x7F, 127)}, 127), (0, 0x3F800000, {0: (0x7F, NANIN), 1: (0, 0)}), None, "NaN and zeros only: c = 0"),
     ("R6 fold", "fold", (1, 0, {0: (0x7F, 127), 1: (0x7E, 128)}, 127), (1, 0x40000000, {0: (0x7F, NANIN), 1: (0x7E, 0)}), None, "NaN + 896"),
@@ -70,9 +75,12 @@ C = [
      (-8, 0x3B800000, {0: (0x7F, NANIN), 31: (0x7F, NANIN), 32: (0x78, 0)}), None, "NaN-scale block of 1.0s, then 1.0s"),
     ("R6 fold", "fold", (1, 0, {0: (0x00, 0xFF), 32: (0x38, 127)}, 127), (-8, 0x3B800000, {0: (0x7F, NANIN), 32: (0x78, 0)}), None,
      "a ZERO element of a NaN-scale block is written NaN"),
+    ("R6 fold", "fold", (1, 0, {99: (0x7E, 127), **{i: (0x00, 127) for i in range(100, 256)}}, 127),
+     (0, 0x3F800000, {99: (0x7E, 0), 100: (0x00, 0), 255: (0x00, 0)}), None,
+     "A3: short tile (100 elements) padded with element 0 and a finite scale (E8M0 127): the padding is a clean zero"),
     ("R6 fold", "fold", (1, 0, {99: (0x7E, 127), **{i: (0x00, 0xFF) for i in range(100, 256)}}, 127),
-     (0, 0x3F800000, {99: (0x7E, 0), 100: (0x00, 0), 255: (0x00, 0)}), (0, 0x3F800000, {99: (0x7E, 0), 100: (0x7F, NANIN), 255: (0x7F, NANIN)}),
-     "short tile (100 elements) padded with element 0 but a NaN (0xFF) scale: 'presented as zero elements' does not say the scale"),
+     (0, 0x3F800000, {99: (0x7E, 0), 100: (0x7F, NANIN), 255: (0x7F, NANIN)}), None,
+     "A3 (why the scale must be finite): padding with a NaN (0xFF) scale is written NaN with NAN_IN"),
     ("R6 fold", "fold", (0, 0, {0: (0x7, 127)}, 127), (-6, 0x3C800000, {0: (0x7C, 0)}), None, "MXFP4 amax 6 -> c = -6, 384"),
     # R7  N-2 fold step 4: NVFP4 cs = fp32_mul(2^c, T) (RNE, DAZ / FTZ) in the DMA engine
     ("R7 nvfp4 cs", "mul", (0x41000000, 0x3F800000), (0x41000000, 0), None, "c = 3, T = 1"),
@@ -86,16 +94,16 @@ C = [
     ("R8 inv-supp", "dot16", ([0x7F80, 0x3F80], [0x0000, 0x3F80]), (NAN, INV), None, "Inf x 0 alone"),
     ("R8 inv-supp", "add", (0x7F800000, 0xFF800000), (NAN, INV), None, "Inf - Inf"),
     ("R8 inv-supp", "mul", (0x7FC00000, 0x00000000), (NAN, NANIN), None, "NaN x 0: NAN_IN only"),
-    ("R8 inv-supp", "acc", (0x7FC00000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0), (NAN, NANIN), (NAN, INV | NANIN),
-     "ACC lane: NaN acc + (Inf x 0 in cs). 'one unit' with a NaN input -> NAN_IN only; per multiply -> INVALID too"),
-    ("R8 inv-supp", "acc", (0x7F800000, 0x7FC00000, 0x00000000, 0x3F800000, 1, 0, 0), (NAN, NANIN), (NAN, INV | NANIN),
-     "ACC lane: (Inf x 0 rowscale) + NaN part"),
+    ("R8 inv-supp", "acc", (0x7FC00000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0), (NAN, INV | NANIN), None,
+     "A1: ACC lane, NaN acc + (Inf x 0 in cs): an operation is one multiply or add, so INVALID stays (the 'one unit' reading, NAN_IN only, is rejected)"),
+    ("R8 inv-supp", "acc", (0x7F800000, 0x7FC00000, 0x00000000, 0x3F800000, 1, 0, 0), (NAN, INV | NANIN), None,
+     "A1: ACC lane, (Inf x 0 rowscale) + NaN part"),
     # R9  N-5 NAN_IN: a NaN among the external operands; a NaN made inside is INVALID only
     ("R9 nan-in", "acc", (0x3F800000, 0x7F800000, 0x3F800000, 0x00000000, 0, 1, 0), (NAN, INV), None, "Inf x 0 in cs: INVALID only"),
     ("R9 nan-in", "acc", (0x7F800000, 0x3F800000, 0x00000000, 0x3F800000, 1, 0, 0), (NAN, INV), None, "Inf x 0 in rowscale"),
     ("R9 nan-in", "acc", (0x7FC00001, 0x3F800000, 0x3F800000, 0x3F800000, 0, 0, 0), (NAN, NANIN), None, "NaN acc accumulated"),
-    ("R9 nan-in", "acc", (0x3F800000, 0x7FC00001, 0x3F800000, 0x3F800000, 0, 0, 1), (0x7FC00001, NANIN), (0x7FC00001, 0),
-     "OVERWRITE copies a NaN part (no cs): an external NaN operand of the lane, but no arithmetic consumes it"),
+    ("R9 nan-in", "acc", (0x3F800000, 0x7FC00001, 0x3F800000, 0x3F800000, 0, 0, 1), (0x7FC00001, 0), None,
+     "A2: OVERWRITE copies a NaN part (no cs): no arithmetic consumes it, so no NAN_IN (the PE column reported it)"),
     ("R9 nan-in", "acc", (0x3F800000, 0x7FC00001, 0x3F800000, 0x40000000, 0, 1, 1), (NAN, NANIN), None, "OVERWRITE, NaN part scaled"),
     ("R9 nan-in", "acc", (0x7FC00000, 0x3F800000, 0x3F800000, 0x3F800000, 1, 0, 0), (NAN, NANIN), None, "NaN acc rescaled"),
     ("R9 nan-in", "dot8", ([0x7F, 0, 0, 0], [0x38, 0, 0, 0]), (NAN, NANIN), None, "E4M3 NaN operand of the PE"),
@@ -103,7 +111,7 @@ C = [
     ("R10 max", "max", (0x7FC00001, 0x3F800000), (NAN, NANIN), None, "NaN -> canonical"),
     ("R10 max", "max", (0x3F800000, 0xFF800001), (NAN, NANIN), None, "-NaN -> +canonical"),
     ("R10 max", "max", (0x80000000, 0x00000000), (0x00000000, 0), None, "max(-0, +0)"),
-    ("R10 max", "max", (0x00000001, 0x80000000), (0x00000000, 0), (0x00000001, 0), "DAZ: the result is +0, or the subnormal's bits?"),
+    ("R10 max", "max", (0x00000001, 0x80000000), (0x00000000, 0), None, "A4: DAZ, the result is +0 (not the subnormal's bits)"),
     ("R10 max", "max", (0xFF800000, 0xFF7FFFFF), (0xFF7FFFFF, 0), None, "ordered"),
     ("R10 max", "max", (0x80000001, 0x80000000), (0x80000000, 0), None, "-sub (DAZ -0) vs -0"),
     # R11 N-6 ADD_BF16 = RNE_BF16(RNE_FP32(old + new)), NAN_IN from the add only
@@ -111,7 +119,7 @@ C = [
     ("R11 add_bf16", "addbf", (0x7F7F, 0x7F7F), (0x7F80, OVF), None, "FP32 overflow"),
     ("R11 add_bf16", "addbf", (0x7F7F, 0x7B00), (0x7F80, OVF), None, "FP32 finite 2^128 - 2^119, BF16 tie -> Inf: OVERFLOW from the converter"),
     ("R11 add_bf16", "addbf", (0x7FC1, 0x3F80), (0x7FC0, NANIN), None, "NaN old: NAN_IN once"),
-    ("R11 add_bf16", "addbf", (0x0001, 0x0080), (0x0080, 0), (0x0081, 0), "BF16 subnormal old: DAZ (principles) or only FTZ (N-5 row)?"),
+    ("R11 add_bf16", "addbf", (0x0001, 0x0080), (0x0080, 0), None, "A5: write-add operands are DAZ (BF16 subnormal old reads as 0)"),
     ("R11 add_bf16", "addbf", (0x3F80, 0x3B80), (0x3F80, 0), None, "1 + 2^-8: BF16 tie -> even"),
     # R12 N-3: in BF16 mode Inf comes from operands and from a dot overflow too
     ("R12 bf16 inf", "dot16", ([0x7F7F, 0], [0x7F7F, 0]), (0x7F800000, OVF), None, "the spec's example"),
