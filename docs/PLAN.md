@@ -269,7 +269,7 @@ session checks the fixes next.
 | Block | Contents | Verification hook |
 |---|---|---|
 | `common` | FIFOs (incl. async FIFO for the HBM `clk_mc` domain), credit interfaces, arbiters (RR, priority), SRAM wrapper (behavioral ↔ fakeram macro switch) | formal |
-| `arith` | FP8/BF16 multipliers, 4-way dot-product PE, FP32 adder/accumulator, converters, MXFP4 decoder | **exhaustive** FP8×FP8 (65,536 pairs per format) vs `ml_dtypes`; BF16 random + corners |
+| `arith` | FP8/BF16 multipliers, 4-way dot-product PE, FP32 adder/accumulator, converters, MXFP4 decoder. **Built (2026-11-07), spec [arith.md](spec/arith.md).** Adds FP32 multiply / max, ACC lane, the dequantizer to BF16 and the DMA fold blocks | **exhaustive** FP8×FP8 (65,536 pairs per format) vs `ml_dtypes`; BF16 random + corners. Done: all of it bit-exact, plus exhaustive decode / dequant, directed rounding and sticky cases and a mutation check |
 | `core/mxu` | weight-stationary array (decided in Phase 2, microarch.md §2.2), skew/de-skew, column-scale and rowscale multipliers | cocotb GEMM vs NumPy (`numerics.mxu_mm`) |
 | `core/acc` | accumulator SRAM (2048 x 64 FP32), MXU read-modify-write port, VPU port, conflict stall | directed + random vs NumPy |
 | `core/vpu`, `sfu` | lanes, reductions, exp/recip/rsqrt (LUT + polynomial), top-k unit | ULP-error bounds vs NumPy |

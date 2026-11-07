@@ -961,3 +961,75 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 ### Next
 - `make syn` numbers are generic-cell counts, not ASAP7 areas (Phase 6).
 - Phase 3 `arith` and the leaf blocks can instantiate these blocks; `flit_t` width goes in through `WIDTH`.
+
+## Phase 3: arith (2026-11-07)
+
+Working tree on `main`, not committed (CLAUDE.md: commit only when asked). `make lint`, `make unit` and `make pytest`
+(`test_arith.py`: 30 tests) are green. `docs/spec/numerics.md` is unchanged; the spec for the blocks is
+[arith.md](../spec/arith.md), which also lists nine places where numerics.md was silent or inconsistent and what the RTL does.
+
+### Blocks (`rtl/arith/`, 20 files, each with a `tb/unit/tb_<name>.sv` except the helpers `fp_round`, `fp_addu`, `mx_exact`,
+tested through the blocks that instantiate them)
+- Rounding core `fp_round` (exact magnitude to any binary format: RNE, subnormal grid, FTZ, saturate / Inf, `SUBN_MAX`),
+  `fp_addu` (aligner with sticky).
+- MXU PE: `fp8_mul`, `fp8_dot4`, `bf16_dot2`, `mxu_pe_dot` (mode mux), `mxu_pe` (dot, FP32 add, optional registers).
+- FP32: `fp32_add`, `fp32_mul`, `fp32_max` (write-add `MAX_F32`), `acc_update` (RESCALE / column scale / OVERWRITE lane).
+- Converters: `cvt_fp32_fp` (BF16, FP16, E4M3, E5M2, E2M1), `cvt_fp32_int`, `cvt_dec` (exact decode to FP32 or BF16),
+  `mx_exact` + `mx_dequant_bf16` (MXFP4, MXFP8, NVFP4 -> BF16).
+- DMA fold: `fold_key`, `fold_amax`, `fold_c`, `fold_quant`.
+
+Other changes: `make unit` also builds the arith testbenches (all `rtl/arith` files per testbench, run from `build/`, vectors from
+the new `make arith-vec`); `make lint` also lints every arith block as its own top and 24 parameter variants; `make syn
+BLOCK=<arith block>` reads the whole directory; `make pytest` includes `test_arith.py`. `sw/npumodel/arith_ref.py` is the exact
+integer reference (values as sign, integer, exponent) and `scripts/gen_arith_vectors.py` writes the vectors.
+
+### Test results
+| Test | Vectors |
+|---|---|
+| `fp8_mul` exhaustive, expected from `ml_dtypes` | 65,536 pairs |
+| `fp8_dot4` / `bf16_dot2` | 196,792 / 150,000 |
+| `fp32_add` / `fp32_mul` / `fp32_max` | 138,229 / 125,729 / 55,729 |
+| `mxu_pe_dot`, `mxu_pe` (three pipeline variants), `acc_update` | 20,000, 20,000 rows, 20,000 |
+| `cvt_fp32_fp` (BF16, FP16, E4M3, E5M2, E2M1) | 286k, 280k, 91k, 91k, 90k |
+| `cvt_fp32_int` (5 types) | 42,795 each |
+| `cvt_dec`, `mx_dequant_bf16` | every code / every (element, scale) pair |
+| `fold_*` | 1,500 tiles of 64 per format (MXFP4, MXFP8, NVFP4) |
+
+All bit-exact against the reference, including flags. `test_arith.py` ties the reference to `numerics.py` and `ml_dtypes`.
+
+### Mutation check (`scripts/arith_mutants/run_arith_mutants.py`, 36 mutants, 4 min, 63 MB; run under `scripts/memrun`)
+32 mutants fail their testbench; four pass and are equivalent:
+- `g_fp32_3`, `g_bf16_11`: the aligner at the proven bound `SW + G = 27` (the RTL runs one bit above it: `fp32_add` G = 4, `bf16_dot2`
+  G = 12). One bit lower (`g_fp32_2`, `g_bf16_10`), or the sticky OR removed at either width, fails.
+- `foldc_hi`: a normalized significand of exactly 0xE1 cannot occur for the supported elements and scales.
+- `add_subn_full`: the full subnormal shifter in `fp32_add` changes only area (sums of normal FP32 values below 2^-126 are exact).
+The first mutation round found two gaps in the vectors, both closed: no vector had both BF16 products infinite with opposite
+signs and no NaN operand, and none had a power-of-two product cancelled by a much smaller one (the lost sticky bit merging with
+the guard bit) or a sum rounding up into 2^-126.
+
+### Area (Yosys generic cells, `make syn`, flattened, native)
+| Block | Cells | | Block | Cells |
+|---|---|---|---|---|
+| `fp8_dot4` | 2,462 | | `fp32_mul` | 4,025 |
+| `bf16_dot2` | 2,147 | | `acc_update` | 9,744 |
+| `fp32_add` | 1,455 | | `cvt_fp32_fp` (BF16) | 428 |
+| `mxu_pe_dot` | 4,505 | | `mx_dequant_bf16` | 192 |
+| `mxu_pe` (registered) | 6,580 | | `fold_quant` (per element) | 249 |
+At 6.6k cells a 64 x 64 array is about 27 M generic cells per core, so `FULL` stays a simulator-only configuration and the array
+is synthesized hierarchically (capacity.md); the PE is the block to optimize in Phase 6. The first version of `fp32_add` had a
+26-bit guard field (1,855 cells; 5,186 for `mxu_pe_dot`); the test-backed minimum cut them to 1,455 and 4,505.
+
+### Findings
+- numerics.md N-2 says FP16 -> BF16 is exact; it is not (11-bit against 8-bit significand). `cvt_dec` rounds it (RNE).
+- N-2 (flush BF16 results below 2^-126) and N-5 ("BF16 kept" for DMA conversions) disagree for FP32 -> BF16; the RTL follows N-2.
+- The fold of a tile that contains a NaN is undefined in N-2; the RTL leaves NaNs out of `amax` and writes E4M3 NaN.
+- The remaining items (signed zeros, flag semantics, NVFP4 scale sign, fold scale range) are in arith.md "Decisions and gaps".
+These need a decision from the spec owner; none changes a frozen number.
+
+### Next
+- `core/mxu` instantiates `mxu_pe` (skew, shadow weights, stationary load) and `core/acc` instantiates `acc_update`; the MXU test
+  against `numerics.mxu_mm` is then the cocotb GEMM of PLAN Phase 3.
+- `core/vpu` / `core/sfu`: FMA (reuse `fp_round`, a 48-bit aligned add in front), exp / reciprocal / rsqrt, `VQUANT` scale logic
+  (E8M0 exponent, NVFP4 block scale) on top of `cvt_fp32_fp`.
+- `core/ni` write-add ALU: `fp32_add` / `fp32_max`, `ADD_BF16` as `fp32_add` + `cvt_fp32_fp #(FMT=0)`.
+- Phase 6: stage cuts of `mxu_pe` against the clock, BF16 multiplier cost against sharing the FP8 ones.
