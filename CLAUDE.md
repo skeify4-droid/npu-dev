@@ -18,9 +18,11 @@ Full plan: `docs/PLAN.md`. Environment: `/Volumes/EVO970PLUS/claude/env_setup` (
 - Simulator (Icarus) and Verilator run on macOS. Yosys and Icarus take `sv2v` output for complex SV.
 - OpenROAD: `eda-run` / `orfs-make` (VM). Do not change the pinned OpenROAD/ORFS/Yosys commits.
 - afifo CDC constraints: `make cdc-sta` (VM: ORFS ASAP7 synthesis of six configurations, then OpenSTA checks of the
-  header text taken literally, plus one configuration through floorplan and CTS with three controls; about 2 min, 0.4 GB
-  in the VM; `scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`). Run it after any change to
-  the afifo RTL or its constraint text.
+  header text taken literally, plus one configuration through floorplan, CTS and global/detail route with three
+  controls; about 2.5 min, 1.3 GB in the VM; `scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`). The checks
+  guard their own selections (set sizes) and values (max/min delay bounds), and time the post-flow results at the flow's
+  corner with placement parasitics. Run it after any change to the afifo RTL or its constraint text. `CDC_SRC` / `CDC_B`
+  point `scripts/cdc_sta/run.sh` at another afifo.sv and work directory (mutation runs).
 
 ## RTL conventions
 - Synthesizable SV: packages, structs, enums, and parameters are allowed. No classes or interfaces in synthesizable code.

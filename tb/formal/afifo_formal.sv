@@ -65,8 +65,9 @@ module afifo_formal #(
   //       low: strictly before it rises, not on the rd_clk edge that releases it) is popped later, no reset between;
   //   c5  a word goes through after a write-only reset of a running FIFO;
   //   c6  a word goes through after a read-only reset of a running FIFO;
-  //   c7  the FIFO fills and wr_ready returns, no reset input asserted in between: a pop has crossed back through
-  //       rgray_w1 / rgray_w2 (c1 does not need that).
+  //   c7  the FIFO fills and wr_ready returns, no reset input asserted in between (port level only: the full flag can
+  //       be seen while a pop is already in rgray_w1, so a first stage that stops after full still reaches this;
+  //       cover c8 in afifo.sv needs rgray_w1 and rgray_w2 to move after full).
   reg f_wr_up = 0;                               // c1: wr_ready seen high, no reset input asserted since
   always @($global_clock) f_wr_up <= arst_n && (f_wr_up || wr_ready);
   reg f_full = 0;                                // c7: c1 seen (full), no reset input asserted since
@@ -77,7 +78,7 @@ module afifo_formal #(
     f_arst_q <= arst_n; f_rdv_q <= rd_valid; f_occ_q <= occ; f_npush_q <= npush; f_npop_q <= npop;
   end
   reg [1:0] f_rdq = 0;                           // c4: rd_clk edges since both inputs went high, saturating at 2
-  always @(posedge rd_clk or negedge arst_n)     //     (rrst_n == (f_rdq == 2) holds in every step)
+  always @(posedge rd_clk or negedge arst_n)     //     (afifo.sv asserts rrst_n == (f_rsq == 2) for the same count inside the block)
     if (!arst_n) f_rdq <= 0; else if (f_rdq != 2'd2) f_rdq <= f_rdq + 1'b1;
   reg          f_early = 0;                      // c4: npush moved this step and the read domain is still in reset
   reg [CW-1:0] f_eidx = 0;                       //     after it; f_eidx is that word's push number

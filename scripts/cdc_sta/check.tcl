@@ -1,25 +1,42 @@
 # CDC constraint check for afifo on an ORFS ASAP7 post-synthesis netlist (OpenSTA in OpenROAD). One mode per run.
 # Environment: NETLIST, KIND (top: afifo_top harness with instance u_f and consumer register q; blk: afifo as top),
-#   DEPTH, CONS (the extracted header commands, extract.py), MODE, TMPD (scratch directory), CLR=1 for
-#   sta_preset_clear_arcs_enabled.
+#   DEPTH, WIDTH, CONS (the extracted header commands, extract.py), MODE, TMPD (scratch directory), CLR=1 for
+#   sta_preset_clear_arcs_enabled. params.tcl (extract.py, next to this file) holds the numbers of the header commands.
+#   post only: LIBS (the flow's liberty files: make print-LIB_FILES, CORNER from the platform config) and SETRC (the
+#   platform's setRC.tcl); the design is timed at the flow's corner with estimate_parasitics -placement.
 # MODE excl_none|excl_gray|excl_mem|excl_arst (top only): false-path the three categories the header names (Gray
 #   endpoints, mem startpoints, the arst_n net), leaving one out for the negative controls, and report the
 #   wr_clk <-> rd_clk endpoints that are left. excl_none must leave none; each control must bring back its category.
 # MODE text: the header commands as written; every crossing endpoint must be in the path-delay group for max and min.
-# MODE post (top only): the same checks on the ORFS result after floorplan and CTS (ODB, SDC: 4_cts.odb / 4_cts.sdc, the
-#   SDC as the flow wrote it back, propagated clocks), plus: no crossing endpoint violated, buffers on the synchronizer
-#   nets (EXPECT_HB 0: none; 1: some, for the controls), EXPECT_VIOL (0, or some for the clocks-only control), dont_touch flags in the database (EXPECT_DT nets|nets+inst|none).
-#   With POST_BASIC set (controls without the header SDC) only the last two are checked.
+#   Both modes also check the values: the max delays of the Gray endpoints (T_wr-U_g, T_rd-U_g) and of the mem paths
+#   (2*T_rd-U_m) as the report prints them, the min delays (0) and the library setup / hold term (or the block-level
+#   output delay) that makes up the required time.
+# MODE post (top only): the same checks on the ORFS result (ODB, SDC: <stage>.odb / <stage>.sdc, the SDC as the flow wrote
+#   it back, propagated clocks; 4_cts, and 5_1_grt / 5_route when the flow ran through routing), plus: no crossing
+#   endpoint violated (and every crossing endpoint reported), hold slack >= 0 at the D pins of the synchronizer second
+#   stages, buffers on the synchronizer nets (EXPECT_HB 0: none; 1: some, for the controls), EXPECT_VIOL (0, or some for
+#   the clocks-only control), dont_touch flags in the database (EXPECT_DT nets|nets+inst|none).
+#   With POST_BASIC set (controls without the header SDC) only the last four are checked.
 # Each check prints "RESULT <name> PASS|FAIL <detail>".
 set P $::env(FLOW_HOME)/platforms/asap7
 read_lef $P/lef/asap7_tech_1x_201209.lef
 read_lef $P/lef/asap7sc7p5t_28_R_1x_220121a.lef
-foreach l {SEQ_RVT_TT_nldm_220123.lib INVBUF_RVT_TT_nldm_220122.lib.gz AO_RVT_TT_nldm_211120.lib.gz
-           OA_RVT_TT_nldm_211120.lib.gz SIMPLE_RVT_TT_nldm_211120.lib.gz} { read_liberty $P/lib/NLDM/asap7sc7p5t_$l }
 set KIND $::env(KIND); set MODE $::env(MODE)
+if {$MODE eq "post"} {
+  # the flow's own corner and libraries (inner.sh takes them from the platform config), not a fixed list
+  if {![info exists ::env(LIBS)] || [llength $::env(LIBS)] == 0 || ![info exists ::env(SETRC)]} {
+    puts "RESULT post_env FAIL LIBS / SETRC not set"; exit
+  }
+  foreach l $::env(LIBS) { read_liberty $l }
+} else {
+  foreach l {SEQ_RVT_TT_nldm_220123.lib INVBUF_RVT_TT_nldm_220122.lib.gz AO_RVT_TT_nldm_211120.lib.gz
+             OA_RVT_TT_nldm_211120.lib.gz SIMPLE_RVT_TT_nldm_211120.lib.gz} { read_liberty $P/lib/NLDM/asap7sc7p5t_$l }
+}
 if {$MODE eq "post"} {
   read_db $::env(ODB)
   read_sdc $::env(SDC)
+  source $::env(SETRC)
+  estimate_parasitics -placement
 } else {
   read_verilog $::env(NETLIST)
   link_design [expr {$KIND eq "top" ? "afifo_top" : "afifo"}]
@@ -41,18 +58,32 @@ if {$MODE eq "post"} {
   set_input_delay 0 -clock rd_clk [get_ports {rd_rst_n rd_ready}]
 }
 
-set DEPTH $::env(DEPTH)
+set DEPTH $::env(DEPTH); set WIDTH $::env(WIDTH)
 source [file join [file dirname [info script]] sel.tcl]
+source [file join [file dirname [info script]] params.tcl]
 if {$KIND eq "top"} { set cons [FF {^q(\[|\$)}]; set ncons [llength $cons] } else { set ncons [llength [get_ports rd_data*]] }
-puts "SETS mode=$MODE clr=$::sta_preset_clear_arcs_enabled AW=$AW wg=[llength $wg] wg_r1=[llength $wg_r1] rg=[llength $rg] rg_w1=[llength $rg_w1] mem=[llength $mem] cons=$ncons sync=[llength $sync]"
+puts "SETS mode=$MODE clr=$::sta_preset_clear_arcs_enabled AW=$AW wg=[llength $wg] wg_r1=[llength $wg_r1] rg=[llength $rg] rg_w1=[llength $rg_w1] mem=[llength $mem] cons=$ncons sync=[llength $sync] S1=[llength $S1] S2=[llength $S2] syncn=[llength $SYNCN] syncff=[llength $SYNCFF]"
 
 proc result {name ok detail} { puts "RESULT $name [expr {$ok ? "PASS" : "FAIL"}] $detail" }
-# an empty selection makes OpenSTA drop the exception with only a warning (STA-0472), so check the sets first
+# An empty or short selection makes the exceptions and checks below vacuous (OpenSTA drops an exception on an empty
+# selection with only a warning, STA-0472; a check over an empty set passes), so every set has its expected size first,
+# as a function of AW (and WIDTH, DEPTH). Synchronizer pairs: AW+1 wgray bits, AW+1 rgray bits, wrst_n, rrst_n. The ASAP7
+# flops have a QN output only, so an inverter (or, in the ctsn control, a hold buffer) sits between the two stages of
+# every pair and the nets are two per pair: the first stage's output net and the second stage's D net. Gray source flops:
+# AW wgray (the MSB is merged into wbin[AW]) + wbin[AW], AW rgray + rbin[AW].
 set nap [expr {$ARST eq "" ? 0 : [llength [get_pins -of_objects $ARST]]}]
-if {$nap != 5 || [llength $WR1D] == 0 || [llength $RW1D] == 0 || [llength $mem] == 0 || [llength $sync] != 4 || $ncons == 0} {
-  result "sets_$MODE" 0 "arst_n pins $nap (expect 5), wgray_r1 D [llength $WR1D], rgray_w1 D [llength $RW1D], mem [llength $mem], sync [llength $sync], consumer $ncons"
-  exit
-}
+set npair [expr {2 * $AW + 4}]
+set want [list \
+  arst_pins $nap 5   wgray [llength $wg] $AW   rgray [llength $rg] $AW \
+  wgray_r1 [llength $wg_r1] [expr {$AW + 1}]   rgray_w1 [llength $rg_w1] [expr {$AW + 1}] \
+  WR1D [llength $WR1D] [expr {$AW + 1}]   RW1D [llength $RW1D] [expr {$AW + 1}] \
+  mem [llength $mem] [expr {$DEPTH * $WIDTH}]   consumer $ncons $WIDTH   sync [llength $sync] 4 \
+  S1 [llength $S1] $npair   S2 [llength $S2] $npair   SYNCN [llength $SYNCN] [expr {2 * $npair}] \
+  SYNCFF [llength $SYNCFF] [expr {2 * $npair + 2 * $AW + 2}]]
+set bad {}
+foreach {n got exp} $want { if {$got != $exp} { lappend bad "$n $got (expect $exp)" } }
+if {[llength $bad] > 0} { result "sets_$MODE" 0 "[join $bad {, }]"; exit }
+result "sets_$MODE" 1 "AW $AW: [expr {[llength $want] / 3}] set sizes as expected (S1 = S2 = $npair, syncn [llength $SYNCN], syncff [llength $SYNCFF])"
 
 # endpoints of a report, per path group: returns a dict group -> list of endpoint names (instance or port part)
 set ::K 0
@@ -66,6 +97,50 @@ proc groups {args} {
     if {$cur ne "" && [regexp {^(\S+) .*\((MET|VIOLATED)\)} $l -> ep]} { dict lappend d $cur [lindex [split $ep /] 0] }
   }
   return $d
+}
+# Full reports parsed into one record per path: {startpoint endpoint bound adjustments required}. bound is the number on the
+# max_delay / min_delay line (empty if the path has none: the exception is not applied), adjustments the (description
+# value) terms between that line and "data required time" (library setup / hold time, output external delay).
+proc fullpaths {args} {
+  set fn $::env(TMPD)/full_[pid]_[incr ::K].txt
+  report_checks {*}$args -group_path_count 100000 -endpoint_path_count 1 -format full -digits 1 > $fn
+  set f [open $fn]; set t [read $f]; close $f; file delete $fn
+  set out {}; set st ""; set en ""; set bound ""; set adj {}; set in 0
+  foreach l [split $t "\n"] {
+    if {[regexp {^Startpoint: (\S+)} $l -> x]} { set st $x; set en ""; set bound ""; set adj {}; set in 0; continue }
+    if {[regexp {^Endpoint: (\S+)} $l -> x]} { set en $x; continue }
+    if {[regexp {^\s*(-?[0-9.]+)\s+(-?[0-9.]+)\s+(max|min)_delay\s*$} $l -> d c k]} { set bound $d; set in 1; continue }
+    if {[regexp {^\s*(-?[0-9.]+)\s+data required time} $l -> r] && $st ne ""} {
+      lappend out [list $st $en $bound $adj $r]; set st ""; set in 0; continue
+    }
+    if {$in && [regexp {^\s*(-?[0-9.]+)\s+(-?[0-9.]+)\s+(\S.*\S)\s*$} $l -> d c desc]} { lappend adj [list $desc $d] }
+  }
+  return $out
+}
+# The delay values: every path of a class must carry the bound the header gives, and nothing else in its required time but
+# the capture flop's library setup / hold (or, at block level, the output delay). cls: gray_wr, gray_rd, cons.
+proc check_values {pfx recs cls n exp dly} {
+  set bad 0; set seen {}
+  foreach r $recs {
+    lassign $r st en bound adj req
+    set want [list "library [expr {$dly eq "max" ? "setup" : "hold"}] time"]
+    set tot 0.0
+    if {$cls eq "cons" && $::KIND eq "blk"} {
+      set want [list "output external delay"]
+      set ev [expr {$dly eq "max" ? -$::SHARE : -$::CMIN}]
+    }
+    set okb [expr {$bound ne "" && abs($bound - $exp) < 0.05}]
+    set oka [expr {[llength $adj] == 1 && [lindex $adj 0 0] eq [lindex $want 0]}]
+    if {$oka} {
+      set d [lindex $adj 0 1]; set tot $d
+      if {[info exists ev] && abs($d - $ev) > 0.05} { set oka 0 }
+    }
+    set okr [expr {$bound ne "" && $oka && abs($req - ($bound + $tot)) < 0.15}]
+    if {!($okb && $oka && $okr)} { incr bad }
+    lappend seen "$bound/[join [lmap a $adj {lindex $a 1}] +]"
+  }
+  set vals [lsort -unique $seen]
+  result ${pfx}_val_${cls}_$dly [expr {[llength $recs] == $n && $bad == 0}] "[llength $recs] paths (expect $n), bound/adjustment {[lrange $vals 0 3]} (expect $exp / [expr {$cls eq "cons" && $::KIND eq "blk" ? "output delay" : "library term"}]), $bad off"
 }
 proc all_eps {d} { set o {}; dict for {g l} $d { lappend o {*}$l }; return $o }
 proc count_re {l re} { set n 0; foreach e $l { if {[regexp $re $e]} { incr n } }; return $n }
@@ -108,6 +183,17 @@ foreach dly {max min} {
   set n [expr {[dict exists $d $kind] ? [llength [dict get $d $kind]] : 0}]
   result "${PFX}_rd_wr_$dly" [expr {[dict size $d] == 1 && $n == [llength $RW1D]}] "groups {[dict keys $d]}, path delay $n (expect [llength $RW1D] rgray_w1)"
 }
+foreach dly {max min} {
+  set bg [expr {$dly eq "max" ? $TWR - $UG : 0}]; set br [expr {$dly eq "max" ? $TRD - $UG : 0}]
+  set bm [expr {$dly eq "max" ? 2 * $TRD - $UM : 0}]
+  set wr [fullpaths -from [get_clocks wr_clk] -to [get_clocks rd_clk] -path_delay $dly]
+  set rw [fullpaths -from [get_clocks rd_clk] -to [get_clocks wr_clk] -path_delay $dly]
+  set g {}; set m {}
+  foreach r $wr { if {[regexp {wgray_r1\[} [lindex $r 1]]} { lappend g $r } else { lappend m $r } }
+  check_values $PFX $g gray_wr [llength $WR1D] $bg $dly
+  check_values $PFX $rw gray_rd [llength $RW1D] $br $dly
+  check_values $PFX $m cons $ncons $bm $dly
+}
 set n 0; foreach c $sync { incr n [llength [all_eps [groups -to [PinsNamed $c RESETN] -path_delay min_max]]] }
 result ${PFX}_sync_recovery [expr {[llength $sync] == 4 && $n == 0}] "$n recovery/removal checks left at the 4 synchronizer flops (expect 0)"
 set n [llength [all_eps [groups -from [FF "^${HS}wrst_n\\\$"] -to [PinsNamed $wbin RESETN] -path_delay min_max]]]
@@ -126,21 +212,35 @@ if {$KIND eq "blk"} {
 }
 if {$MODE eq "post"} {
   # crossing endpoints violated, max and min, with the clock propagated (EXPECT_VIOL 0: none; some: the related-clock
-  # setup violations of the clocks-only control, max only)
+  # setup violations of the clocks-only control, max only). An empty report is no pass: every crossing endpoint has to
+  # be in it (WR1D + consumer for wr -> rd, RW1D for rd -> wr; the clocks-only control only has to have some).
   foreach dly {max min} {
-    set n 0
+    set n 0; set tot 0
     foreach {a b} {wr_clk rd_clk rd_clk wr_clk} {
       set fn $::env(TMPD)/vio_[pid].txt
       report_checks -from [get_clocks $a] -to [get_clocks $b] -path_delay $dly -group_path_count 100000 -endpoint_path_count 1 -format end > $fn
       set f [open $fn]; set t [read $f]; close $f; file delete $fn
-      incr n [regexp -all {VIOLATED} $t]
+      incr n [regexp -all {\(VIOLATED\)} $t]; incr tot [regexp -all {\((MET|VIOLATED)\)} $t]
     }
+    set expn [expr {[llength $WR1D] + $ncons + [llength $RW1D]}]
     if {$::env(EXPECT_VIOL) eq "some"} {
-      if {$dly eq "max"} { result post_viol_max [expr {$n > 0}] "$n violated crossing endpoints (expect some: clocks-only SDC, related-clock paths)" }
+      if {$dly eq "max"} { result post_viol_max [expr {$n > 0 && $tot > 0}] "$n of $tot reported crossing endpoints violated (expect some: clocks-only SDC, related-clock paths)" }
     } else {
-      result post_viol_$dly [expr {$n == 0}] "$n violated crossing endpoints (expect 0)"
+      result post_viol_$dly [expr {$n == 0 && $tot == $expn}] "$n of $tot reported crossing endpoints violated (expect 0 of $expn)"
     }
   }
+  # hold slack at the D pins of the synchronizer second stages (wgray_r2, rgray_w2, wrst_n, rrst_n), at the flow's corner
+  # with placement parasitics. Their nets are dont_touch, so repair_timing cannot fix a hold violation there; this is the
+  # only place it shows. The flow's hold margin (HOLD_SLACK_MARGIN) is not required, only slack >= 0.
+  set mn 1e9; set worst ""; set np 0
+  foreach c $S2 {
+    foreach path [find_timing_paths -to [PinsNamed $c D] -path_delay min] {
+      incr np
+      set sl [get_property $path slack]
+      if {$sl < $mn} { set mn $sl; set worst [get_full_name $c] }
+    }
+  }
+  result post_s2_hold [expr {$np == [llength $S2] && $mn >= 0}] "worst hold slack [format %.1f $mn] ps at $worst over $np of [llength $S2] second-stage D pins (expect all, >= 0)"
   # buffers on the synchronizer-internal nets
   set nb 0; set nets 0
   foreach n $SYNCN {

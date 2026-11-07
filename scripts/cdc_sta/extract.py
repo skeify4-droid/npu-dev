@@ -10,6 +10,7 @@ periods by numbers. Output:
   cons_top.tcl  the timing commands plus the top-level mem form (afifo inside a design)
   cons_blk.tcl  the timing commands plus the block-level mem form (afifo as top)
   cons_dt_net.tcl, cons_dt_inst.tcl  the set_dont_touch commands on nets (floorplan on) and on instances (after CTS)
+  params.tcl    the numbers substituted above (TWR TRD UG UM SHARE CMIN), for the value checks in check.tcl
 Fails if a placeholder is left over or a form is missing, so a change to the header's form shows up here.
 """
 import argparse
@@ -52,9 +53,18 @@ for name, l in (('common', com), ('top-level mem', top), ('block-level mem', blk
         sys.exit(f'extract: no {name} commands found in {a.src}')
 if not any('$WR1D' in c for c in com) or not any('$ARST' in c for c in com):
     sys.exit('extract: Gray endpoint or arst_n command missing')
+# gen.py applies the net dont_touch from floorplan (PRE_FLOORPLAN_TCL) and the instance dont_touch only after CTS
+# (POST_CTS_TCL) and the checks assume it, so the header prose has to say the same
+prose = re.sub(r'\s+', ' ', ' '.join(re.sub(r'^//', '', l) for l in open(a.src) if l.startswith('//')))
+for pat, what in ((r'only after CTS \(POST_CTS_TCL', 'instance dont_touch only after CTS (POST_CTS_TCL)'),
+                  (r'as PRE_FLOORPLAN_TCL', 'net dont_touch as PRE_FLOORPLAN_TCL')):
+    if not re.search(pat, prose):
+        sys.exit(f'extract: the header no longer says "{what}", which gen.py and the checks assume')
 open(f'{a.outdir}/cons_top.tcl', 'w').write('\n'.join(com + top) + '\n')
 open(f'{a.outdir}/cons_blk.tcl', 'w').write('\n'.join(com + blk) + '\n')
 open(f'{a.outdir}/cons_dt_net.tcl', 'w').write('\n'.join(dtn) + '\n')
 open(f'{a.outdir}/cons_dt_inst.tcl', 'w').write('\n'.join(dti) + '\n')
+open(f'{a.outdir}/params.tcl', 'w').write(
+    f'set TWR {a.twr}\nset TRD {a.trd}\nset UG {a.ug}\nset UM {a.um}\nset SHARE {a.share}\nset CMIN {a.cmin}\n')
 print(f'extract: {len(cmds)} commands (common {len(com)}, top {len(top)}, block {len(blk)}, dont_touch {len(dtn)} net '
       f'+ {len(dti)} instance); T_wr {a.twr} T_rd {a.trd} U_g {a.ug} U_m {a.um} share {a.share} cmin {a.cmin}')

@@ -301,6 +301,40 @@ module afifo #(
     assert (!rd_valid || f_dc > 0);
   end
 
+  // Reset synchronizers: a domain leaves reset on the second of its own clock edges after both inputs are high. Counters of
+  // those edges (saturating at 2, cleared while either input is low) give the exact release instant, so a one-stage
+  // synchronizer (the domain released on the first edge) fails here and nowhere else. The first-stage flop is part of the
+  // invariant (it is 1 from the first edge on), which makes it inductive. Inside the module because a hierarchical
+  // reference from the wrapper (dut.x) is an undriven wire in this Yosys.
+  reg [1:0] f_wsq = 0, f_rsq = 0;
+  always @(posedge wr_clk or negedge arst_n)
+    if (!arst_n) f_wsq <= 0; else if (f_wsq != 2'd2) f_wsq <= f_wsq + 1'b1;
+  always @(posedge rd_clk or negedge arst_n)
+    if (!arst_n) f_rsq <= 0; else if (f_rsq != 2'd2) f_rsq <= f_rsq + 1'b1;
+  always @(*) begin
+    assert (f_wsq <= 2'd2);
+    assert (f_rsq <= 2'd2);
+    assert (wr_rs0 == (f_wsq != 0));
+    assert (rd_rs0 == (f_rsq != 0));
+    assert (wrst_n == (f_wsq == 2'd2));
+    assert (rrst_n == (f_rsq == 2'd2));
+  end
+
+  // Non-vacuity of the read -> write pointer path (cover c8; the wrapper's c7 only sees the ports). The FIFO fills (wr_ready
+  // low after having been high), then rgray_w1 and rgray_w2 each change at least once, then wr_ready is high again, no reset
+  // input asserted in between. A first stage that stops after full leaves rgray_w1 constant, a second stage that stops
+  // leaves rgray_w2 constant, so neither can reach it.
+  reg f_cup = 0, f_cfull = 0, f_cm1 = 0, f_cm2 = 0;
+  reg [AW:0] f_cp1 = 0, f_cp2 = 0;
+  always @($global_clock) begin
+    f_cp1 <= rgray_w1; f_cp2 <= rgray_w2;
+    f_cup   <= arst_n && (f_cup || wr_ready);
+    f_cfull <= arst_n && (f_cfull || (f_cup && !wr_ready));
+    f_cm1   <= arst_n && f_cfull && (f_cm1 || rgray_w1 != f_cp1);
+    f_cm2   <= arst_n && f_cfull && (f_cm2 || rgray_w2 != f_cp2);
+  end
+  always @(*) cover (f_cfull && f_cm1 && f_cm2 && wr_ready && arst_n);       // c8
+
   // One tagged entry (a free, constant pointer value): the data pushed at that pointer is the data popped at it.
   (* anyconst *) reg [AW:0] f_tag;
   reg [WIDTH-1:0] f_tdata;
