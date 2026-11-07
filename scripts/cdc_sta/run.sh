@@ -4,7 +4,8 @@
 #   - excl_*: every wr_clk <-> rd_clk path ends at a wgray_r1 / rgray_w1 D pin, starts at a mem register, or runs
 #     through arst_n (false-path the three, nothing may cross; leave one out, its category must come back);
 #   - text: with the header commands as written, every crossing endpoint is in the path-delay group (max and min),
-#     recovery / removal is gone at the reset synchronizers and kept at wrst_n -> wbin, rbin -> consumer is an
+#     recovery / removal is gone at the reset synchronizers and kept (exact pin counts) from wrst_n to {wbin, wgray,
+#     rgray_w1, rgray_w2} and from rrst_n to {rbin, rgray, wgray_r1, wgray_r2}, rbin -> consumer is an
 #     ordinary rd_clk path, and the Gray MSB is merged as the header says.
 # Each check runs with sta_preset_clear_arcs_enabled 0 and 1. Results: build/cdc_sta/summary.txt.
 # Every run first checks the sizes of the selections (sets_*: AW+1 Gray bits, four reset-synchronizer flops, 2 nets per
@@ -14,8 +15,9 @@
 #   its set_dont_touch commands in PRE_FLOORPLAN_TCL / POST_CTS_TCL (gen.py): the header's checks again on 4_cts.odb /
 #   4_cts.sdc, no repair_timing run on the crossing endpoints (two "RSZ-0098 No setup violations" in the logs), no
 #   buffers on the synchronizer nets, dont_touch flags in the database, and hold slack >= 0 at the D pins of the
-#   synchronizer second stages (post_s2_hold), timed at the flow's own corner (BC / FF libraries from the platform config)
-#   with placement parasitics. The cts configuration runs on through global and detail route and the same checks run on
+#   synchronizer second stages (post_s2_hold, every pin printed), timed at the flow's own corner (BC / FF libraries from the
+#   platform config) with the parasitics of the stage: placement estimate (4_cts), global-route estimate (5_1_grt), RCX
+#   extraction read back from a SPEF (5_route). The cts configuration runs on through global and detail route and the same checks run on
 #   5_1_grt and 5_route. Controls: ctsc (SDC with the two clocks only: floorplan / CTS repair the 12 false violations),
 #   ctsn (no dont_touch: hold buffers on the synchronizer nets), ctsi (instance dont_touch from floorplan: CTS-0137).
 # Not covered: kept hierarchy, steps after route (see docs/reports/status.md, Phase 3).

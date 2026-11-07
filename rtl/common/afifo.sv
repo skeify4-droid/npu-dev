@@ -23,7 +23,9 @@
 //   - Storage is not reset. rd_data is undefined while rd_valid is 0.
 //   - rd_data integration rule. rd_data is the array read combinationally at the read pointer, and while rd_valid is 0
 //     it changes asynchronously to rd_clk (the entry the pointer is on can be written at any time in wr_clk). A consumer
-//     must capture it only on an edge where rd_valid is 1 (a load enable or a mux on rd_valid). A free-running capture
+//     must capture it only on an edge where rd_valid is 1, using the rd_valid of that same edge (a load enable or a mux
+//     on rd_valid), not a registered copy of it: an enable from the registered rd_valid captured entries within 8 ps of
+//     their write in the review simulation (1465 of 196735 captures below the budget). A free-running capture
 //     register samples it at edges where it is moving and can go metastable, and then the 2*T_rd-U_m budget below means
 //     nothing: that budget assumes the word is stable when used, which holds only for a word that rd_valid announced.
 //   - Reset-domain rule. A one-sided reset is a reset-domain crossing. Asserting either input clears both domains'
@@ -58,22 +60,24 @@
 // SDC_FILE: floorplan and CTS run repair_timing from it) as well as in signoff STA. With an SDC holding only the two
 // clocks, ORFS spent floorplan and CTS repair_timing on 12 of the 16 wr_clk <-> rd_clk crossing endpoints of a WIDTH 8
 // DEPTH 8 build (4 wgray_r1 + 8 consumer + 4 rgray_w1), as related-clock paths (667 / 833 ps: edges 1 ps apart; worst
-// rgray_w1[3]/D, WNS -59 to -67 ps), none of them a real violation. The 12 are the 8 consumer and the 4 rgray_w1 at the
-// flow's FF corner; the 4 wgray_r1 fail only at TT. Command options and behaviour are checked against the OpenSTA in the
+// rgray_w1[3]/D, WNS -59 to -67 ps), none of them a real violation. With sta_preset_clear_arcs_enabled 0 the 12 are the 8
+// consumer and the 4 rgray_w1 at the flow's FF corner, and the 4 wgray_r1 fail only at TT; with it 1 (clear arcs on) all 16
+// violate at FF (make cdc-sta, control w8d8ctsc: 12 of 16, 16 of 16). Command options and behaviour are checked against the OpenSTA in the
 // pinned OpenROAD (18f08d7) on ASAP7 netlists of this block from ORFS synthesis, and for one configuration after
 // floorplan, CTS and global and detail route (make cdc-sta); nothing here is checked by simulation, lint or formal.
 // T_wr / T_rd are the clock periods.
 // -ignore_clock_latency ignores set_clock_uncertainty and the capture clock's latency (the required time does not move
 // with either), but not the launch clock's source latency: with ideal clocks the launch source latency is counted in the
-// arrival (set_clock_latency -source 150 on wr_clk moved the wr_clk -> wgray_r1 max slack from 527 to 377 ps and the min
-// slack from 71 to 221 ps; the same on rd_clk, the capture clock there, moved nothing), and with propagated clocks it is
-// ignored (the same setting changed nothing). Consequence: in pre-CTS repair_timing and in any ideal-clock STA, a
+// arrival (set_clock_latency -source 150 on wr_clk moved the slack at wgray_r1[3]/D, one endpoint, from 527 to 377 ps max and
+// from 71 to 221 ps min; the worst bit of the four went 527.1 -> 377.1 max and 60.0 -> 210.0 min; the same on rd_clk, the
+// capture clock there, moved nothing), and with propagated clocks it is ignored (the same setting changed nothing). Consequence: in pre-CTS repair_timing and in any ideal-clock STA, a
 // source latency L on a launch clock makes the max slack of its crossings L worse and the min slack L better, i.e. the
 // hold side looks safer than it is and setup is repaired against an L that is not there after CTS: the same SDC gives
 // different numbers before and after. So leave set_clock_latency -source off wr_clk and rd_clk in the SDC the flow reads
 // (create_clock only); if a shared SDC must carry one, do not read the crossings' min slack, nor trust their max slack,
 // from an ideal-clock run, and sign off with propagated clocks. Launch-clock network latency (set_clock_latency without
-// -source) was not measured. What the exceptions leave for jitter and skew is written into the numbers by hand: U_g and
+// -source, 150 ps on wr_clk, rd_clk and both) was measured too: ignored with ideal and with propagated clocks, no slack
+// changed, on the synthesis netlist and after CTS. What the exceptions leave for jitter and skew is written into the numbers by hand: U_g and
 // U_m below, one per item. Every wr_clk <-> rd_clk path of this block ends at a wgray_r1 / rgray_w1 D pin, starts at a
 // mem register, or runs through the arst_n net; the three items below cover these by endpoint, by startpoint and by net.
 //   - Never set_clock_groups (-asynchronous, -logically_exclusive or -physically_exclusive; the -exclusive of other tools
@@ -186,16 +190,22 @@
 //     works too but gives nothing the net form does not.
 //     Consequence of the net dont_touch: repair_timing cannot buffer or resize on the stage-2 D nets, so a hold
 //     violation at a stage-2 D pin (wgray_r2, rgray_w2, wrst_n, rrst_n) is not repaired. The 10 stage-2 D pins of the
-//     WIDTH 8 DEPTH 8 build sit at +28 to +31 ps hold slack at the flow's FF corner (inside the 40 ps hold margin, so
+//     WIDTH 8 DEPTH 8 build sit at +29.8 to +34.2 ps hold slack at the flow's FF corner (inside the 40 ps hold margin, so
 //     repair_timing reports RSZ-0064 "Unable to repair all hold checks within margin" at CTS and global route and
-//     leaves them), so there is room, but a real hold violation there would stay. make cdc-sta checks it (post_s2_hold:
-//     hold slack >= 0 at every stage-2 D pin after CTS, global route and detail route; 30.2 ps worst in the run).
+//     leaves them), so there is room, but a real hold violation there would stay. The number depends on the parasitics of
+//     the stage: worst 30.6 ps after CTS (placement estimate), 29.8 ps after global route (estimate_parasitics
+//     -global_routing), 30.9 ps after detail route (RCX extraction of the routed wires, as the flow's final report does).
+//     make cdc-sta checks it (post_s2_hold: hold slack >= 0 at every stage-2 D pin at those three stages, every pin
+//     printed).
 //
 // Latency and throughput: a word pushed at a wr_clk edge shows on rd_valid two rd_clk edges after the edge that
 // registers the write pointer into the read domain's synchronizer; a freed entry reaches wr_ready two wr_clk edges
-// after the read pointer moves. The credit round trip limits throughput by DEPTH. Measured with both clocks equal and
-// both sides always ready: DEPTH 2 gives 1/3 word per cycle, DEPTH 4 gives 2/3, DEPTH 8 (the default) gives 1 (997 of
-// 1000 cycles). Size DEPTH for the slower clock's round trip of about 6 cycles.
+// after the read pointer moves. Formal (tasks l2, l4, DEPTH 2 and 4, abc pdr) proves
+// both as lower bounds: never earlier. The credit round trip limits throughput by DEPTH, and the figure depends on the phase
+// between the clocks. Measured (tb_afifo, afifo_thr) with both clocks equal and both sides always ready, pops per rd_clk
+// edge over 1000 edges: at zero phase (edges coincide) DEPTH 2 gives 1/3 word per cycle and DEPTH 4 gives 2/3; with the
+// read clock 250 ps (a quarter period) after the write clock DEPTH 2 gives 0.4 and DEPTH 4 gives 0.8; DEPTH 8 (the
+// default) gives 1 at both. Size DEPTH for the slower clock's round trip of about 6 cycles.
 module afifo #(
   parameter int WIDTH = 8,
   parameter int DEPTH = 8
@@ -382,5 +392,61 @@ module afifo #(
     if (f_tin && !f_twr) assert (mem[f_tag[AW-1:0]] == f_tdata);
     if (rd_valid && rbin == f_tag) assert (rd_data == f_tdata);
   end
+
+  // Latency (header, "Latency and throughput"). Not k-inductive with yices, so behind FORMAL_LAT and proved with abc pdr
+  // (tasks l2, l4); d2 / d4 / d8 do not define it. The tagged entry again.
+  //   L1  the entry is announced (rd_valid with rbin == f_tag) no earlier than the 2nd rd_clk edge after the wr_clk edge
+  //       that pushed it. A token toggles in wr_clk at that push; a counter in rd_clk restarts at 1 on the first rd_clk
+  //       edge that sees the new token (that edge registers the write pointer into wgray_r1) and counts to 3.
+  //   L2  the same for the entry freed by popping f_tag, offered to the writer (wr_ready with wbin == f_tag + DEPTH): not
+  //       before the 2nd wr_clk edge after the rd_clk edge that popped it. f_pe: f_tag popped since the last reset input
+  //       assertion (before that, wbin == f_tag + DEPTH is a pointer value the writer has not been refused).
+`ifdef FORMAL_LAT
+  reg f_tw = 0, f_sw = 0, f_tr = 0, f_sr = 0;
+  reg [1:0] f_lr = 0, f_lw = 0;
+  reg f_pe = 0;
+  always @(posedge wr_clk or negedge arst_n)
+    if (!arst_n) f_tw <= 0; else if (wrst_n && push && wbin == f_tag) f_tw <= !f_tw;
+  always @(posedge rd_clk or negedge arst_n)
+    if (!arst_n) begin f_sw <= 0; f_lr <= 0; end
+    else if (f_sw != f_tw) begin f_sw <= f_tw; f_lr <= 1; end
+    else if (f_lr != 0 && f_lr != 3) f_lr <= f_lr + 1'b1;
+  always @(posedge rd_clk or negedge arst_n)
+    if (!arst_n) begin f_tr <= 0; f_pe <= 0; end
+    else if (rrst_n && pop && rbin == f_tag) begin f_tr <= !f_tr; f_pe <= 1; end
+  always @(posedge wr_clk or negedge arst_n)
+    if (!arst_n) begin f_sr <= 0; f_lw <= 0; end
+    else if (f_sr != f_tr) begin f_sr <= f_tr; f_lw <= 1; end
+    else if (f_lw != 0 && f_lw != 3) f_lw <= f_lw + 1'b1;
+  always @(*) begin
+    if (rd_valid && rbin == f_tag) assert (f_sw == f_tw && f_lr >= 2);                         // L1
+    if (f_pe && wr_ready && wbin == f_tag + DEPTH[AW:0]) assert (f_sr == f_tr && f_lw >= 2);    // L2
+  end
+`endif
+
+  // Non-vacuity of the read-side mirror (cover c9, of c8) and of a second fill (c10). c9: the FIFO drains (rd_valid low
+  // after having been high, the read domain out of reset), then wgray_r1 and wgray_r2 each change at least once, then
+  // rd_valid is high again, no reset input asserted in between. A first stage that stops after the first drain leaves
+  // wgray_r1 constant, a second stage that stops leaves wgray_r2 constant. c10: the FIFO fills and wr_ready returns, fills
+  // again and wr_ready returns again, no reset input asserted in between (the full / not-full flag works more than once).
+  reg f_dv = 0, f_de = 0, f_dm1 = 0, f_dm2 = 0;
+  reg [AW:0] f_dp1 = 0, f_dp2 = 0;
+  always @($global_clock) begin
+    f_dp1 <= wgray_r1; f_dp2 <= wgray_r2;
+    f_dv  <= arst_n && (f_dv || rd_valid);
+    f_de  <= arst_n && (f_de || (f_dv && !rd_valid && rrst_n));
+    f_dm1 <= arst_n && f_de && (f_dm1 || wgray_r1 != f_dp1);
+    f_dm2 <= arst_n && f_de && (f_dm2 || wgray_r2 != f_dp2);
+  end
+  always @(*) cover (f_de && f_dm1 && f_dm2 && rd_valid && arst_n);       // c9
+  reg [2:0] f_ff = 0;
+  always @($global_clock)
+    if (!arst_n) f_ff <= 0;
+    else case (f_ff)
+      3'd0, 3'd2, 3'd4: if (wr_ready)  f_ff <= f_ff + 1'b1;
+      3'd1, 3'd3:       if (!wr_ready) f_ff <= f_ff + 1'b1;
+      default: ;
+    endcase
+  always @(*) cover (f_ff == 3'd5 && arst_n);                             // c10
 `endif
 endmodule

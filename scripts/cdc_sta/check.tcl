@@ -3,7 +3,9 @@
 #   DEPTH, WIDTH, CONS (the extracted header commands, extract.py), MODE, TMPD (scratch directory), CLR=1 for
 #   sta_preset_clear_arcs_enabled. params.tcl (extract.py, next to this file) holds the numbers of the header commands.
 #   post only: LIBS (the flow's liberty files: make print-LIB_FILES, CORNER from the platform config) and SETRC (the
-#   platform's setRC.tcl); the design is timed at the flow's corner with estimate_parasitics -placement.
+#   platform's setRC.tcl), STAGE (4_cts, 5_1_grt, 5_route), RCX (the platform's RCX_RULES, 5_route); the design is timed at
+#   the flow's corner with the parasitics of the stage: estimate_parasitics -placement (4_cts), -global_routing (5_1_grt),
+#   RCX extraction read back from a SPEF (5_route).
 # MODE excl_none|excl_gray|excl_mem|excl_arst (top only): false-path the three categories the header names (Gray
 #   endpoints, mem startpoints, the arst_n net), leaving one out for the negative controls, and report the
 #   wr_clk <-> rd_clk endpoints that are left. excl_none must leave none; each control must bring back its category.
@@ -36,7 +38,24 @@ if {$MODE eq "post"} {
   read_db $::env(ODB)
   read_sdc $::env(SDC)
   source $::env(SETRC)
-  estimate_parasitics -placement
+  # parasitics as the flow has them at that stage: placement estimate after CTS (the flow's cts.tcl), the global-route
+  # estimate after global route (global_route.tcl), RCX extraction of the routed wires after detail route (final_outputs.tcl:
+  # define_process_corner, set_extraction_rules_file $RCX_RULES, extract_parasitics, write_spef, read_spef)
+  switch $::env(STAGE) {
+    4_cts    { estimate_parasitics -placement; set PARA placement }
+    5_1_grt  { estimate_parasitics -global_routing; set PARA global_routing }
+    5_route  {
+      if {![info exists ::env(RCX)]} { puts "RESULT post_env FAIL RCX not set"; exit }
+      define_process_corner -ext_model_index 0 X
+      set_extraction_rules_file $::env(RCX)
+      extract_parasitics
+      write_spef $::env(TMPD)/post_[pid].spef
+      read_spef $::env(TMPD)/post_[pid].spef
+      file delete $::env(TMPD)/post_[pid].spef
+      set PARA rcx
+    }
+    default  { puts "RESULT post_env FAIL unknown STAGE $::env(STAGE)"; exit }
+  }
 } else {
   read_verilog $::env(NETLIST)
   link_design [expr {$KIND eq "top" ? "afifo_top" : "afifo"}]
@@ -196,8 +215,23 @@ foreach dly {max min} {
 }
 set n 0; foreach c $sync { incr n [llength [all_eps [groups -to [PinsNamed $c RESETN] -path_delay min_max]]] }
 result ${PFX}_sync_recovery [expr {[llength $sync] == 4 && $n == 0}] "$n recovery/removal checks left at the 4 synchronizer flops (expect 0)"
-set n [llength [all_eps [groups -from [FF "^${HS}wrst_n\\\$"] -to [PinsNamed $wbin RESETN] -path_delay min_max]]]
-result ${PFX}_wrst_wbin [expr {$n > 0}] "wrst_n -> wbin RESETN checks $n (expect > 0: same-clock recovery/removal kept)"
+# Same-clock recovery / removal from each domain reset to every pointer set the header says stays timed: wrst_n to
+# {wbin, wgray, rgray_w1, rgray_w2}, rrst_n to {rbin, rgray, wgray_r1, wgray_r2}. One result per set; every RESETN pin of the
+# set needs its recovery check (max) and its removal check (min), an exact count (a false path on part of a set, or on
+# the whole set, takes pins away), and all of them in the asynchronous path group.
+foreach {src sname sset nexp} [list \
+    wrst_n wbin $wbin [expr {$AW + 1}]   wrst_n wgray $wg $AW   wrst_n rgray_w1 $rg_w1 [expr {$AW + 1}]   wrst_n rgray_w2 $rg_w2 [expr {$AW + 1}] \
+    rrst_n rbin $rbin [expr {$AW + 1}]   rrst_n rgray $rg $AW   rrst_n wgray_r1 $wg_r1 [expr {$AW + 1}]   rrst_n wgray_r2 $wg_r2 [expr {$AW + 1}]] {
+  set pins [PinsNamed $sset RESETN]; set from [FF "^${HS}${src}\\\$"]
+  set cnt {}; set okg 1
+  foreach dly {max min} {
+    set d [groups -from $from -to $pins -path_delay $dly]
+    lappend cnt [llength [all_eps $d]]
+    foreach k [dict keys $d] { if {![string match *:asynchronous $k]} { set okg 0 } }
+  }
+  result ${PFX}_rst_${src}_${sname} [expr {[llength $from] == 1 && [llength $pins] == $nexp && $cnt eq [list $nexp $nexp] && $okg}] \
+    "$src -> $sname RESETN: [llength $pins] pins (expect $nexp), recovery / removal checks [lindex $cnt 0] / [lindex $cnt 1] (expect $nexp / $nexp), asynchronous group only: $okg"
+}
 set to [expr {$KIND eq "top" ? $cons : [get_ports rd_data*]}]
 set d [groups -from $rbin -to $to -path_delay max]
 result ${PFX}_rbin_cons [expr {[dict keys $d] eq "max_delay/setup:rd_clk"}] "rbin -> consumer groups {[dict keys $d]} (expect an ordinary rd_clk path)"
@@ -230,17 +264,18 @@ if {$MODE eq "post"} {
     }
   }
   # hold slack at the D pins of the synchronizer second stages (wgray_r2, rgray_w2, wrst_n, rrst_n), at the flow's corner
-  # with placement parasitics. Their nets are dont_touch, so repair_timing cannot fix a hold violation there; this is the
+  # with the stage's parasitics. Their nets are dont_touch, so repair_timing cannot fix a hold violation there; this is the
   # only place it shows. The flow's hold margin (HOLD_SLACK_MARGIN) is not required, only slack >= 0.
-  set mn 1e9; set worst ""; set np 0
+  set mn 1e9; set worst ""; set np 0; set all {}
   foreach c $S2 {
     foreach path [find_timing_paths -to [PinsNamed $c D] -path_delay min] {
       incr np
       set sl [get_property $path slack]
       if {$sl < $mn} { set mn $sl; set worst [get_full_name $c] }
+      lappend all "[regsub {\$_DFF.*} [regsub {^u_f\.} [get_full_name $c] {}] {}]=[format %.1f $sl]"
     }
   }
-  result post_s2_hold [expr {$np == [llength $S2] && $mn >= 0}] "worst hold slack [format %.1f $mn] ps at $worst over $np of [llength $S2] second-stage D pins (expect all, >= 0)"
+  result post_s2_hold [expr {$np == [llength $S2] && $mn >= 0}] "$PARA parasitics: worst hold slack [format %.1f $mn] ps at $worst over $np of [llength $S2] second-stage D pins (expect all, >= 0); every pin: [join $all { }]"
   # buffers on the synchronizer-internal nets
   set nb 0; set nets 0
   foreach n $SYNCN {

@@ -30,7 +30,7 @@ for cfg in "$@"; do
     "${ORFS[@]}" $tgt > "$B/$name.flow.log" 2>&1; frc=$?
     # the corner and parasitics the flow used, from the platform config (make print-VAR)
     pv() { make -C "$FLOW_HOME" DESIGN_CONFIG="$B/$name.mk" "print-$1" 2>/dev/null | sed -n "s/^$1: //p"; }
-    LIBS=$(pv LIB_FILES); SETRC=$(pv PLATFORM_DIR)/setRC.tcl; export LIBS SETRC
+    LIBS=$(pv LIB_FILES); SETRC=$(pv PLATFORM_DIR)/setRC.tcl; RCX=$(pv RCX_RULES); export LIBS SETRC RCX
     res=$B/work_$name/results/asap7/cdc_$name/base; lg=$B/work_$name/logs/asap7/cdc_$name/base
     rep() { echo "RESULT $name/$1 $2 $3" | tee -a "$B/summary.txt"; }
     # flow-level checks, per variant
@@ -63,7 +63,7 @@ for cfg in "$@"; do
           if [ ! -f "$res/$stage.odb" ] || [ ! -f "$res/$stage.sdc" ]; then
             echo "RESULT post FAIL no $stage.odb / $stage.sdc in $res" > "$log"
           else
-            ODB=$res/$stage.odb SDC=$res/$stage.sdc KIND=top DEPTH=$d WIDTH=$w MODE=post TMPD=$B/tmp EXPECT_HB=$eh EXPECT_DT=$ed EXPECT_VIOL=$ev \
+            ODB=$res/$stage.odb SDC=$res/$stage.sdc STAGE=$stage KIND=top DEPTH=$d WIDTH=$w MODE=post TMPD=$B/tmp EXPECT_HB=$eh EXPECT_DT=$ed EXPECT_VIOL=$ev \
               "$EDA/openroad/bin/openroad" -no_init -no_splash -exit "$D/check.tcl" > "$log" 2>&1
           fi
           grep -q '^RESULT ' "$log" || echo "RESULT post FAIL no result (see $log)" >> "$log"

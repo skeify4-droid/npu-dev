@@ -20,6 +20,7 @@ proc PinsNamed {cells lps} {
 set AW 0; while {(1 << $AW) < $DEPTH} { incr AW }
 set NS [string map {\\ {}} $HS]
 set wg_r1 [FF "^${HS}wgray_r1\\\["]; set rg_w1 [FF "^${HS}rgray_w1\\\["]
+set wg_r2 [FF "^${HS}wgray_r2\\\["]; set rg_w2 [FF "^${HS}rgray_w2\\\["]
 set wg    [FF "^${HS}wgray\\\["];    set rg    [FF "^${HS}rgray\\\["]
 set mem   [FF "^${HS}mem\\\["];      set rbin  [FF "^${HS}rbin\\\["];  set wbin [FF "^${HS}wbin\\\["]
 set sync  [FF "^${HS}(wr_rs0|wrst_n|rd_rs0|rrst_n)\\\$"]

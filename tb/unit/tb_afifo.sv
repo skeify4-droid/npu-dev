@@ -4,7 +4,7 @@
 // the read side alone, and skewed (one input asserted a few clock edges before the other). Either input resets the
 // whole FIFO, so the model is cleared at the first assertion. Checks: ordering, no loss, no duplication, no overflow
 // (wr_ready never with the model full), no phantom data (rd_valid only with data in flight, also while the other
-// side is in reset), and a final drain that must empty the model.
+// side is in reset), and a final drain that must empty the model. afifo_thr measures the throughput of the credit round trip.
 `timescale 1ps/1ps
 
 module afifo_chk #(
@@ -119,6 +119,38 @@ module afifo_chk #(
   end
 endmodule
 
+// Throughput of the credit round trip (the header's "Latency and throughput"): equal clocks (1000 ps), both sides always
+// ready, pops counted over 1000 rd_clk edges starting 20 edges after reset release. PH is the read clock's offset from the
+// write clock: at PH 0 the edges coincide (DEPTH 2: 1/3 word per cycle, DEPTH 4: 2/3), at 250 ps DEPTH 2 gives 0.4 and DEPTH 4
+// 0.8; DEPTH 8 gives 1 at both. EXP is the expected pop count out of 1000, checked within +-2.
+module afifo_thr #(
+  parameter int DEPTH = 8,
+  parameter int PH    = 0,
+  parameter int EXP   = 1000,
+  parameter int ID    = 0
+) (
+  output int   errors,
+  output logic done
+);
+  logic wr_clk = 0, rd_clk = 0, rst_n = 0, wr_ready, rd_valid;
+  logic [7:0] rd_data;
+  afifo #(.WIDTH(8), .DEPTH(DEPTH)) dut (.wr_clk, .wr_rst_n(rst_n), .wr_valid(1'b1), .wr_ready, .wr_data(8'h5a),
+                                         .rd_clk, .rd_rst_n(rst_n), .rd_valid, .rd_ready(1'b1), .rd_data);
+  always #500 wr_clk = ~wr_clk;
+  initial begin #(PH); forever #500 rd_clk = ~rd_clk; end
+  int n = 0, c = 0;
+  initial begin
+    errors = 0; done = 0;
+    #5000 rst_n = 1;
+    repeat (20) @(posedge rd_clk);
+    repeat (1000) begin @(posedge rd_clk); if (rd_valid) n++; end
+    if (n < EXP - 2 || n > EXP + 2) begin
+      errors++; $display("[thr %0d] DEPTH %0d phase %0d ps: %0d pops in 1000 rd_clk edges (expect %0d)", ID, DEPTH, PH, n, EXP);
+    end
+    done = 1;
+  end
+endmodule
+
 module tb_afifo;
   localparam int N = 9;
   logic run = 0;
@@ -136,12 +168,22 @@ module tb_afifo;
   afifo_chk #(8,  16, 500, 523,  77, 7) c7 (run, errs[7], npush[7], npop[7], nfull[7], nidle[7], dn[7]); // DEPTH 16
   afifo_chk #(24, 4,  833, 667,   9, 8) c8 (run, errs[8], npush[8], npop[8], nfull[8], nidle[8], dn[8]); // DEPTH 4, 1.2 : 1.5 (wr slower)
 
+  int terr [6]; logic tdn [6];
+  afifo_thr #(2, 0,   333, 0) t0 (terr[0], tdn[0]);
+  afifo_thr #(4, 0,   667, 1) t1 (terr[1], tdn[1]);
+  afifo_thr #(8, 0,  1000, 2) t2 (terr[2], tdn[2]);
+  afifo_thr #(2, 250, 400, 3) t3 (terr[3], tdn[3]);
+  afifo_thr #(4, 250, 800, 4) t4 (terr[4], tdn[4]);
+  afifo_thr #(8, 250, 1000, 5) t5 (terr[5], tdn[5]);
+
   int total;
   initial begin
     #100 run = 1;
     wait (dn[0] && dn[1] && dn[2] && dn[3] && dn[4] && dn[5] && dn[6] && dn[7] && dn[8]);
+    wait (tdn[0] && tdn[1] && tdn[2] && tdn[3] && tdn[4] && tdn[5]);
     total = 0;
     for (int i = 0; i < N; i++) total += errs[i];
+    for (int i = 0; i < 6; i++) total += terr[i];
     if (total == 0) $display("PASS tb_afifo");
     else            $fatal(1, "FAIL tb_afifo: %0d errors", total);
     $finish;

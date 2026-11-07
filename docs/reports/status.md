@@ -663,14 +663,17 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
   of this side's clock periods after the later of the two inputs goes high (sufficient, not necessary; enough when
   recovery time + 2 * jitter < period: in silicon the removal and recovery windows let a domain leave reset on the 1st,
   2nd or 3rd of its edges after both inputs are high, the 2nd in the formal model). `rd_data` changes asynchronously to
-  `rd_clk` while `rd_valid` is 0, so a consumer captures it only on an edge where `rd_valid` is 1 (a load enable or a
-  mux); a free-running capture register can go metastable and the `mem` budget below then means nothing (integration
+  `rd_clk` while `rd_valid` is 0, so a consumer captures it only on an edge where `rd_valid` is 1, the `rd_valid` of that
+  same edge (a load enable or a mux), not a registered copy of it (an enable from the registered `rd_valid` captured
+  entries 8 ps after their write in the review simulation, 1465 of 196735 captures below the `mem` budget;
+  `afifo_review2/rdq/tb_rdq.sv`, not in the repo); a free-running capture register can go metastable and the `mem` budget below then means nothing (integration
   rule in the header). The side not reset
   cannot see that its words were dropped (`wr_ready` low looks like full), so a requester tracking outstanding words
   is reset with the FIFO (open question 9). No RTL change for this: an integration rule in the header. (Before review
   the two resets were used directly per domain and had to overlap; with the read reset a few `rd_clk` edges late, the
-  reader saw the reset write pointer and popped never-written words.) Throughput at 1:1 with both sides always ready:
-  DEPTH 2 gives 1/3, DEPTH 4 gives 2/3, DEPTH 8 gives 1.
+  reader saw the reset write pointer and popped never-written words.) Throughput at 1:1 with both sides always ready
+  depends on the phase between the clocks (`tb_afifo`, `afifo_thr`): at zero phase DEPTH 2 gives 1/3 and DEPTH 4 gives
+  2/3; with the read clock 250 ps after the write clock 0.4 and 0.8; DEPTH 8 gives 1 at both.
 - `credit_tx`/`credit_rx`: a credit per flit, saturating counter (illegal events are ignored and flagged, not wrapped);
   `can_send_pkt` (>= `PKT` credits) is the virtual cut-through test for a 2-flit packet, valid only if no new head enters a
   VC while a packet is in progress on it (it does not count credits owed to a started packet's body; the router allocates
@@ -697,6 +700,8 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     duplication (final drain empties the model), no overflow, no phantom data (also while only the other side is in reset), five kinds of reset: both
     inputs together, write side alone, read side alone, and skewed by 3 clock edges in either order, released after
     different numbers of cycles. The pre-review RTL fails this testbench (phantom words, overflow, data errors).
+    `afifo_thr` (6 DUTs, equal clocks, always ready): pops per 1000 `rd_clk` edges at DEPTH 2 / 4 / 8, zero phase 333 / 667
+    / 1000 and 250 ps phase 400 / 800 / 1000, within 2.
   - `credit_tx`: 5 configurations against an integer model, legal traffic and an abuse phase (sends without a credit,
     spurious credits), reset in the middle. `credit_rx`: both `REG` settings, no credit lost or invented.
   - `arb_rr` (N = 1, 2, 3, 4, 5, 6, 8, 16): explicit-pointer model, one-hot, non-requester, fairness bound (at most N-1 accepted
@@ -707,20 +712,27 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
   - Each testbench was run against hand-made mutants of the RTL (a wrong wrap, a wrong full condition, a dropped
     saturation, a wrong pointer update, a write-first SRAM, an ignored byte mask and so on); every functional mutant fails.
     Mutants that pass are behaviorally equivalent in legal use (for example `arb_prio` updating `last` on an unaccepted
-    grant) or, for `afifo`, a missing data-pointer synchronizer stage, which neither a zero-delay simulation nor the
-    formal tasks can see (below). Re-run on the current RTL (Phase 3 session 2):
+    grant) or, for `afifo`, a missing data-pointer synchronizer stage, which the functional checks cannot see (the zero-delay
+    model has no metastability); latency lower bounds and throughput see it (below). Re-run on the current RTL (Phase 3
+    session 2, then the fix session):
     one-stage reset synchronizer on either side (survived every task and the unit tb before; now fails `d2` / `d4` /
     `d8` at the release-edge assert, `ph2` / `ph4` and the unit tb still pass it), `rgray_w1` frozen after the first full
-    (survived `cov4` with the port-level cover alone; now fails `cov4` at c8). Still surviving: a bypassed data-pointer
-    stage (`wgray_r2 <= wgray` or `rgray_w2 <= rgray`) passes all six tasks and the unit tb; the same stage taken as the
-    flag source (`rd_valid` from `wgray_r1`, `wr_ready` from `rgray_w1`) fails `d2` / `d4` / `d8` only.
-- **Formal** (SymbiYosys, yices and abc pdr; 50 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
+    (survived `cov4` with the port-level cover alone; now fails `cov4` at c8). A bypassed data-pointer
+    stage (`wgray_r2 <= wgray`, `rgray_w2 <= rgray` or both) passed all six tasks and the unit tb; it now fails the latency
+    tasks `l2` / `l4` (L1 / L2) and `tb_afifo`'s throughput check (`afifo_thr`: DEPTH 2 / 4 give 0.4 / 0.8 at zero phase
+    instead of 1/3 / 2/3), and still passes `d2` / `d4` / `d8`, `ph2` / `ph4`, `cov4`. The same stage taken as the flag
+    source (`rd_valid` from `wgray_r1`, `wr_ready` from `rgray_w1`) fails `d2` / `d4` / `d8`, `l2` / `l4` and the throughput
+    check. Full set of 25 mutants (`afifo_review2/mut/`, eight sby tasks and `tb_afifo` each; the `c7_w1_*` runs used the
+    unit tb from before the throughput check): none survives. `c7_w*_freeze`, `c7_w2_hold` and `r_r*_freeze[_rst]`
+    fail `cov4` only (and the unit tb); the reset-synchronizer mutants fail `d*` (and `l*`); the mask and flag mutants
+    fail `d*`.
+- **Formal** (SymbiYosys, yices and abc pdr; 52 tasks under `make formal`; at least one task of every block was also run on a mutant and failed, and
   cover tasks show the properties are not vacuous):
   - `fifo` (16 tasks, DEPTH 1, 3, 4, 5, registered and fall-through): `count`, `full`, `empty`, `in_ready`, `out_valid`
     against a shadow count, no overflow, no underflow, by BMC and k-induction (unbounded); in-order data (one tagged entry
     from push to pop) and "a stalled output keeps its data", unbounded with `abc pdr` (k-induction cannot, the stored data
     is internal state).
-  - `afifo` (6 tasks, DEPTH 2, 4, 8, multiclock with two free clocks and two free resets; the only assumption is that
+  - `afifo` (8 tasks, DEPTH 2, 4, 8, multiclock with two free clocks and two free resets; the only assumption is that
     the run starts in reset): Gray registers follow the binary pointers, the
     pointer chain `srw2 <= srw1 <= rbin <= wbin`, `rbin <= sw2 <= sw1 <= wbin`, at most DEPTH apart; `wr_ready` and `rd_valid`
     are exact functions of the synchronized pointers and the domain reset; a domain in reset has zero pointers on both
@@ -728,17 +740,19 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     the RTL under `` `ifdef FORMAL `` (they need the pointers). Two edge counters inside the module (cleared while either
     input is low, saturating at 2) give the release instant: `wr_rs0` / `rd_rs0` and `wrst_n` / `rrst_n` are asserted
     against the number of own-clock edges since both inputs are high (second edge in this model), so a reset synchronizer
-    of one flop fails. Port-level tasks `ph2` / `ph4` (`abc pdr`, internal
+    of one flop fails. Latency tasks `l2` / `l4` (`abc pdr`, `-DFORMAL_LAT`; k-induction cannot prove them): a word is
+    announced on `rd_valid` no earlier than the 2nd `rd_clk` edge after the `wr_clk` push (L1), a freed entry offered on
+    `wr_ready` no earlier than the 2nd `wr_clk` edge after the pop (L2); `d2` / `d4` / `d8` do not define it. Port-level tasks `ph2` / `ph4` (`abc pdr`, internal
     properties off): pushes and pops counted per domain, `rd_valid` only with a word pushed and not popped, `wr_ready`
     only with a free entry, any reset pattern; both fail on the pre-review RTL (wr reset a few `rd_clk` edges before the
     rd reset gives a phantom word).
   - `afifo` synchronizer depth is a structural / review check, not a functional one. With a zero-delay, step-level clock
-    model a missing stage is not a functional error: a mutant that bypasses one stage (`wgray_r2 <= wgray`) passes `d4`,
-    `ph4` and the unit tb; a mutant that takes `rd_valid` from `wgray_r1` fails only `d4`, at the internal assert that
-    `rd_valid` is an exact function of `wgray_r2`, and passes `ph4` and the unit tb. The same holds on the write side
+    model a missing stage is not a functional error: a mutant that bypasses one stage (`wgray_r2 <= wgray`) passes `d4`
+    and `ph4` (it fails only the latency bounds `l2` / `l4` and the throughput check, which count edges); a mutant that takes `rd_valid` from `wgray_r1` fails only `d4`, at the internal assert that
+    `rd_valid` is an exact function of `wgray_r2`, and passes `ph4`. The same holds on the write side
     (`rgray_w2 <= rgray`, `wr_ready` from `rgray_w1`). The reset synchronizers are the exception: their release edge is
     counted, so a missing stage there is seen by `d2` / `d4` / `d8`.
-  - `afifo` covers (`cov4`), eight at the ports (c1 to c7) and one inside the module (c8): a word goes through (step 9); the FIFO fills, `wr_ready` high since the
+  - `afifo` covers (`cov4`), seven at the ports (c1 to c7) and three inside the module (c8, c9, c10): a word goes through (step 9); the FIFO fills, `wr_ready` high since the
     last reset input and then low with no reset in between (step 12); the write input alone asserts while the reader
     shows a word (step 10); the read input alone asserts while the reader shows a word (step 10); a word pushed at a
     `wr_clk` edge after which the read domain is still in reset (strictly before `rrst_n` rises) is popped later with no
@@ -752,7 +766,10 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
     never edging. Each witness trace was read to confirm it shows what its cover says; the new one has four `wr_clk`
     pushes, one `rd_clk` pop, two `wr_clk` edges carrying the read pointer into `rgray_w1` then `rgray_w2`, then
     `wr_ready` high. With an assumption that no step has both clocks rising, a scratch run reaches all eight port-level covers at
-    the same steps. Before review the fill cover was `!wr_ready && wr_rst_n`, reached
+    the same steps. c9 is the read-side mirror of c8 (the FIFO drains, `wgray_r1` and `wgray_r2` each change, `rd_valid`
+    returns; step 19), c10 a second fill (`wr_ready` returns twice with no reset input in between; step 14). The read-side
+    freezes (`r_r1_freeze`, `r_r2_freeze`, `r_r12_freeze` and the reset-clearing `r_r1_freeze_rst`, `r_r2_freeze_rst`)
+    fail c9, `c7_w2_hold` fails c10. Before review the fill cover was `!wr_ready && wr_rst_n`, reached
     at step 1 by the reset synchronizer alone. In the next review the old read-only cover fired with the read domain
     still in reset and `rd_valid` never 1, the early-push cover pushed on the `rd_clk` edge that released `rrst_n`, and
     the write-only cover was the tail of the initial reset (empty FIFO); these are the replacements.
@@ -798,10 +815,11 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
 7. `afifo` CDC constraints for Phase 6 STA. The full text is in the afifo header. Command options and behaviour were
    checked against the OpenSTA in the pinned OpenROAD (18f08d7) on ORFS ASAP7 netlists of the block (flattened under a
    wrapper with a producer and a consumer register, and the block as top) and, for one configuration, after ORFS
-   floorplan and CTS. `make cdc-sta` (`scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`, 451 checks, all pass) repeats this from the
-   header text taken literally and also checks the set sizes, the max / min delay bounds, hold slack at the synchronizer
-   second stages and, for `w8d8cts`, the flow through global and detail route; nothing is checked by simulation, lint or
-   formal. The header's commands (`T_wr` 667 ps,
+   floorplan and CTS. `make cdc-sta` (`scripts/cdc_sta/`, results in `build/cdc_sta/summary.txt`, 577 checks, all pass) repeats this from the
+   header text taken literally and also checks the set sizes, the max / min delay bounds, recovery / removal from
+   `wrst_n` / `rrst_n` to every pointer set (one result per set, exact RESETN pin counts, text and post modes), hold slack
+   at the synchronizer second stages (every pin printed, with the parasitics of each stage) and, for `w8d8cts`, the flow
+   through global and detail route; nothing is checked by simulation, lint or formal. The header's commands (`T_wr` 667 ps,
    `T_rd` 833 ps, `U_g` = `U_m` = 25 ps) put every crossing endpoint in the path-delay group for max and min, with clear
    arcs off and on, none left in a clock group. Endpoints `wr_clk` to `rd_clk` / `rd_clk` to `wr_clk`: WIDTH 8 DEPTH 8
    12 / 4 (4 `wgray_r1` + 8 consumer / 4 `rgray_w1`), DEPTH 2 10 / 2, DEPTH 16 13 / 5, WIDTH 1 5 / 4, WIDTH 64 68 / 4.
@@ -810,20 +828,23 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
    `rd_data` ports in place of the consumer).
    - The commands belong in the SDC the flow reads from floorplan on (ORFS `SDC_FILE`) as well as in signoff STA. With an
      SDC holding only the two clocks, floorplan and CTS `repair_timing` each worked on 12 of the 16 crossing endpoints
-     (the 8 consumer and 4 `rgray_w1` violate at the flow's FF corner; the 4 `wgray_r1` fail only at TT; `wr_clk` /
+     (with clear arcs off the 8 consumer and 4 `rgray_w1` violate at the flow's FF corner and the 4 `wgray_r1` fail only at
+     TT; with clear arcs on all 16 violate at FF, `w8d8ctsc` 12 of 16 / 16 of 16; `wr_clk` /
      `rd_clk` 667 / 833 ps treated as related clocks, edges 1 ps apart; WNS -67 ps at floorplan, -59 ps in
      CTS, worst `rgray_w1[3]/D`; `build/cdc_sta/work_w8d8ctsc/logs/.../2_1_floorplan.log`, `4_1_cts.log`). With the
      header's SDC neither stage finds a setup violation (`make cdc-sta`, `w8d8cts` and its control `w8d8ctsc`).
    - `-ignore_clock_latency` ignores `set_clock_uncertainty` and the capture clock's latency (slack unchanged with
      uncertainty 100 ps or `rd_clk` latency 200 ps; `claims/unc.log` under `/Volumes/EVO970PLUS/claude/afifo_review/`, as are the other `claims/` and `logs/` files named below) but not the launch clock's source latency. With
-     ideal clocks, `set_clock_latency -source 150` on `wr_clk` moved the `wr_clk` -> `wgray_r1` max slack 527 -> 377 ps
-     and the min slack 71 -> 221 ps (on `rd_clk`, the capture clock there, nothing moved; both clocks: same as `wr_clk`
-     alone; `claims/unc.log`, `logs/batch3.log`); with propagated clocks it is ignored (527 / 71 unchanged;
-     `logs/batch3.log`). So in pre-CTS `repair_timing` and any ideal-clock STA a source latency L on a launch clock makes
+     ideal clocks, `set_clock_latency -source 150` on `wr_clk` moved the slack at one endpoint, `wgray_r1[3]/D`, from 527
+     to 377 ps max and from 71 to 221 ps min (the worst bit of the four: 527.1 -> 377.1 max, 60.0 -> 210.0 min; on `rd_clk`,
+     the capture clock there, nothing moved; both clocks: same as `wr_clk` alone; `claims/unc.log`, `logs/batch3.log`,
+     `afifo_review2/lat/lat_syn.log`); with propagated clocks it is ignored (527 / 71 unchanged; `logs/batch3.log`). So in pre-CTS `repair_timing` and any ideal-clock STA a source latency L on a launch clock makes
      the max slack L worse and the min slack L better (hold looks safe, setup is repaired against an L that is gone
      after CTS). The header says: no `set_clock_latency -source` on `wr_clk` / `rd_clk` in the flow's SDC; if a shared
      SDC carries one, do not read the crossings' min slack from an ideal-clock run, and sign off propagated. Launch-clock
-     network latency was not measured.
+     network latency (`set_clock_latency` without `-source`, 150 ps on `wr_clk`, `rd_clk`, both) was measured too: ignored
+     with ideal and with propagated clocks, no slack changed, on the synthesis netlist and after CTS
+     (`afifo_review2/lat/lat_syn.log`, `lat_cts.log`).
    - `U` is one number per item, derived by hand, so the margin is written into the numbers. Every skew term is a worst
      case (the latest clock arrival over one register set minus the earliest over the other), and the min delay is
      measured from the launching flop's clock pin, not the ideal edge: the skew terms account for that. Gray: `U_g` =
@@ -890,12 +911,34 @@ Other changes: `make formal` runs every `tb/formal/*.sby` (all tasks) under `scr
      (`make cdc-sta`, `w8d8cts`, hold margin 40 ps): floorplan and CTS run, no hold buffer on the 20 synchronizer nets, the
      21 nets and 28 flops carry `dont_touch` after CTS and after global and detail route (`4_cts`, `5_1_grt`, `5_route`),
      `arst_n` still has 5 pins. Controls: without `dont_touch` (`w8d8ctsn`) 10 buffer pins on those nets. The price: the
-     10 stage-2 D pins sit at +28 to +31 ps hold slack at the flow's FF corner (30.2 ps worst in `make cdc-sta`), inside
-     the 40 ps margin, and `repair_timing` cannot touch them (RSZ-0064 at CTS and global route), so a real hold violation
-     there would not be repaired. `post_s2_hold` (`make cdc-sta`) fails if any of them goes below 0.
+     10 stage-2 D pins sit at +29.8 to +34.2 ps hold slack at the flow's FF corner, inside the 40 ps margin, and
+     `repair_timing` cannot touch them (RSZ-0064 at CTS and global route), so a real hold violation there would not be
+     repaired. The number depends on the stage's parasitics: worst 30.6 ps after CTS (placement estimate), 29.8 ps after
+     global route (`estimate_parasitics -global_routing`), 30.9 ps after detail route (RCX extraction of the routed wires,
+     read back from a SPEF, as the flow's final report does); `post_s2_hold` (`make cdc-sta`) prints every pin and fails
+     if any of them goes below 0.
    - Post-CTS and after global and detail route (`4_cts.odb`, `5_1_grt.odb`, `5_route.odb` with the SDC as the flow wrote
-     it back, propagated clocks, the flow's corner with placement parasitics): the header's selections resolve and all
-     12 / 4 endpoints stay in the path-delay group, max and min, clear arcs off and on, none of the 16 violated.
+     it back, propagated clocks, the flow's corner; the parasitics of each stage: placement estimate, global-route
+     estimate, RCX extraction): the header's selections resolve and all 12 / 4 endpoints stay in the path-delay group, max
+     and min, clear arcs off and on, none of the 16 violated.
+   - What `make cdc-sta` reproduces, and what only logs outside the repo show. Reproduced by `make cdc-sta` (and in
+     `build/cdc_sta` after a run): set sizes, the bounds and library terms of every crossing class, path-group membership
+     with each category excluded in turn (`excl_*`), recovery / removal removed at the four synchronizer flops and kept
+     from `wrst_n` / `rrst_n` to the eight pointer sets, clear arcs off and on, the blk form and `blk_rbin_min_required`,
+     the flow through CTS and route with no setup repair (`w8d8cts`), the 12 related-clock endpoints repaired against a
+     clocks-only SDC (`w8d8ctsc`, 12 of 16 violated with clear arcs off, 16 of 16 on), hold buffers without `dont_touch`
+     (`w8d8ctsn`), CTS-0137 with instance `dont_touch` before CTS (`w8d8ctsi`), `dont_touch` flags, and the stage-2 hold
+     slacks per stage (30.6 / 29.8 / 30.9 ps worst after CTS / global route / detail route). Only in logs outside the repo
+     (`afifo_review/`, `afifo_review2/`): the behaviour of `set_clock_groups` and `set_false_path` on the crossings
+     (`claims/`), `-ignore_clock_latency` against uncertainty, source and network latency (`claims/unc.log`,
+     `lat/`), the TT-only failure of the 4 `wgray_r1` in the clocks-only run, the 60 ps hold-margin buffer runs and
+     RSZ-3006 at `max_fanout` 10 (`rev2_sta*`), the minimum-pulse-width numbers and the unreported `set_min_pulse_width`
+     (`claims/mpw.log`), the output-delay arithmetic (1641 -> 1341 ps), the `rd_data` capture-pattern simulation (`rdq/`).
+     The harness itself was run against 25 header and RTL mutants (`afifo_review2/hmut/`): every one fails except
+     `n_allow_paths` (expected to pass: `-allow_paths` keeps both bounds) and `r_keep_msb` (`(* keep *)` on `wgray` still
+     merges the MSB; not checked whether it is equivalent). The three reset mutants `n_fp_wbin_rst`, `n_fp_rbin_rst`,
+     `n_fp_rgray_w1_rst` (false path to part of a reset set) now all fail the `rst_*` checks; before only the first did.
+     `n_hold_unc` (50 ps hold uncertainty) fails in the flow itself (RSZ-0060 in CTS), not at `post_s2_hold`.
    - Still open: synchronizer depth (2 flops, data and reset) against the ASAP7 MTBF numbers; the SDC and the two hook
      scripts as Phase 6 files (the scripted flow generates them from the header text); the steps after detail route
      (fill, final reports) with `dont_touch`; the 12 / 16 counts and slacks are for one build, WIDTH 8 DEPTH 8.
