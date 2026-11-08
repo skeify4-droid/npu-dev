@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-change mutants of rtl/core/mxu*.sv, run against tb_mxu (iverilog) and, for the control mutants, against tb/formal/mxu.sby.
+"""One-change mutants of rtl/core/mxu*.sv, run against tb_mxu (iverilog) and, for the control mutants, against tb/formal/mxu.sby (mxu) and mxu_dec.sby (the decoder).
 
 Usage (always under scripts/memrun, one job at a time; the vectors of `make mxu-vec` must exist in build/mxu):
   scripts/memrun mxu_mutants_tb python3 scripts/mxu_mutants/mxu_mutants.py tb [--quick] [NAME ...]
@@ -12,6 +12,8 @@ Every mutant is a copy of rtl/core with exactly one textual change (`old` must o
   formal_blind  the proofs cannot see it (M <= 2): tb_mxu must kill it, and sby bmc_a is expected to PASS (a recorded limit of the proofs)
   equiv  an equivalent change (not visible at the ACC / the fault port): tb_mxu must still PASS
   formal the control mutants of the proofs: sby task bmc_a (depth 56) must fail (or, for `equiv_f`, pass)
+  formal_dec  mutants of the decoder's M = 0 path and checks: tb/formal/mxu_dec.sby task bmc (depth 40, the real mxu_dec) must fail
+  equiv_dec  an equivalent change of the decoder: the same proof must still pass
 Exit status 0 when every mutant behaved as its expectation says.
 """
 import os
@@ -130,6 +132,22 @@ mut("token_live", X, "assign a_lastp = (s_m == s_Mrows - 16'd1);", "assign a_las
     note="the proofs cannot see it (M <= 2); the system test does")
 
 
+# ------------------------------------------------------------------------------------------- M = 0 in the decoder: tb_mxu and mxu_dec.sby
+mut("z_no_wait", D, "assign z_inc    = (dst == D_PUSH) && m_zero && inf_empty;", "assign z_inc    = (dst == D_PUSH) && m_zero;", exp="formal_dec",
+    note="M = 0 completes without waiting for the FIFO to empty")
+mut("z_m16", D, "assign m_zero = (vM == 64'd0);", "assign m_zero = (vM[15:0] == 16'd0);", exp="equiv_dec",
+    note="equivalent: the zero test on 16 bits of M; every M >= 2^16 is already a RANGE fault of the ACC (full 64-bit M > ACC_ROWS), so none reaches D_PUSH")
+mut("z_ctx_too", D, "assign ctx_push = (dst == D_PUSH) && !m_zero && ctx_ready;", "assign ctx_push = (dst == D_PUSH) && ctx_ready;", exp="formal_dec",
+    note="M = 0 also pushes a context")
+mut("z_leave_early", D, "D_PUSH: if (m_zero ? inf_empty : ctx_ready) dst <= D_IDLE;", "D_PUSH: if (ctx_ready) dst <= D_IDLE;", exp="formal_dec",
+    note="the decoder takes the next instruction while an M = 0 waits")
+mut("z_mreg_ignored", D, "vM   = m_en ? r_m : 64'(a_n1);", "vM   = 64'(a_n1);", exp="formal_dec", note="S-7: R[m_reg] not used")
+mut("z_unchecked", D, "if (bad_any) begin\n            fault_valid", "if (bad_any && !m_zero) begin\n            fault_valid", exp="formal_dec",
+    note="an M = 0 instruction skips the legality checks")
+mut("z_range_a", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = (a_ext > 96'(SPM_BYTES));", exp="formal_dec",
+    note="A with no bytes (M = 0) can fault RANGE")
+
+
 def build(m):
     name, file, old, new, exp, note = m
     d = os.path.join(BUILD, name)
@@ -185,6 +203,22 @@ def run_formal(m):
     return "ERROR", out[-400:]
 
 
+def run_formal_dec(m):
+    d = build(m)
+    sby = open(os.path.join(ROOT, "tb/formal/mxu_dec.sby")).read()
+    sby = sby.replace("../../rtl/core/", d + "/").replace("../../isa/gen/", os.path.join(ROOT, "isa/gen") + "/")
+    p = os.path.join(d, "mxu_dec.sby")
+    open(p, "w").write(sby)
+    r = subprocess.run([SBY, "-f", "--prefix", os.path.join(d, "run"), p, "bmc"], cwd=d, capture_output=True, text=True, timeout=3600)
+    out = r.stdout + r.stderr
+    if "DONE (FAIL" in out:
+        line = [l for l in out.splitlines() if "Assert failed" in l]
+        return "fails", line[0].strip() if line else ""
+    if "DONE (PASS" in out:
+        return "passes", ""
+    return "ERROR", out[-400:]
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] not in ("tb", "formal", "list"):
@@ -201,7 +235,7 @@ def main():
     bad = 0
     for m in sel:
         name, _, _, _, exp, note = m
-        if mode == "tb" and exp == "formal":
+        if mode == "tb" and exp in ("formal", "formal_dec", "equiv_dec"):
             res, info = run_tb(m, quick)           # a formal mutant is also run against the system test
             ok = True                              # reported, not judged
             verdict = "tb " + res
@@ -210,10 +244,10 @@ def main():
             ok = (res == "fails") if exp in ("kill", "formal_blind") else (res == "passes") if exp == "equiv" else (res == "fails" or quick)
             verdict = ("KILLED" if res == "fails" else "SURVIVED" if res == "passes" else res) + ("" if ok else "   <-- UNEXPECTED")
         else:
-            if exp not in ("formal", "formal_blind"):
+            if exp not in ("formal", "formal_blind", "formal_dec", "equiv_dec"):
                 continue
-            res, info = run_formal(m)
-            ok = (res == "fails") if exp == "formal" else (res == "passes")
+            res, info = run_formal_dec(m) if exp in ("formal_dec", "equiv_dec") else run_formal(m)
+            ok = (res == "fails") if exp in ("formal", "formal_dec") else (res == "passes")
             verdict = ("CAUGHT" if res == "fails" else "SURVIVED" if res == "passes" else res) + ("" if ok else "   <-- UNEXPECTED")
         bad += 0 if ok else 1
         print("%-26s %-8s %s   %s" % (name, exp, verdict, info if res in ("fails", "COMPILE-ERROR", "ERROR") else ""), flush=True)

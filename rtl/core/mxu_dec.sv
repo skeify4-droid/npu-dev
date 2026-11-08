@@ -3,6 +3,10 @@
 // instruction. An instruction with M = 0 passes every check, reads and writes nothing, and completes (`z_inc`, with `ctx_sync`)
 // once nothing is in flight, i.e. in order after the earlier instructions' acc_done.
 // A separate module so that the control of `mxu` can be proved without these 64-bit address computations (tb/formal/mxu.sby).
+// the import is outside the module because the Yosys front end of tb/formal/mxu_dec.sby does not take it inside
+// verilator lint_off IMPORTSTAR
+import isa_pkg::*;
+// verilator lint_on IMPORTSTAR
 module mxu_dec #(
   parameter int DIM       = 8,
   parameter int ACC_ROWS  = 2048,
@@ -40,8 +44,6 @@ module mxu_dec #(
   output logic [3:0]          fault_cause,
   output logic [63:0]         fault_addr
 );
-  import isa_pkg::*;
-
   typedef enum logic [3:0] {D_IDLE, D_TDA_REQ, D_TDA_WAIT, D_TDW_REQ, D_TDW_WAIT, D_CHECK, D_PUSH, D_FAULT} dstate_t;
   dstate_t dst;
 
@@ -238,4 +240,79 @@ module mxu_dec #(
 
   logic unused_td;
   assign unused_td = &{1'b0, td_a[255:112], td_w[255:112]};
+
+`ifdef FORMAL
+  // ================================================================== formal (tb/formal/mxu_dec.sby; spec mxu.md 6)
+  // The real decoder alone, every input free except: reset is low for the first two cycles and high afterwards. The shadow
+  // registers below take the instruction, R[m_reg] and the TD n1 field straight from the inputs, so the properties do not
+  // read the decoder's own latches. They say what the legality checks and the DIM-independent handshake of the M = 0 path
+  // (M-14: no context, no FIFO entry, completes only with an empty FIFO) must do; the arithmetic of the checks is tb_mxu's.
+  reg [1:0] f_rc = 2'd0;
+  always @(posedge clk) if (f_rc != 2'd3) f_rc <= f_rc + 2'd1;
+  always @(*) begin
+    if (f_rc < 2'd2) assume (!rst_n);
+    else             assume (rst_n);
+  end
+
+  wire        f_acc  = (dst == D_IDLE) && q_ready;                  // an instruction is taken
+  wire        f_chk  = (dst == D_CHECK);
+  wire        f_done = ctx_push || z_inc || (f_chk && bad_any);     // it leaves the decoder: context, M = 0 completion or fault
+  reg [127:0] f_ins;
+  reg [63:0]  f_rm;
+  reg [15:0]  f_n1;
+  reg [1:0]   f_out = 2'd0;                                         // taken minus left
+  reg         f_pdone = 1'b0, f_pstall = 1'b0, f_pbad = 1'b0, f_pok = 1'b0, f_ppush = 1'b0;   // previous cycle: left D_CHECK with / without a fault
+  always @(posedge clk) begin
+    if (f_acc) begin
+      f_ins <= q_instr;
+      f_rm  <= q_regs[64*3 +: 64];
+    end
+    if (dst == D_TDA_WAIT && dtab_rvalid) f_n1 <= dtab_data[TD_N1_MSB:TD_N1_LSB];
+    if (!rst_n) begin
+      f_out <= 2'd0; f_pdone <= 1'b0; f_pstall <= 1'b0; f_pbad <= 1'b0; f_pok <= 1'b0; f_ppush <= 1'b0;
+    end else begin
+      f_out    <= f_out + {1'b0, f_acc} - {1'b0, f_done};
+      f_pdone  <= ctx_push || z_inc;
+      f_pstall <= (dst == D_PUSH) && m_zero && !inf_empty;
+      f_pbad   <= f_chk && bad_any;
+      f_pok    <= f_chk && !bad_any;
+      f_ppush  <= (dst == D_PUSH);
+    end
+  end
+  wire [63:0] f_mval = (f_ins[T_MXU_M_REG_MSB:T_MXU_M_REG_LSB] != 5'd0) ? f_rm : 64'(f_n1);   // M of the instruction, 64 bits
+
+  always @(*) begin
+    if (rst_n && f_rc == 2'd3) begin
+      // one outcome per instruction taken: a context, an M = 0 completion or a fault, never two
+      assert (!(z_inc && ctx_push));
+      assert (f_out <= 2'd1);
+      assert (!f_done || f_out == 2'd1);
+      assert (!f_pdone || dst == D_IDLE);
+      // M = 0: completes only in order (FIFO empty), never pushes a context, M is R[m_reg] in 64 bits or n1 of the TD
+      assert (!z_inc || (dst == D_PUSH && inf_empty));
+      assert (!z_inc || f_mval == 64'd0);
+      assert (!ctx_push || (ctx_ready && f_mval != 64'd0));
+      assert (!f_pstall || dst == D_PUSH);                              // an M = 0 that found the FIFO not empty is still there next cycle (it leaves only through z_inc)
+      // sem_inc fields
+      assert (!(z_inc || ctx_push) || ctx_sync == {f_ins[SYNC_SSEM_MSB:SYNC_SSEM_LSB], f_ins[SYNC_SINC_MSB:SYNC_SINC_LSB]});
+      // every instruction, M = 0 included, is checked: a fault stops in D_FAULT, D_PUSH is entered only from a check without one
+      // (stated on the previous cycle's result, so that the solver does not compare two copies of the 96-bit address arithmetic)
+      assert (!f_pbad || (dst == D_FAULT && fault_valid));
+      assert (dst != D_PUSH || f_pok || f_ppush);
+      // with no bytes, A and the rowscale of an M = 0 instruction cannot fault
+      assert (!m_zero || (!f_r_a && !f_r_rs));
+    end
+  end
+
+  // reachability: an M = 0 completion that waited and one that did not, from the register and from the TD, a context, a fault of an M = 0 instruction
+  always @(*) begin
+    if (rst_n && f_rc == 2'd3) begin
+      cover (z_inc && f_pstall);
+      cover (z_inc && !f_pstall && f_ins[T_MXU_M_REG_MSB:T_MXU_M_REG_LSB] != 5'd0);
+      cover (z_inc && !f_pstall && f_ins[T_MXU_M_REG_MSB:T_MXU_M_REG_LSB] == 5'd0);
+      cover (ctx_push);
+      cover (f_chk && bad_any && m_zero);
+    end
+  end
+`endif
 endmodule
