@@ -1,0 +1,42 @@
+# mxu: control properties of the matrix unit (docs/spec/mxu.md 6) on DIM = 8 with stub PEs and a stub decoder
+# (mxu_stubs.sv, mxu_dec_stub.sv). P1 no write over an uncopied shadow beat / duplicated beat, P2 no swap with a missing beat,
+# P3 ACC row spacing >= ACC_LAT, P4 row order within a pass, P5 FIFO bounds and fill-before-read. Bounded model checking
+# (depth 56 per task). k-induction does not close: its step starts from arbitrary pipeline contents (the shadow bookkeeping and the
+# free flags / tag pipeline of the DUT would need a joint invariant; open); cov = reachability of the interesting cases.
+[tasks]
+bmc_a  bmc  mm2 kt2 nt1
+bmc_b  bmc  mm2 kt1 nt2
+bmc_c  bmc  mm1 kt2 nt2
+cov    cover cov mm2 kt2 nt2
+
+[options]
+bmc: mode bmc
+bmc: depth 56
+cover: mode cover
+cover: depth 90
+
+[engines]
+bmc: smtbmc yices
+cover: smtbmc yices
+
+[script]
+mm1: read -define MMAX=1
+mm2: read -define MMAX=2
+kt1: read -define KTMAX=1
+kt2: read -define KTMAX=2
+nt1: read -define NTMAX=1
+nt2: read -define NTMAX=2
+cov: read -define F_COVER=1
+read -formal mxu.sv
+read -formal mxu_array.sv
+read -formal mxu_wpack.sv
+read -formal mxu_stubs.sv
+read -formal mxu_dec_stub.sv
+prep -top mxu
+
+[files]
+../../rtl/core/mxu.sv
+../../rtl/core/mxu_array.sv
+../../rtl/core/mxu_wpack.sv
+mxu_stubs.sv
+mxu_dec_stub.sv

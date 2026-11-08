@@ -1117,3 +1117,10 @@ stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv
 
 ### Open
 - `BF16X3` (faults `ILLEGAL_FIELD`), formal properties, `core/acc` (must accept the `acc_*` stream of mxu.md §5), the small-M period decision, Phase 6 fan-out of A.
+
+### Formal (mxu.sby)
+`ifdef FORMAL` block in `rtl/core/mxu.sv` (decode split into `mxu_dec` so that it can be stubbed: `tb/formal/mxu_dec_stub.sv`, PE stub `mxu_stubs.sv`). P1-P5 proved to depth 56 on DIM 8 for three size mixes (3-6 min each,
+`make formal` runs them and the cover task). 8 mutants of the control logic: caught `no_free_gate` (P1), `no_gap` (P3), `swap_early` and `last_beat_early` (P2), `cs_pop_first`, `rs_pop_end` and
+`cs_cnt_leak` (P5); `dup_beat` is equivalent. Two survivors of the first round led to new assertions (rowscale lane pointer, independent reservation counts).
+Limits: no unbounded proof (induction does not close without joint invariants), no liveness proof, DIM 8 only. A wrong assumption in the stub (`8'(ACC_ROWS)` truncating 2048 to 0) made every
+property vacuous until the cover points failed to be reached; keep the cover task in the regression.

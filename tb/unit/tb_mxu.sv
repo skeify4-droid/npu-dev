@@ -283,7 +283,7 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   always @(posedge clk) begin
     dtab_gnt <= dtab_req && !dtab_gnt && !dtab_rvalid;
     dtab_rvalid <= dtab_gnt;
-    if (dtab_gnt) dtab_data <= (dut.dst == 4'd1) ? td_a : td_w;
+    if (dtab_gnt) dtab_data <= (dut.u_dec.dst == 4'd1) ? td_a : td_w;
   end
   int spm_touch = 0;
   always @(posedge clk) if (|a_req_v || |w_req_v || s_req_v || acc_valid || sem_inc_valid) spm_touch++;
