@@ -1089,3 +1089,31 @@ behaviour the RTL, reference and oracle already had; numerics.md states them now
   (E8M0 exponent, NVFP4 block scale) on top of `cvt_fp32_fp`.
 - `core/ni` write-add ALU: `fp32_add` / `fp32_max`, `ADD_BF16` as `fp32_add` + `cvt_fp32_fp #(FMT=0)`.
 - Phase 6: stage cuts of `mxu_pe` against the clock, BF16 multiplier cost against sharing the FP8 ones.
+
+## Phase 3: core/mxu (2026-11-08)
+
+Spec: [mxu.md](../spec/mxu.md). RTL: `rtl/core/mxu_array.sv` (PE grid, double-buffered stationary words with the swap skewed down the rows, A skew,
+sideband chain, flag qualification), `mxu_wpack.sv` (SPM lanes of a load beat -> 128-word window), `mxu.sv` (decode and legality checks, load FSM,
+stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv`, `tb/unit/tb_mxu.sv`; vectors `scripts/gen_mxu_vectors.py` (`make mxu-vec`).
+
+### Design decisions (mxu.md §8)
+- One parameter `DIM`; the SPM lane of the MXU ports is `DIM` bytes, so there are always 4 load groups of `DIM/4` PE rows and `DIM/2` beats per tile.
+- N outer, K inner; ACC read-modify-write hazards are excluded by pass spacing (`ACC_LAT`), not by interlocks.
+- Shadow load by group, because the swap reaches PE row `i` `i` cycles after row 0.
+
+### Results
+- `mxu_array`: 8 x 8 and 16 x 16 against an independent model on `arith_ref`: bit-exact y, flags every cycle, `swap_tap` timing per buffer and group; 17 mutants, all killed.
+- `mxu`: 6 instructions per size on DIM 8 and 16, with and without grant stalls: the whole ACC image is bit-exact against the logical `A x W`; 29 illegal
+  instructions raise the right cause; one 32 x 32 decode instruction is bit-exact and checks the tile period; a long-A-stall run (the loader runs ahead of the swap) exercises the buffer interlock; 21 mutants of `mxu.sv` / `mxu_wpack.sv`: 17 killed, 4 equivalent. Lint clean at DIM 8, 16, 32, 64.
+
+### Findings
+- Spec gap: the column-scale array `[KT x N]` is lane-aligned only if `4N % LB == 0`; now a legality rule (`ILLEGAL_FIELD`), and the DMA must pad `N`.
+- Bug found by the 16 x 16 run: the second beat of a group waited for the group's own `free` flag (deadlock for `DIM >= 16`); fixed.
+- **Performance, against my own estimate:** with one shadow buffer the tile period at M = 1 was 25 cycles at DIM 16 (1.25·DIM + 9, about 80 for `FULL`), not 32-40:
+  the next pass waited for all four groups, the last of which is free `DIM - 1` cycles after the swap. Decision (user): a second shadow buffer (mxu.md M-9).
+  Measured now: 21-22 cycles per tile at DIM 32 (the one-buffer formula gave 49), extrapolated about 39 for `FULL`, 420 B/cycle of FP8 weights against a decode need of
+  164-193. Not simulated at 64.
+- Bank-conflict note for the compiler: group beats read one lane from 8 consecutive W rows (mxu.md §7).
+
+### Open
+- `BF16X3` (faults `ILLEGAL_FIELD`), formal properties, `core/acc` (must accept the `acc_*` stream of mxu.md §5), the small-M period decision, Phase 6 fan-out of A.

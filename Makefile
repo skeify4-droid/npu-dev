@@ -17,15 +17,19 @@ export PATH := $(EDA_HOME)/tools/sby/bin:$(PATH)
 
 COMMON_SV := $(wildcard $(RTL_DIR)/common/*.sv)
 ARITH_SV  := $(sort $(wildcard $(RTL_DIR)/arith/*.sv))
+CORE_SV   := $(sort $(wildcard $(RTL_DIR)/core/*.sv))
+ISA_PKG   := isa/gen/isa_pkg.sv
 # Parameter variants of the arith blocks that `make lint` checks besides the defaults: <top>:<-G options joined by ,>
 ARITH_LINT_VAR := cvt_fp32_fp:-GFMT=1 cvt_fp32_fp:-GFMT=2 cvt_fp32_fp:-GFMT=3 cvt_fp32_fp:-GFMT=4 \
   cvt_dec:-GFMT=0,-GTO_BF16=1 cvt_dec:-GFMT=1 cvt_dec:-GFMT=1,-GTO_BF16=1 cvt_dec:-GFMT=3 cvt_dec:-GFMT=4,-GTO_BF16=1 \
   cvt_fp32_int:-GBITS=8,-GSIGNED=0 cvt_fp32_int:-GBITS=16 cvt_fp32_int:-GBITS=32 cvt_fp32_int:-GBITS=32,-GSIGNED=0 \
   mx_dequant_bf16:-GELEM=1 mx_dequant_bf16:-GSCALE=1 fold_key:-GELEM=1 fold_quant:-GELEM=1 fold_quant:-GSCALE=1 \
   fold_amax:-GN=5 fold_amax:-GN=64 fold_amax:-GN=1 mxu_pe:-GREG_DOT=0,-GREG_OUT=0 mxu_pe:-GREG_DOT=0 mxu_pe:-GREG_OUT=0
+# Parameter variants of the core blocks that `make lint` checks besides the defaults (DIM 8)
+CORE_LINT_VAR := mxu:-GDIM=16 mxu:-GDIM=64 mxu_array:-GROWS=16,-GCOLS=16 mxu_array:-GROWS=64,-GCOLS=64 mxu_wpack:-GDIM=64
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit arith-vec pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean
+.PHONY: help lint unit arith-vec mxu-vec pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean
 help:
 	@echo "targets: lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean"
 
@@ -40,6 +44,16 @@ lint:
 	  top=$$(basename $$f .sv); \
 	  echo "== lint $$top"; \
 	  verilator --lint-only -Wall --top-module $$top $(ARITH_SV) || exit 1; \
+	done
+	@for f in $(CORE_SV); do \
+	  top=$$(basename $$f .sv); \
+	  echo "== lint $$top"; \
+	  verilator --lint-only -Wall --top-module $$top $(ISA_PKG) $(CORE_SV) $(ARITH_SV) || exit 1; \
+	done
+	@for v in $(CORE_LINT_VAR); do \
+	  top=$${v%%:*}; opts=$$(echo "$${v#*:}" | tr ',' ' '); \
+	  echo "== lint $$top $$opts"; \
+	  verilator --lint-only -Wall --top-module $$top $$opts $(ISA_PKG) $(CORE_SV) $(ARITH_SV) || exit 1; \
 	done
 	@for v in $(ARITH_LINT_VAR); do \
 	  top=$${v%%:*}; opts=$$(echo "$${v#*:}" | tr ',' ' '); \
@@ -66,16 +80,22 @@ $(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py scripts/arith_hand_cases.py 
 # anywhere else cannot shadow it. A testbench fails unless every vector file has exactly the row count of counts.svh (not
 # zero), and the simulator's warnings about a missing, short or long file (Unable to open, Not enough words, Too many
 # words) fail it too.
-unit: $(BUILD) arith-vec
+# MXU test vectors (scripts/gen_mxu_vectors.py -> build/mxu, a few seconds).
+mxu-vec: $(BUILD)/mxu/.stamp
+$(BUILD)/mxu/.stamp: scripts/gen_mxu_vectors.py sw/npumodel/arith_ref.py
+	$(PY) scripts/gen_mxu_vectors.py $(BUILD)/mxu >/dev/null && touch $@
+
+unit: $(BUILD) arith-vec mxu-vec
 	@for tb in $(UNIT_TB); do \
-	  name=$$(basename $$tb .sv); dut=$${name#tb_}; \
+	  name=$$(basename $$tb .sv); dut=$${name#tb_}; cdir=; vp=; \
 	  echo "== unit $$name"; \
 	  if [ -f $(RTL_DIR)/common/$$dut.sv ]; then src=$(ROOT)/$(RTL_DIR)/common/$$dut.sv; \
 	  elif [ -f $(RTL_DIR)/arith/$$dut.sv ]; then src="$(abspath $(ARITH_SV))"; \
+	  elif [ -f $(RTL_DIR)/core/$$dut.sv ]; then src="$(abspath $(ISA_PKG)) $(abspath $(CORE_SV)) $(abspath $(ARITH_SV))"; cdir=mxu; vp=../$$name; \
 	  else echo "unit: no RTL for $$name"; exit 1; fi; \
-	  (cd $(abspath $(BUILD))/arith && iverilog -g2012 -o $(abspath $(BUILD))/$$name $(ROOT)/$$tb $$src) 2>$(BUILD)/$$name.cmp; rc=$$?; \
+	  (cd $(abspath $(BUILD))/$${cdir:-arith} && iverilog -g2012 -o $(abspath $(BUILD))/$$name $(ROOT)/$$tb $$src) 2>$(BUILD)/$$name.cmp; rc=$$?; \
 	  grep -v "sorry: constant selects" $(BUILD)/$$name.cmp; [ $$rc -eq 0 ] || { echo "unit FAILED (compile): $$name"; exit 1; }; \
-	  (cd $(BUILD) && vvp -n $$name) 2>&1 | tee $(BUILD)/$$name.out; \
+	  (cd $(BUILD)/$${cdir:-.} && vvp -n $${vp:-$$name}) 2>&1 | tee $(BUILD)/$$name.out; \
 	  if grep -qE "Unable to open|Not enough words|Too many words" $(BUILD)/$$name.out; then \
 	    echo "unit FAILED (vector file missing, short or long): $$name"; exit 1; fi; \
 	  grep -q "^PASS" $(BUILD)/$$name.out || { echo "unit FAILED: $$name"; exit 1; }; \
