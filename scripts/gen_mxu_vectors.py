@@ -7,7 +7,14 @@ of the RTL: it applies the window mapping of the mxu_array header to a shadow ti
 a swap, and evaluates every wave with the exact reference of sw/npumodel/arith_ref.py (dot, then FP32 add, PE by PE down
 the column), with the flags of each PE row at the cycle the array reports them.
 
-Usage: gen_mxu_vectors.py [OUTDIR]   (default build/mxu)
+`tb_mxu` (whole instructions): every case is computed twice and the two must agree bit for bit (`build_top` raises
+otherwise): (1) the arith_ref PE chain per K tile + `acc_update` per ACC row (the way the RTL is built), and (2) the golden
+model `numerics.mxu_mm(A, W, mode, cs, acc, rowscale, dim=DIM)` on the logical A x W. The column scales are generated per
+fold tile (256 FP8 / 128 BF16 deep, mxu.md M-13) and the SPM image replicates each one for the `64 / DIM` MXU passes it covers.
+
+Usage: gen_mxu_vectors.py [--lock] [OUTDIR]   (default build/mxu)
+  --lock   after generating, (re)write scripts/mxu_vectors.lock (row count and SHA-256 of every file, scripts/mxu_lock.py).
+           Do this after an intended change of the generator, arith_ref.py, numerics.py or NumPy, and commit the lock.
 """
 import os
 import sys
@@ -17,8 +24,11 @@ import numpy as np
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "sw"))
 from npumodel import arith_ref as R  # noqa: E402
+from npumodel import numerics as nm  # noqa: E402
 
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "mxu")
+_ARGS = [a for a in sys.argv[1:] if a != "--lock"]
+WRITE_LOCK = "--lock" in sys.argv[1:]
+OUT = _ARGS[0] if _ARGS else os.path.join(ROOT, "build", "mxu")
 os.makedirs(OUT, exist_ok=True)
 RNG = np.random.default_rng(20261108)
 WL_WORDS = 128
@@ -261,6 +271,36 @@ def bf16_clean():
     return bf16_code(0)
 
 
+def f32_from_bits(words):
+    return np.array(words, dtype=np.uint32).view(np.float32).astype(np.float64)
+
+
+def golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc, acc_row):
+    """The ACC rows the arith_ref chain produced (`acc`) must equal numerics.mxu_mm(..., dim=dim) on the logical A x W
+    (bit for bit; any NaN equals any NaN: the two models may differ in the payload only)."""
+    fmt = nm.BF16 if bf16 else nm.E4M3
+    a = nm.decode(np.array(A, dtype=np.int64), fmt)
+    w = nm.decode(np.array(W, dtype=np.int64), fmt)
+    cs = f32_from_bits(cs_fold) if cs_fold is not None else None
+    init = f32_from_bits(acc_init) if accm else None
+    rs = f32_from_bits(rs_vals) if accm == 2 else None
+    y = nm.mxu_mm(a, w, "BF16" if bf16 else "FP8", cs=cs, acc=init, rowscale=rs, dim=dim).astype(np.float32).view(np.uint32)
+    NT = (N + dim - 1) // dim
+    bad = []
+    for j in range(NT):
+        for m in range(M):
+            for c in range(min(dim, N - j * dim)):
+                got, want = acc[acc_row + j * M + m][c], int(y[m, j * dim + c])
+                nan = lambda v: (v & 0x7F800000) == 0x7F800000 and (v & 0x007FFFFF) != 0
+                if got != want and not (nan(got) and nan(want)):
+                    bad.append((m, j * dim + c, got, want))
+    if bad:
+        m, n, got, want = bad[0]
+        raise AssertionError("dim %d %s accm %d M %d K %d N %d: arith_ref chain and numerics.mxu_mm differ at %d of %d outputs, "
+                             "first out[%d,%d] 0x%08X vs 0x%08X" % (dim, "BF16" if bf16 else "FP8", accm, M, K, N, len(bad),
+                                                                   M * N, m, n, got, want))
+
+
 def build_top(dim, decode_only=False):
     """A list of MXU_MM instructions on a DIM x DIM MXU with their SPM image, DTAB, initial / expected ACC and flags."""
     LB = dim
@@ -318,10 +358,14 @@ def build_top(dim, decode_only=False):
         kte = (2 if bf16 else 4) * dim
         KT = (K + kte - 1) // kte
         NT = (N + dim - 1) // dim
-        cs_vals = rs_vals = None
+        cs_vals = rs_vals = cs_fold = None
         cs_base = rs_base = 0
         if cs:
-            cs_vals = [[f32bits(2.0 ** int(RNG.integers(-3, 4)) * RNG.uniform(0.75, 1.25)) for _ in range(N)] for _ in range(KT)]
+            fold = (128 if bf16 else 256)                # the DMA's fold tile, the same in every config (M-13)
+            rep_ = fold // kte                          # = 64 / DIM MXU passes per scale row
+            cs_fold = [[f32bits(2.0 ** int(RNG.integers(-3, 4)) * RNG.uniform(0.75, 1.25)) for _ in range(N)]
+                       for _ in range((K + fold - 1) // fold)]
+            cs_vals = [cs_fold[t // rep_] for t in range(KT)]        # SPM image: each scale row replicated per MXU pass
             cs_base = alloc(4 * KT * N + LB)
             for t in range(KT):
                 for n in range(N):
@@ -331,6 +375,7 @@ def build_top(dim, decode_only=False):
             rs_base = alloc(4 * M + LB)
             for m in range(M):
                 spm[rs_base + 4 * m: rs_base + 4 * m + 4] = rs_vals[m].to_bytes(4, "little")
+        acc_init = [[acc[acc_row + (n // dim) * M + m][n % dim] for n in range(N)] for m in range(M)]
         # expected: per N tile j, K tile t in order
         for j in range(NT):
             nc = min(dim, N - j * dim)
@@ -352,6 +397,8 @@ def build_top(dim, decode_only=False):
                         y, _ = R.acc_update(acc[r][c], ps, rs_vals[m] if (rs and accm == 2) else 0,
                                             cs_vals[t][n] if cs else 0, accm == 2 and t == 0, bool(cs), accm == 0 and t == 0)
                         acc[r][c] = y
+        assert rs or accm != 2, "RESCALE needs a rowscale vector"
+        golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc, acc_row)
         regs = [a_base, w_base, acc_row, M if m_reg else 0, rs_base, cs_base]
         ins = (0x60 << 120) | (wsem << 114) | (ssem << 95) | (sinc << 91) | (1 << 86) | (a_td << 78) | (2 << 73) | (w_td << 65) | \
               (3 << 60) | ((4 if m_reg else 0) << 55) | ((5 if (rs and accm == 2) else 0) << 50) | ((6 if cs else 0) << 45) | \
@@ -368,9 +415,9 @@ def build_top(dim, decode_only=False):
         case(1, 8 * D, 2 * D, False, True, 0, False, False, 100, ssem=1, sinc=1)
         return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
                     sem=sem_cnt, spm_bytes=SPM)
-    case(5, 2 * 4 * D + 3 * D // 2, D + D // 2, False, True, 0, True, False, 0, ssem=1, sinc=1)           # FP8 trans OVERWRITE + cs, K 2.4 tiles
+    case(5, 256 + 6 * D + 3, D + D // 2, False, True, 0, True, False, 0, ssem=1, sinc=1)                   # FP8 trans OVERWRITE + cs, 2 fold tiles (2 scale rows)
     case(3, 4 * D, D, False, False, 1, False, False, 2, wsem=1, wval=1)                                     # FP8 non-trans ACCUM onto rows of #1
-    case(D // 4 + 1, 2 * D + 5, D + D // 4, True, True, 2, True, True, 0, ssem=2, sinc=3, pad_a=LB)                    # BF16 trans RESCALE + cs + rowscale
+    case(D // 4 + 1, 128 + 2 * D + 5, D + D // 4, True, True, 2, True, True, 0, ssem=2, sinc=3, pad_a=LB)             # BF16 trans RESCALE + cs + rowscale, 2 fold tiles
     case(2 * D + 3, D + 1, D, True, False, 0, False, False, 40)                                              # BF16 non-trans OVERWRITE, many rows
     case(1, 4 * D, 2 * D, False, True, 0, True, False, 100, pad_w=2 * LB)                                    # decode-like M = 1
     case(6, 5 * D + 1, D + 3, False, False, 1, False, False, 100, special=True, m_reg=True)                  # specials, M from register, ACCUM
@@ -503,6 +550,10 @@ def main():
     with open(os.path.join(OUT, "counts.svh"), "w") as fh:
         for n, c in counts:
             fh.write("`define CNT_%s %d\n" % (n, c))
+    if WRITE_LOCK:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import mxu_lock
+        mxu_lock.write(OUT)
 
 
 if __name__ == "__main__":

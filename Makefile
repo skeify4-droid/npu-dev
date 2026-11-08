@@ -80,9 +80,13 @@ $(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py scripts/arith_hand_cases.py 
 # anywhere else cannot shadow it. A testbench fails unless every vector file has exactly the row count of counts.svh (not
 # zero), and the simulator's warnings about a missing, short or long file (Unable to open, Not enough words, Too many
 # words) fail it too.
-# MXU test vectors (scripts/gen_mxu_vectors.py -> build/mxu, a few seconds).
+# MXU test vectors (scripts/gen_mxu_vectors.py -> build/mxu, a few seconds). The generator cross-checks its arith_ref
+# expectations against numerics.mxu_mm(dim=DIM) and fails when they differ. Then build/mxu must equal the committed lock
+# scripts/mxu_vectors.lock (rows and SHA-256 of every file, counts.svh included; scripts/mxu_lock.py). After an intended
+# change of the generator, arith_ref.py, numerics.py or NumPy: scripts/gen_mxu_vectors.py --lock, commit the lock.
 mxu-vec: $(BUILD)/mxu/.stamp
-$(BUILD)/mxu/.stamp: scripts/gen_mxu_vectors.py sw/npumodel/arith_ref.py
+	@$(PY) scripts/mxu_lock.py verify $(BUILD)/mxu
+$(BUILD)/mxu/.stamp: scripts/gen_mxu_vectors.py sw/npumodel/arith_ref.py sw/npumodel/numerics.py
 	$(PY) scripts/gen_mxu_vectors.py $(BUILD)/mxu >/dev/null && touch $@
 
 unit: $(BUILD) arith-vec mxu-vec

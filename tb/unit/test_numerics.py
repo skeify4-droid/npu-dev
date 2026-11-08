@@ -118,7 +118,8 @@ def test_fold_nvfp4_rounds_but_never_saturates():
     v, cs = nm.fold_e4m3(Wq / T)
     t = (Wq / T).reshape(64, 2, 256)
     assert np.all(np.max(np.abs(v.reshape(64, 2, 256)), -1) <= 448)
-    assert np.all(np.max(np.abs(t), -1) / cs > 224)            # c is the smallest exponent that fits
+    assert cs.shape == (2, 64)                                 # [K tiles, N], the ISA orientation (mxu.md M-12)
+    assert np.all(np.max(np.abs(t), -1) / cs.T > 224)          # c is the smallest exponent that fits
     err = np.linalg.norm(nm.unfold(v, cs) - Wq / T) / np.linalg.norm(Wq / T)
     assert 0 < err < 0.04
 
@@ -167,6 +168,87 @@ def test_mxu_semantics_and_order():
     p1 = nm.mxu_mm(A[:, 256:], W[256:])
     assert np.array_equal(y2, nm.f32(nm.f32(nm.f32(y * 3.0) + nm.f32(p0 * 0.5)) + nm.f32(p1 * 2.0)))
     assert np.max(np.abs(y - A @ W)) <= 4 * np.spacing(np.float32(np.max(np.abs(A @ W))))
+
+
+def _tiled_ref(A, W, rows, g, cs=None, cs_rep=1, acc=None, rs=None):
+    """Independent loop in float32: K tile = rows * g, chain of `rows` PEs from +0 per tile, tiles added in K order.
+    acc None = OVERWRITE; rs = RESCALE (ACC * rowscale first)."""
+    M, K = A.shape
+    acc = np.zeros((M, W.shape[1]), dtype=np.float32) if acc is None else np.asarray(acc, dtype=np.float32)
+    if rs is not None:
+        acc = (acc * np.asarray(rs, dtype=np.float32)[:, None]).astype(np.float32)
+    for t, k0 in enumerate(range(0, K, rows * g)):
+        p = np.zeros_like(acc)
+        for k in range(k0, min(k0 + rows * g, K), g):
+            p = (p + (A[:, k:k + g] @ W[k:k + g]).astype(np.float32)).astype(np.float32)
+        if cs is not None:
+            p = (p * cs[t // cs_rep].astype(np.float32)).astype(np.float32)
+        acc = (acc + p).astype(np.float32)
+    return acc
+
+
+def test_mxu_mm_order_depends_on_dim_review_s2():
+    """mxu_review.md S-2: M=4, K=64, N=8 FP8 (operands from the review, tb/unit/data/mxu_order_s2.npz as E4M3 codes).
+    One K tile of 16 PE rows (FULL) and two tiles of 8 rows (DIM 8) round differently; out[0,0] is 0xC7FA24B8 vs 0xC7FA24B9."""
+    d = np.load(os.path.join(os.path.dirname(__file__), "data", "mxu_order_s2.npz"))
+    A, W = nm.decode(d["A"], nm.E4M3), nm.decode(d["W"], nm.E4M3)
+    assert A.shape == (4, 64) and W.shape == (64, 8)
+    bits = lambda y: np.asarray(y, dtype=np.float32).view(np.uint32)
+    full, tiny, mid = (nm.mxu_mm(A, W, dim=n) for n in (64, 8, 16))
+    assert np.array_equal(bits(nm.mxu_mm(A, W)), bits(full))                 # FULL is the default
+    assert bits(full)[0, 0] == 0xC7FA24B8 and bits(tiny)[0, 0] == 0xC7FA24B9
+    assert int((bits(full) != bits(tiny)).sum()) == 15                       # 15 of the 32 outputs, as in the review
+    # DIM 16 has K tile 64 = the whole K here: same order as FULL
+    assert np.array_equal(bits(mid), bits(full))
+    for n, y in ((64, full), (8, tiny), (16, mid)):                          # and each one is the independent loop for its DIM
+        assert np.array_equal(bits(y), bits(_tiled_ref(A, W, n, 4)))
+
+
+@pytest.mark.parametrize("dim", [8, 16, 32, 64])
+@pytest.mark.parametrize("mode", ["FP8", "BF16"])
+def test_mxu_mm_dim_cs_rows_follow_the_fold_tile(dim, mode):
+    """M-13: the fold tile (256 FP8 / 128 BF16) is the same in every config, so pass t uses cs[t // (64 / dim)]."""
+    g, fmt = (4, nm.E4M3) if mode == "FP8" else (2, nm.BF16)
+    K, N = 64 * g * 2 + 3 * g, 5                                            # 2.05 fold tiles, ragged
+    A = nm.round_to(RNG.standard_normal((3, K)), fmt)
+    W = nm.round_to(RNG.standard_normal((K, N)) * 0.1, fmt)
+    cs = 2.0 ** RNG.integers(-3, 4, (3, N))
+    got = nm.mxu_mm(A, W, mode, cs=cs, dim=dim)
+    want = _tiled_ref(A, W, dim, g, cs=cs, cs_rep=64 // dim)
+    assert np.array_equal(np.asarray(got, dtype=np.float32).view(np.uint32), want.view(np.uint32))
+    with pytest.raises(ValueError):
+        nm.mxu_mm(A, W, mode, cs=cs[:2], dim=dim)                           # too few fold rows
+    # ACCUM / RESCALE compose with dim: acc + part, rowscale first
+    acc = nm.f32(RNG.standard_normal((3, N)))
+    rs = np.array([0.5, 1.5, 3.0])
+    y = nm.mxu_mm(A, W, mode, cs=cs, acc=acc, rowscale=rs, dim=dim)
+    want = _tiled_ref(A, W, dim, g, cs=cs, cs_rep=64 // dim, acc=acc, rs=rs)
+    assert np.array_equal(np.asarray(y, dtype=np.float32).view(np.uint32), want.view(np.uint32))
+
+
+def test_mxu_mm_rejects_bad_dim():
+    for bad in (0, 3, 128):
+        with pytest.raises(ValueError):
+            nm.mxu_mm(np.zeros((1, 8)), np.zeros((8, 1)), dim=bad)
+
+
+def test_fold_cs_orientation_is_the_isa_one():
+    """M-12: fold_e4m3 returns cs [K tiles, N] (what mxu_mm indexes cs[t] and the ISA stores as [KT x N]); unfold takes it back."""
+    N, K = 6, 512
+    W = RNG.standard_normal((N, K)) * 2.0 ** RNG.integers(-4, 4, (N, 1))     # a different scale per output row
+    v, cs = nm.fold_e4m3(W)
+    assert cs.shape == (K // 256, N)
+    for t in range(2):
+        for n in range(N):
+            amax = np.abs(W[n, t * 256:(t + 1) * 256]).max()
+            assert cs[t, n] == 2.0 ** int(nm.fold_exponent(amax))
+    assert np.array_equal(nm.unfold(v, cs).reshape(N, 2, 256), v.reshape(N, 2, 256) * cs.T[..., None])
+    # the consumer takes it unchanged: A x (folded W)^T with cs equals A x unfold(W)^T up to FP32 rounding, at FULL and at DIM 8
+    A = nm.round_to(RNG.standard_normal((3, K)), nm.E4M3)
+    ref = A @ nm.unfold(v, cs).T
+    for dim in (64, 8):
+        y = nm.mxu_mm(A, v.T, cs=cs, dim=dim)
+        assert np.max(np.abs(y - ref)) <= 1e-4 * np.max(np.abs(ref))
 
 
 def test_bf16x3_and_two_pass_hc_form():

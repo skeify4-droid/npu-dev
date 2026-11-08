@@ -1,6 +1,6 @@
 # MXU (`rtl/core/mxu*.sv`)
 
-Status: **Phase 3, 2026-11-08: built and verified at `DIM` 8, 16 and (one decode instruction) 32** (`mxu_array`, `mxu_wpack`, `mxu`; below). `BF16X3` is reserved in v1 (M-15); the formal properties pass to depth 56 (§6, bounded). **Spec status:** this document, isa.yaml, isa.md, memmap.md, numerics.md and microarch.md follow decisions M-10 .. M-18 (§8); the RTL, `tb_mxu`, `numerics.py` and `gen_mxu_vectors.py` do not yet (list at the end of §8). Inputs: [microarch.md](microarch.md) §2.2 and §5, [numerics.md](numerics.md) N-3,
+Status: **Phase 3, 2026-11-08: built and verified at `DIM` 8, 16 and (one decode instruction) 32** (`mxu_array`, `mxu_wpack`, `mxu`; below). `BF16X3` is reserved in v1 (M-15); the formal properties pass to depth 56 (§6, bounded). **Spec status:** this document, isa.yaml, isa.md, memmap.md, numerics.md and microarch.md follow decisions M-10 .. M-18 (§8); `numerics.py` (`mxu_mm` `dim`, `fold_e4m3` / `unfold` orientation) does since M-12 / M-13; the RTL, `tb_mxu` and the rest of `gen_mxu_vectors.py` do not yet (list at the end of §8). Inputs: [microarch.md](microarch.md) §2.2 and §5, [numerics.md](numerics.md) N-3,
 [arith.md](arith.md) "Integration contract" items 1-5, [isa.md](isa.md) §4-5 and `MXU_MM` in [isa_ref.md](isa_ref.md).
 Golden model: `numerics.mxu_mm` (the array and the ACC input together); `arith_ref` for the bit-exact PE chain.
 
@@ -211,9 +211,13 @@ elaboration below it.
 
 Bit-exactness: the array output equals `numerics.mxu_mm` for one K tile (`test_arith.py` ties `arith_ref`'s PE chain to it). The
 top-level test compares the ACC image after the `acc_update` lanes with the logical `A x W` evaluated tile by tile with `arith_ref`
-for the config's `DIM` (table above). It cannot compare with `numerics.mxu_mm` at `DIM` 8 / 16 while that model is FULL-only (review
-S-2): once `mxu_mm` takes `dim` (M-13) the expected image comes from `mxu_mm(A, W, mode, cs, acc, rowscale, dim=DIM)`. Tiles with an
-MX scale below 2^-126 are exempt (numerics.md N-8).
+for the config's `DIM` (table above). Since M-13 `numerics.mxu_mm` has a `dim` parameter, and `scripts/gen_mxu_vectors.py` computes every
+`tb_mxu` case twice, with the `arith_ref` chain + `acc_update` and with `mxu_mm(A, W, mode, cs, acc, rowscale, dim=DIM)`, and fails
+unless the two ACC images are bit-identical (NaN payloads aside). The column scales are generated per fold tile (256 FP8 / 128 BF16)
+and the SPM image replicates each one for the `64 / DIM` passes it covers; two cases span two fold tiles. The S-2 example is
+`test_mxu_mm_order_depends_on_dim_review_s2` (`test_numerics.py`). `scripts/mxu_vectors.lock` holds the row count and SHA-256 of every
+`build/mxu` file (`scripts/mxu_lock.py`, checked by `make mxu-vec` and so `make unit`; after an intended change of the generator,
+`arith_ref.py`, `numerics.py` or NumPy: `scripts/gen_mxu_vectors.py --lock`). Tiles with an MX scale below 2^-126 are exempt (numerics.md N-8).
 
 ## 7. Performance (estimates; `tb_mxu` measures them)
 
@@ -273,9 +277,8 @@ Decisions M-10 .. M-17 were taken 2026-11-08, answering review part S (S-1 .. S-
 isa.md §4-8, memmap.md §4 / §7, numerics.md N-2 / N-3 / N-8 / D1, microarch.md §2.2 / §2.3 / §4 / §5 / §6, this document (S-13).
 **Still old** and to follow these rows: `rtl/core/mxu*.sv` (alignment by `LB` instead of 64 B, the `4·N` rule, `M = 0` and
 `R[m_reg]` width, mode / reserved bits / `rs_reg` checks, fault priority and 64-bit `fault_addr`, `cs` row pitch `CSP` and row
-`t >> log2 R`; the shim `mxu_spm_shim` does not exist), `tb_mxu` (29 illegal cases, the `4·N` case), `tb/formal/mxu.sby` (re-run after
-the `M = 0` change), `sw/npumodel/numerics.py` (`mxu_mm` `dim`, `fold_e4m3` / `unfold` / `cvt_source_check` orientation) with
-`test_arith.py` / `test_numerics.py` and the generated `numerics_experiments.md`, `scripts/gen_mxu_vectors.py`, `core/seq` (`fault_in`,
+`t >> log2 R`; the shim `mxu_spm_shim` does not exist), `tb_mxu` (29 illegal cases, the `4·N` case; the `cs` image keeps the `4·N` pitch and one row per pass), `tb/formal/mxu.sby` (re-run after
+the `M = 0` change), `core/seq` (`fault_in`,
 `eng_stop`), `core/spm`, and `docs/reports/status.md` (line 191 "the MXU is never the decode bottleneck"). Review items not decided
 here: S-10 (`RANGE` on operand extents), S-12 (DTAB / prefetch ordering wording). S-11 is decided by M-19 ([acc.md](acc.md); the RTL list is acc.md §10, not yet done).
 

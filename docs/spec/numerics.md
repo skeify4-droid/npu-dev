@@ -111,7 +111,7 @@ blocks; the last tile may be shorter):
    written `0x7F` with `NAN_IN`). The DMA engine drops the written value and the flags of those positions.
 2. Choose `c`, the smallest integer with `amax ≤ 448 · 2^c` (`c = 0` for an all-zero tile).
 3. Write the elements `v = RNE_E4M3(w · 2^-c)` with `sat`. Because of step 2 it never saturates.
-4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). The array is `[K tiles, N]` (`r` is the column `n`), the orientation of `mxu_mm` and the ISA (review finding S-1; the golden `fold_e4m3` and `unfold` still use `[N, K tiles]` and change to this orientation, mxu.md M-12). `fold_c` (`rtl/arith`) produces
+4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). The array is `[K tiles, N]` (`r` is the column `n`), the orientation of `mxu_mm` and the ISA (review finding S-1; the golden `fold_e4m3` returns it and `unfold` takes it, mxu.md M-12). `fold_c` (`rtl/arith`) produces
    `2^c`.
    - **NVFP4:** the DMA engine multiplies it by `R[ts_reg]` with one `fp32_mul` (RNE, DAZ/FTZ) and ORs that multiply's flags
      into `FP_STATUS` (OVERFLOW for a huge `T`, NAN_IN for a NaN `T`). The operand is named in isa.md §5; the multiply, its

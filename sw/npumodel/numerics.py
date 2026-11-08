@@ -236,44 +236,57 @@ def fold_exponent(amax) -> np.ndarray:
 
 def fold_e4m3(w_exact, ktile: int = KTILE_FP8):
     """Fold block-scaled weights (exact values, tensor scale excluded) into E4M3 + one FP32 power-of-two column
-    scale per (row, K tile). w_exact: [N, K] (HF [out, in] layout). Returns (E4M3 values [N, K], cs [N, K/ktile])."""
+    scale per (K tile, column). w_exact: [N, K] (HF [out, in] layout). Returns (E4M3 values [N, K], cs [K/ktile, N]):
+    cs is in the orientation of the ISA and of `mxu_mm` (mxu.md M-11 / M-12): row t = K tile, column n = destination row."""
     t = _blocks(w_exact, ktile)
     a = np.abs(t)
     c = fold_exponent(np.max(np.where(np.isnan(a), 0.0, a), axis=-1))     # NaN elements do not take part in amax (N-2)
     v = round_to(t / np.ldexp(1.0, c)[..., None], E4M3, sat=True)             # and stay NaN (code 0x7F)
-    return v.reshape(np.shape(w_exact)), np.ldexp(1.0, c)
+    return v.reshape(np.shape(w_exact)), np.ldexp(1.0, c).T                  # c is [N, KT]; the ISA array is [KT, N]
 
 
 def unfold(v, cs, ktile: int = KTILE_FP8):
-    return (_blocks(v, ktile) * cs[..., None]).reshape(np.shape(v))
+    """Inverse of `fold_e4m3` (cs [K/ktile, N])."""
+    return (_blocks(v, ktile) * np.asarray(cs).T[..., None]).reshape(np.shape(v))
 
 
 # ------------------------------------------------------------------ MXU, numerics.md N-3
-def mxu_mm(A, W, mode: str = "FP8", cs=None, acc=None, rowscale=None):
-    """ACC (+)= A x W with the PE accumulation order of the weight-stationary array.
+def mxu_mm(A, W, mode: str = "FP8", cs=None, acc=None, rowscale=None, dim: int = 64):
+    """ACC (+)= A x W with the PE accumulation order of the weight-stationary array of `dim` x `dim` PEs (mxu.md M-13).
 
     A: [M, K] on the E4M3 (mode FP8) or BF16 grid. W: [K, N] on the same grid. cs: FP32 column scales
-    [K tiles, N] or None. acc: existing ACC [M, N] (FP32 values) or None (OVERWRITE). rowscale: [M] (RESCALE).
-    Per K tile: the partial sum enters the top PE as +0 and flows down 64 PE rows; each PE adds the exact sum of
-    its g products (g = 4 FP8 or 2 BF16), rounded once to FP32, to the incoming partial (FP32 add, RNE).
-    The tile partial is multiplied by its column scale (FP32) and added to ACC (FP32). All FP32 results FTZ.
+    [fold K tiles, N] or None. acc: existing ACC [M, N] (FP32 values) or None (OVERWRITE). rowscale: [M] (RESCALE).
+    Per K tile (g*dim deep, g = 4 FP8 or 2 BF16 elements per PE): the partial sum enters the top PE as +0 and flows
+    down `dim` PE rows; each PE adds the exact sum of its g products, rounded once to FP32, to the incoming partial
+    (FP32 add, RNE). The tile partial is multiplied by its column scale (FP32) and added to ACC (FP32). All FP32
+    results FTZ. `dim` = 64 is FULL. The DMA fold tile is 64*g deep in every config (256 FP8 / 128 BF16), so with
+    R = 64 / dim the pass t of the MXU uses the scale row cs[t // R]. Results are bit-exact per `dim`: a smaller array
+    adds more tile partials in the ACC and rounds differently (review S-2).
     """
+    if dim < 1 or 64 % dim:
+        raise ValueError(f"dim must divide 64, got {dim}")
     A = np.asarray(A, dtype=np.float64)
     W = np.asarray(W, dtype=np.float64)
     M, K = A.shape
     N = W.shape[1]
     g = 4 if mode == "FP8" else 2
-    kt = 64 * g
+    kt = dim * g
+    R = 64 // dim
     out = np.zeros((M, N)) if acc is None else np.asarray(acc, dtype=np.float64).copy()
     if rowscale is not None:
         out = f32(out * np.asarray(rowscale, dtype=np.float64)[:, None])
+    if cs is not None:
+        cs = np.asarray(cs, dtype=np.float64)
+        need = -(-K // (64 * g))
+        if cs.ndim != 2 or cs.shape[1] != N or cs.shape[0] < need:
+            raise ValueError(f"cs must be [>= {need} fold K tiles, {N}], got {cs.shape}")
     for t, k0 in enumerate(range(0, K, kt)):
         part = np.zeros((M, N))
         for k in range(k0, min(k0 + kt, K), g):
             s = A[:, k:k + g] @ W[k:k + g, :]      # exact in float64 for E4M3 / BF16 products (see tests)
             part = f32(part + f32(s))
         if cs is not None:
-            part = f32(part * np.asarray(cs, dtype=np.float64)[t][None, :])
+            part = f32(part * cs[t // R][None, :])
         out = f32(out + part)
     return out
 

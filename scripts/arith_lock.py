@@ -49,12 +49,12 @@ def read_lock(path=LOCK):
     return lock
 
 
-def write_lock(d=DEFAULT_DIR, path=LOCK):
+def write_lock(d=DEFAULT_DIR, path=LOCK, header=HEADER):
     cur = scan(d)
     if not cur or "counts.svh" not in cur or any(r < 1 for r, _ in cur.values()):
         sys.exit(f"arith_lock: refusing to lock {d}: empty, no counts.svh, or a file with zero rows")
     with open(path, "w") as f:
-        f.write(HEADER)
+        f.write(header)
         for name, (rows, sha) in cur.items():
             f.write(f"{name} {rows} {sha}\n")
     print(f"arith_lock: wrote {os.path.relpath(path, ROOT)}: {len(cur)} files, {sum(r for n, (r, _) in cur.items() if n != 'counts.svh')} rows")
