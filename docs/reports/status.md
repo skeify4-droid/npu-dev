@@ -1105,9 +1105,10 @@ stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv
 - `mxu_array`: 8 x 8 and 16 x 16 against an independent model on `arith_ref`: bit-exact y, flags every cycle, `swap_tap` timing per buffer and group; 17 mutants, all killed.
 - `mxu`: 6 instructions per size on DIM 8 and 16, with and without grant stalls: the whole ACC image is bit-exact against the logical `A x W`; 29 illegal
   instructions raise the right cause; one 32 x 32 decode instruction is bit-exact and checks the tile period; a long-A-stall run (the loader runs ahead of the swap) exercises the buffer interlock; 21 mutants of `mxu.sv` / `mxu_wpack.sv`: 17 killed, 4 equivalent. Lint clean at DIM 8, 16, 32, 64.
+- 2026-11-08, RTL follows the MXU decisions M-10 .. M-18 (review S-1, S-7, S-9, S-10): 64 B alignment in every config, no `4N` rule, `M = 0` completes in order, reserved / undefined word fields fault, 64-bit `FAULT_ADDR` with the M-18 priority, `cs` row pitch `CSP` and row `t >> log2 R`, `RANGE` on operand extents. `tb_mxu`: 13 instructions per size and 72 illegal ones with their addresses; `make lint`, `make unit` and `mxu.sby` (all four tasks) pass; `scripts/mxu_mutants` (66 mutants, new set): see mxu.md §6. Still open: `core/seq` `fault_in`, `core/spm` shim, `core/acc` stream (acc.md §10).
 
 ### Findings
-- Spec gap: the column-scale array `[KT x N]` is lane-aligned only if `4N % LB == 0`; now a legality rule (`ILLEGAL_FIELD`), and the DMA must pad `N`.
+- Spec gap (closed 2026-11-08, mxu.md M-11): the column-scale array `[KT x N]` was lane-aligned only if `4N % LB == 0` (a legality rule and "the DMA must pad `N`"); the array now has the derived row pitch `CSP = roundup(4N, 64)` and the rule is deleted.
 - Bug found by the 16 x 16 run: the second beat of a group waited for the group's own `free` flag (deadlock for `DIM >= 16`); fixed.
 - **Performance, against my own estimate:** with one shadow buffer the tile period at M = 1 was 25 cycles at DIM 16 (1.25·DIM + 9, about 80 for `FULL`), not 32-40:
   the next pass waited for all four groups, the last of which is free `DIM - 1` cycles after the swap. Decision (user): a second shadow buffer (mxu.md M-9).

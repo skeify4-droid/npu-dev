@@ -14,8 +14,7 @@
 module mxu_dec #(
   parameter int DIM       = 8,
   parameter int ACC_ROWS  = 2048,
-  parameter int SPM_BYTES = 4194304,
-  localparam int LB       = DIM
+  parameter int SPM_BYTES = 4194304
 ) (
   input  logic                clk,
   input  logic                rst_n,
@@ -32,19 +31,21 @@ module mxu_dec #(
   input  logic                dtab_rvalid,
   input  logic [255:0]        dtab_data,
   input  logic                inf_room,
+  input  logic                inf_empty,
   input  logic                ctx_ready,
   output logic                ctx_push,
+  output logic                z_inc,
   output logic [9:0]          ctx_sync,
   output logic                c_trans,
   output logic                c_bf16,
   output logic                c_cs_en,
   output logic [1:0]          c_accm,
   output logic [15:0]         c_K, c_M, c_N, c_KT, c_NT,
-  output logic [21:0]         c_a_base, c_a_pitch, c_w_base, c_w_pitch, c_cs_base, c_rs_base,
+  output logic [21:0]         c_a_base, c_a_pitch, c_w_base, c_w_pitch, c_cs_base, c_rs_base, c_csp,
   output logic [10:0]         c_acc_base,
   output logic                fault_valid,
   output logic [3:0]          fault_cause,
-  output logic [31:0]         fault_addr
+  output logic [63:0]         fault_addr
 );
   (* anyseq *) wire        f_push;
   (* anyseq *) wire        f_trans, f_bf16, f_cs;
@@ -70,18 +71,19 @@ module mxu_dec #(
   assign dtab_idx = 8'd0;
   assign fault_valid = 1'b0;
   assign fault_cause = 4'd0;
-  assign fault_addr = 32'd0;
+  assign fault_addr = 64'd0;
+  assign z_inc = 1'b0;                              // the stub decoder never makes an M = 0 instruction (M >= 1 above)
   assign ctx_push = ctx_ready && f_push;
 
   always @(posedge clk) if (ctx_push) begin
     c_trans <= f_trans; c_bf16 <= f_bf16; c_cs_en <= f_cs; c_accm <= f_accm;
     c_K <= f_Kx; c_M <= {14'd0, f_M}; c_N <= f_Nx; c_KT <= {14'd0, f_KT}; c_NT <= {14'd0, f_NT};
-    c_a_base <= f_addr; c_a_pitch <= f_addr; c_w_base <= f_addr; c_w_pitch <= f_addr; c_cs_base <= f_addr; c_rs_base <= f_addr;
+    c_a_base <= f_addr; c_a_pitch <= f_addr; c_w_base <= f_addr; c_w_pitch <= f_addr; c_cs_base <= f_addr; c_rs_base <= f_addr; c_csp <= f_addr;
     c_acc_base <= {6'd0, f_acc};
   end
   assign ctx_sync = f_sync;
   initial begin c_M = 16'd0; c_KT = 16'd0; c_NT = 16'd0; c_acc_base = 11'd0; end   // constant upper bits for the solver
 
   logic unused;
-  assign unused = &{1'b0, clk, rst_n, q_valid, q_instr, q_regs, q_wval, sem_rd_val, dtab_gnt, dtab_rvalid, dtab_data, inf_room, SPM_BYTES[0], LB[0]};
+  assign unused = &{1'b0, clk, rst_n, q_valid, q_instr, q_regs, q_wval, sem_rd_val, dtab_gnt, dtab_rvalid, dtab_data, inf_room, inf_empty, SPM_BYTES[0], DIM[0], ACC_ROWS[0]};
 endmodule

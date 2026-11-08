@@ -3,7 +3,8 @@
 // the A stream (a_rd) into mxu_array, rowscale prefetch, and the ACC input stream with completion.
 //
 // Everything on the SPM side has a fixed response latency SPM_LAT after the grant and is never back-pressured.
-// Lane width LB = DIM bytes. `mode = BF16X3` is not implemented (ILLEGAL_FIELD, mxu.md 9).
+// Lane width LB = DIM bytes (DIM = 8, 16, 32 or 64). Legality, FAULT_ADDR and M = 0 follow mxu.md 4.1 (M-10 .. M-18);
+// `mode = BF16X3` is reserved in v1 (ILLEGAL_FIELD, M-15).
 // The ACC (core/acc) accepts one row per cycle (`acc_valid`, no ready) and pulses `acc_done` when the write of the row that
 // carried `acc_last` is visible; spacing of two updates of the same ACC row is at least ACC_LAT cycles (mxu.md 4.4).
 module mxu #(
@@ -20,6 +21,7 @@ module mxu #(
   localparam int KB       = 4 * DIM,
   localparam int NCW      = $clog2(DIM + 1),
   localparam int META_W   = 24,
+  localparam int CS_SHIFT = 6 - $clog2(DIM),          // log2(64 / DIM): MXU passes per scale row
   localparam int RS_DEPTH = (2 * SPM_LAT + DIM + 6) / GRP + 3,
   localparam int NIDX     = (DIM / 8 > GRP / 2) ? DIM / 8 : GRP / 2,
   localparam int IDXW     = (NIDX > 1) ? $clog2(NIDX) : 1
@@ -72,7 +74,7 @@ module mxu #(
   output logic [3:0]          fp_flags,
   output logic                fault_valid,
   output logic [3:0]          fault_cause,
-  output logic [31:0]         fault_addr
+  output logic [63:0]         fault_addr
 );
   // ================================================================== D: queue head, TDs, checks (mxu_dec)
   typedef enum logic [2:0] {L_IDLE, L_CALC, L_RUN, L_PUSH} lstate_t;
@@ -89,17 +91,18 @@ module mxu #(
   logic        c_trans, c_bf16, c_cs_en;
   logic [1:0]  c_accm;
   logic [15:0] c_K, c_M, c_N, c_KT, c_NT;
-  logic [21:0] c_a_base, c_a_pitch, c_w_base, c_w_pitch, c_cs_base, c_rs_base;
+  logic [21:0] c_a_base, c_a_pitch, c_w_base, c_w_pitch, c_cs_base, c_rs_base, c_csp;
   logic [10:0] c_acc_base;
   logic [9:0]  ctx_sync;
+  logic        z_inc;                   // an M = 0 instruction completes (mxu_dec: only with nothing in flight)
 
   assign ctx_ready = !ctx_v && (lst == L_IDLE);
   mxu_dec #(.DIM(DIM), .ACC_ROWS(ACC_ROWS), .SPM_BYTES(SPM_BYTES)) u_dec (
     .clk, .rst_n, .q_valid, .q_ready, .q_instr, .q_regs, .q_wval, .sem_rd_idx, .sem_rd_val,
     .dtab_req, .dtab_idx, .dtab_gnt, .dtab_rvalid, .dtab_data,
-    .inf_room(inf_cnt < 3'd4), .ctx_ready, .ctx_push(inf_push), .ctx_sync,
+    .inf_room(inf_cnt < 3'd4), .inf_empty(inf_cnt == 3'd0), .ctx_ready, .ctx_push(inf_push), .z_inc, .ctx_sync,
     .c_trans, .c_bf16, .c_cs_en, .c_accm, .c_K, .c_M, .c_N, .c_KT, .c_NT,
-    .c_a_base, .c_a_pitch, .c_w_base, .c_w_pitch, .c_cs_base, .c_rs_base, .c_acc_base,
+    .c_a_base, .c_a_pitch, .c_w_base, .c_w_pitch, .c_cs_base, .c_rs_base, .c_csp, .c_acc_base,
     .fault_valid, .fault_cause, .fault_addr);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) ctx_v <= 1'b0;
@@ -122,9 +125,13 @@ module mxu #(
   end
   logic [9:0] inf_head;
   assign inf_head = inf_mem[inf_rd];
-  assign sem_inc_valid = acc_done && (inf_cnt != 3'd0) && (inf_head[9:4] != 6'd0) && (inf_head[3:0] != 4'd0);
-  assign sem_inc_idx   = inf_head[9:4];
-  assign sem_inc_amt   = inf_head[3:0];
+  // completion: acc_done retires the head of the FIFO; an M = 0 instruction retires itself (z_inc) while the FIFO is empty, so
+  // the two never coincide (an acc_done with an empty FIFO is ignored)
+  logic [9:0] sem_inc_w;
+  assign sem_inc_w     = z_inc ? ctx_sync : inf_head;
+  assign sem_inc_valid = ((acc_done && (inf_cnt != 3'd0)) || z_inc) && (sem_inc_w[9:4] != 6'd0) && (sem_inc_w[3:0] != 4'd0);
+  assign sem_inc_idx   = sem_inc_w[9:4];
+  assign sem_inc_amt   = sem_inc_w[3:0];
 
   // ================================================================== scale port arbiter and tags
   logic        rs_want, cs_want;
@@ -343,7 +350,8 @@ module mxu #(
     t_kb = 9'(((ctx_Kbytes - 64'(l_t) * 64'(KB)) > 64'(KB)) ? 64'(KB) : (ctx_Kbytes - 64'(l_t) * 64'(KB)));
     t_ncols = 8'((64'(c_N) - 64'(l_j) * 64'(DIM)) > 64'(DIM) ? 64'(DIM) : (64'(c_N) - 64'(l_j) * 64'(DIM)));
     t_w_base = c_trans ? 22'(64'(c_w_base) + 64'(l_j) * 64'(DIM) * 64'(c_w_pitch) + 64'(l_t) * 64'(KB)) : c_w_base;
-    t_cs_addr = 22'(64'(c_cs_base) + 64'd4 * (64'(l_t) * 64'(c_N) + 64'(DIM) * 64'(l_j)));
+    // scale row of pass t: t >> log2(64 / DIM) (the scale rows are per fold tile, M-13), pitch CSP (M-11); column tile j: 4 DIM B
+    t_cs_addr = 22'(64'(c_cs_base) + 64'(c_csp) * (64'(l_t) >> CS_SHIFT) + 64'd4 * 64'(DIM) * 64'(l_j));
     t_cs_en = c_cs_en;
   end
 

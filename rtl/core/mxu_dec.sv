@@ -1,11 +1,12 @@
-// mxu_dec: queue head, wait, DTAB reads and the legality checks of MXU_MM (docs/spec/mxu.md 4.1, 5). Hands a checked
-// context (c_*) to the load FSM of `mxu` when `ctx_ready`; raises `fault_*` instead and stops for an illegal instruction.
+// mxu_dec: queue head, wait, DTAB reads and the legality checks of MXU_MM (docs/spec/mxu.md 4.1, 5; decisions M-10 .. M-18).
+// Hands a checked context (c_*) to the load FSM of `mxu` when `ctx_ready`; raises `fault_*` instead and stops for an illegal
+// instruction. An instruction with M = 0 passes every check, reads and writes nothing, and completes (`z_inc`, with `ctx_sync`)
+// once nothing is in flight, i.e. in order after the earlier instructions' acc_done.
 // A separate module so that the control of `mxu` can be proved without these 64-bit address computations (tb/formal/mxu.sby).
 module mxu_dec #(
   parameter int DIM       = 8,
   parameter int ACC_ROWS  = 2048,
-  parameter int SPM_BYTES = 4194304,
-  localparam int LB       = DIM
+  parameter int SPM_BYTES = 4194304
 ) (
   input  logic                clk,
   input  logic                rst_n,
@@ -22,19 +23,22 @@ module mxu_dec #(
   input  logic                dtab_rvalid,
   input  logic [255:0]        dtab_data,
   input  logic                inf_room,      // the in-flight instruction FIFO has room
+  input  logic                inf_empty,     // the in-flight instruction FIFO is empty
   input  logic                ctx_ready,     // the load FSM is idle and holds no context
   output logic                ctx_push,      // one cycle: c_* are written, the instruction is in flight
-  output logic [9:0]          ctx_sync,      // {ssem, sinc} of the instruction (valid with ctx_push)
+  output logic                z_inc,         // one cycle: an M = 0 instruction completes; sem_inc {ssem, sinc} = ctx_sync
+  output logic [9:0]          ctx_sync,      // {ssem, sinc} of the instruction (valid with ctx_push and z_inc)
   output logic                c_trans,
   output logic                c_bf16,
   output logic                c_cs_en,
   output logic [1:0]          c_accm,
   output logic [15:0]         c_K, c_M, c_N, c_KT, c_NT,
   output logic [21:0]         c_a_base, c_a_pitch, c_w_base, c_w_pitch, c_cs_base, c_rs_base,
+  output logic [21:0]         c_csp,         // row pitch of the column-scale array, roundup(4 N, 64) bytes (M-11)
   output logic [10:0]         c_acc_base,
   output logic                fault_valid,
   output logic [3:0]          fault_cause,
-  output logic [31:0]         fault_addr
+  output logic [63:0]         fault_addr
 );
   import isa_pkg::*;
 
@@ -87,42 +91,82 @@ module mxu_dec #(
   assign rs_en   = ins[T_MXU_RS_REG_MSB:T_MXU_RS_REG_LSB] != 5'd0;
   assign m_en    = ins[T_MXU_M_REG_MSB:T_MXU_M_REG_LSB] != 5'd0;
 
-  // derived values (64-bit arithmetic: nothing wraps)
+  // ---- derived values. 96-bit arithmetic for the extents: 64-bit register + 2^64 rows x 2^31 pitch cannot wrap.
   logic        fp8, bf16;
-  logic [63:0] vK, vM, vN, vKw, vNT, vKT, vKTE, veb;
-  logic [63:0] a_ext, w_ext, cs_ext, rs_ext;
-  logic        bad_op, bad_space, bad_field, bad_range;
-  logic [31:0] bad_addr;
+  logic [63:0] vK, vM, vN, vKw, vNT, vKTE, veb, vKF, vKTF, vCSP;
+  logic [15:0] vKT;                                  // K <= 65535 and a K tile has at least 16 elements
+  logic [95:0] a_ext, w_ext, cs_ext, rs_ext;          // end (exclusive) of the bytes of each operand
+  logic        m_zero;
+  assign m_zero = (vM == 64'd0);
+  // M-18 order: word fields, TD_SPACE (A, W), descriptor rows (no address), alignment (A, W, s1 A, s1 W, cs, rs), RANGE (ACC, A, W, cs, rs)
+  logic        bad_op, f_word, f_sp_a, f_sp_w, f_desc, f_al_a, f_al_w, f_al_sa, f_al_sw, f_al_cs, f_al_rs;
+  logic        f_r_acc, f_r_a, f_r_w, f_r_cs, f_r_rs;
+  logic        bad_any;
+  logic [3:0]  bad_cause;
+  logic [63:0] bad_addr;
   always_comb begin
     fp8  = (a_dt == 5'(DTYPE_E4M3)) && (w_dt == 5'(DTYPE_E4M3));
     bf16 = (a_dt == 5'(DTYPE_BF16)) && (w_dt == 5'(DTYPE_BF16));
     veb  = bf16 ? 64'd2 : 64'd1;
     vK   = 64'(a_n0);
-    vM   = m_en ? r_m : 64'(a_n1);
+    vM   = m_en ? r_m : 64'(a_n1);               // R[m_reg] as a 64-bit unsigned number, compared in full (M-14)
     vKw  = i_trans ? 64'(w_n0) : 64'(w_n1);
     vN   = i_trans ? 64'(w_n1) : 64'(w_n0);
     vNT  = (vN + 64'(DIM) - 64'd1) / 64'(DIM);
     vKTE = bf16 ? 64'(2 * DIM) : 64'(4 * DIM);
-    vKT  = (vK + vKTE - 64'd1) / vKTE;
-    a_ext  = r_a + (vM - 64'd1) * 64'(a_s1) + vK * veb;
-    w_ext  = i_trans ? (r_w + (vN - 64'd1) * 64'(w_s1) + vK * veb) : (r_w + (vK - 64'd1) * 64'(w_s1) + vN * veb);
-    cs_ext = r_cs + 64'd4 * vKT * vN;
-    rs_ext = r_rs + 64'd4 * vM;
-    bad_op    = ins[127:120] != OP_MXU_MM;
-    bad_space = (a_sp != SPACE_SPM) || (w_sp != SPACE_SPM);
-    bad_field = !(fp8 || bf16) || (i_mode != 3'd0) || (i_accm == 2'd3) || (i_accm == 2'd2 && !rs_en) ||
-                (a_fl != 8'd0) || (w_fl != 8'd0) || (a_n2 != 16'd1) || (a_n3 != 16'd1) || (w_n2 != 16'd1) || (w_n3 != 16'd1) ||
-                (vK != vKw) || (vK == 64'd0) || (vN == 64'd0) || (vM == 64'd0) ||
-                a_s1[31] || w_s1[31] ||
-                ((r_a % 64'(LB)) != 0) || ((r_w % 64'(LB)) != 0) || ((64'(a_s1) % 64'(LB)) != 0) || ((64'(w_s1) % 64'(LB)) != 0) ||
-                (cs_en && (((r_cs % 64'(LB)) != 0) || ((64'd4 * vN) % 64'(LB) != 0))) || (rs_en && ((r_rs % 64'(LB)) != 0));
-    bad_range = (vM > 64'(ACC_ROWS)) || (r_acc + vNT * vM > 64'(ACC_ROWS)) || (r_a >= 64'(SPM_BYTES)) || (r_w >= 64'(SPM_BYTES)) ||
-                (a_ext > 64'(SPM_BYTES)) || (w_ext > 64'(SPM_BYTES)) || (cs_en && (cs_ext > 64'(SPM_BYTES))) ||
-                (rs_en && (i_accm == 2'd2) && (rs_ext > 64'(SPM_BYTES)));
-    bad_addr  = (r_acc + vNT * vM > 64'(ACC_ROWS) || vM > 64'(ACC_ROWS)) ? 32'(r_acc) :
-                (a_ext > 64'(SPM_BYTES) || r_a >= 64'(SPM_BYTES)) ? 32'(r_a) :
-                (w_ext > 64'(SPM_BYTES) || r_w >= 64'(SPM_BYTES)) ? 32'(r_w) :
-                (cs_en && cs_ext > 64'(SPM_BYTES)) ? 32'(r_cs) : 32'(r_rs);
+    vKT  = 16'((vK + vKTE - 64'd1) / vKTE);      // K tiles (passes) of the MXU
+    vKF  = bf16 ? 64'd128 : 64'd256;             // fold tile of the column scales, the same in every config (M-13)
+    vKTF = (vK + vKF - 64'd1) / vKF;             // rows of the column-scale array
+    vCSP = ((64'd4 * vN + 64'd63) / 64'd64) * 64'd64;
+    a_ext  = 96'(r_a) + 96'(vM - 64'd1) * 96'(a_s1) + 96'(vK * veb);
+    w_ext  = i_trans ? (96'(r_w) + 96'(vN - 64'd1) * 96'(w_s1) + 96'(vK * veb)) : (96'(r_w) + 96'(vK - 64'd1) * 96'(w_s1) + 96'(vN * veb));
+    cs_ext = 96'(r_cs) + 96'(vKTF - 64'd1) * 96'(vCSP) + 96'(64'd4 * vN);
+    rs_ext = 96'(r_rs) + 96'(64'd4) * 96'(vM);
+
+    bad_op  = ins[127:120] != OP_MXU_MM;
+    f_word  = (ins[38:0] != 39'd0) || (i_mode != 3'd0) || (i_accm == 2'd3) || (i_accm == 2'd2 ? !rs_en : rs_en);
+    f_sp_a  = (a_sp != SPACE_SPM);
+    f_sp_w  = (w_sp != SPACE_SPM);
+    f_desc  = !(fp8 || bf16) || (a_fl != 8'd0) || (w_fl != 8'd0) || (a_n2 != 16'd1) || (a_n3 != 16'd1) || (w_n2 != 16'd1) || (w_n3 != 16'd1) ||
+              (vK == 64'd0) || (vK != vKw) || (vN == 64'd0);
+    // 64 B in every config (the SPM bank width, M-10); N has no rule (M-11); a negative s1 is an alignment fault of that s1
+    f_al_a  = (r_a[5:0] != 6'd0);
+    f_al_w  = (r_w[5:0] != 6'd0);
+    f_al_sa = a_s1[31] || (a_s1[5:0] != 6'd0);
+    f_al_sw = w_s1[31] || (w_s1[5:0] != 6'd0);
+    f_al_cs = cs_en && (r_cs[5:0] != 6'd0);
+    f_al_rs = rs_en && (r_rs[5:0] != 6'd0);
+    // RANGE: the ACC rows first (R[acc_reg] + NT M in 64 bits without a wrap: each term is compared before the sum is trusted),
+    // then the operand extents (review S-10): the bytes an operand has, not the lanes the MXU reads. An operand with no bytes
+    // (A and the rowscale of an M = 0 instruction) cannot be out of range. Lanes the MXU reads past an extent are discarded: they
+    // stay inside the 64 B granule of the extent, except the cs window (4 DIM B, DIM >= 32) and the BF16 non-trans window
+    // (2 DIM B, DIM = 64), which wrap in the 22-bit SPM address (mxu.md 4.1).
+    f_r_acc = (r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || (r_acc + vNT * vM > 64'(ACC_ROWS));
+    f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));
+    f_r_w   = (w_ext > 96'(SPM_BYTES));
+    f_r_cs  = cs_en && (cs_ext > 96'(SPM_BYTES));
+    f_r_rs  = rs_en && !m_zero && (rs_ext > 96'(SPM_BYTES));
+
+    bad_any   = 1'b1;
+    bad_cause = FAULT_CAUSE_ILLEGAL_FIELD;
+    bad_addr  = 64'd0;
+    if (bad_op)        bad_cause = FAULT_CAUSE_ILLEGAL_OP;
+    else if (f_word)   begin end
+    else if (f_sp_a)   begin bad_cause = FAULT_CAUSE_TD_SPACE; bad_addr = r_a; end
+    else if (f_sp_w)   begin bad_cause = FAULT_CAUSE_TD_SPACE; bad_addr = r_w; end
+    else if (f_desc)   begin end
+    else if (f_al_a)   bad_addr = r_a;
+    else if (f_al_w)   bad_addr = r_w;
+    else if (f_al_sa)  bad_addr = r_a;
+    else if (f_al_sw)  bad_addr = r_w;
+    else if (f_al_cs)  bad_addr = r_cs;
+    else if (f_al_rs)  bad_addr = r_rs;
+    else if (f_r_acc)  begin bad_cause = FAULT_CAUSE_RANGE; bad_addr = r_acc | 64'h8000_0000_0000_0000; end
+    else if (f_r_a)    begin bad_cause = FAULT_CAUSE_RANGE; bad_addr = r_a; end
+    else if (f_r_w)    begin bad_cause = FAULT_CAUSE_RANGE; bad_addr = r_w; end
+    else if (f_r_cs)   begin bad_cause = FAULT_CAUSE_RANGE; bad_addr = r_cs; end
+    else if (f_r_rs)   begin bad_cause = FAULT_CAUSE_RANGE; bad_addr = r_rs; end
+    else               bad_any = 1'b0;
   end
 
 
@@ -131,7 +175,7 @@ module mxu_dec #(
       dst <= D_IDLE;
       fault_valid <= 1'b0;
       fault_cause <= 4'd0;
-      fault_addr  <= 32'd0;
+      fault_addr  <= 64'd0;
     end else begin
       case (dst)
         D_IDLE: if (q_ready) dst <= D_TDA_REQ;
@@ -140,21 +184,22 @@ module mxu_dec #(
         D_TDW_REQ: if (dtab_gnt) dst <= D_TDW_WAIT;
         D_TDW_WAIT: if (dtab_rvalid) dst <= D_CHECK;
         D_CHECK: begin
-          if (bad_op || bad_space || bad_field || bad_range) begin
+          if (bad_any) begin
             fault_valid <= 1'b1;
-            fault_cause <= bad_op ? FAULT_CAUSE_ILLEGAL_OP : bad_space ? FAULT_CAUSE_TD_SPACE :
-                           bad_field ? FAULT_CAUSE_ILLEGAL_FIELD : FAULT_CAUSE_RANGE;
-            fault_addr  <= (bad_op || bad_space || bad_field) ? 32'd0 : bad_addr;
+            fault_cause <= bad_cause;
+            fault_addr  <= bad_addr;
             dst <= D_FAULT;
           end else dst <= D_PUSH;
         end
-        D_PUSH: if (ctx_ready) dst <= D_IDLE;
+        D_PUSH: if (m_zero ? inf_empty : ctx_ready) dst <= D_IDLE;
         default: ;
       endcase
     end
   end
   // the context is written in D_PUSH when the load FSM can take it
-  assign ctx_push = (dst == D_PUSH) && ctx_ready;
+  assign ctx_push = (dst == D_PUSH) && !m_zero && ctx_ready;
+  // M = 0 (M-14): no context, no FIFO entry; it retires when every earlier instruction has (the FIFO is empty), which is in order
+  assign z_inc    = (dst == D_PUSH) && m_zero && inf_empty;
   assign ctx_sync = {ins[SYNC_SSEM_MSB:SYNC_SSEM_LSB], ins[SYNC_SINC_MSB:SYNC_SINC_LSB]};
   always_ff @(posedge clk) begin
     if (dst == D_IDLE && q_ready) begin
@@ -176,13 +221,14 @@ module mxu_dec #(
       c_K        <= 16'(vK);
       c_M        <= 16'(vM);
       c_N        <= 16'(vN);
-      c_KT       <= 16'(vKT);
+      c_KT       <= vKT;
       c_NT       <= 16'(vNT);
       c_a_base   <= 22'(r_a);
       c_a_pitch  <= 22'(a_s1);
       c_w_base   <= 22'(r_w);
       c_w_pitch  <= 22'(w_s1);
       c_cs_base  <= 22'(r_cs);
+      c_csp      <= 22'(vCSP);
       c_rs_base  <= 22'(r_rs);
       c_acc_base <= 11'(r_acc);
     end

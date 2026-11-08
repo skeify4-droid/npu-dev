@@ -36,7 +36,7 @@ module mxu_tc #(
   logic [128+6*64+32-1:0] prog [0:NINS-1];
   logic [DIM*32-1:0]     acc0 [0:ACCR-1];
   logic [DIM*32-1:0]     acc1 [0:ACCR-1];
-  logic [31:0]           expv [0:2];
+  logic [31:0]           expv [0:6];            // flags, sem[1..5], ordering pair {A, B} (6 bits each)
   logic [31:0]           accm [0:ACCR*DIM-1];
 
   // ---------------- DUT
@@ -69,7 +69,7 @@ module mxu_tc #(
   logic sem_inc_valid, fault_valid;
   logic [5:0] sem_inc_idx;
   logic [3:0] sem_inc_amt, fp_flags, fault_cause;
-  logic [31:0] fault_addr;
+  logic [63:0] fault_addr;
 
   mxu #(.DIM(DIM), .SPM_LAT(SPM_LAT), .ACC_LAT(ACC_LAT), .ACC_ROWS(ACCR), .SPM_BYTES(SPMB)) dut (.*);
 
@@ -97,7 +97,10 @@ module mxu_tc #(
   end
 
 
+  longint cyc = 0;
   int sem_incs = 0;
+  longint first_inc [0:63];
+  initial for (int i = 0; i < 64; i++) first_inc[i] = -1;
   logic [5:0] last_done_cnt;
   int pending_done = 0;       // acc_done pulses issued and not yet matched by a sem_inc
   always @(posedge clk) begin
@@ -105,6 +108,7 @@ module mxu_tc #(
       for (int i = 0; i < 64; i++) sem[i] <= 32'd0;
     end else if (sem_inc_valid) begin
       sem[sem_inc_idx] <= sem[sem_inc_idx] + 32'(sem_inc_amt);
+      if (first_inc[sem_inc_idx] < 0) first_inc[sem_inc_idx] = cyc;
       sem_incs++;
     end
   end
@@ -177,7 +181,7 @@ module mxu_tc #(
     acc_update u (.acc(lane_acc[c]), .part(acc_part[32*c +: 32]), .rowscale(acc_rowscale), .cs(acc_cs[32*c +: 32]),
                   .rescale(acc_rescale), .use_cs(acc_use_cs), .overwrite(acc_overwrite), .y(lane_y[c]), .flags(lane_f[c]));
   end
-  longint cyc = 0, last_row_cyc = 0;
+  longint last_row_cyc = 0;
   logic [4:0] dsr = 5'd0;
   assign acc_done = dsr[4];       // five cycles after the last row
   longint row_last [0:ACCR-1];
@@ -223,11 +227,11 @@ module mxu_tc #(
     // wait for all completions (instructions with a semaphore) or the time limit
     fork
       begin : w_done
-        wait (qi == NINS && !q_valid && sem[1] == expv[1] && sem[2] == expv[2] && dut.inf_cnt == 0);
+        wait (qi == NINS && !q_valid && sem[1] == expv[1] && sem[2] == expv[2] && sem[3] == expv[3] && sem[4] == expv[4] && sem[5] == expv[5] && dut.inf_cnt == 0);
       end
       begin : w_time
         repeat (`ifdef QUICK 6000 `else 40000 `endif) @(posedge clk);
-        errors++; $display("%s: TIMEOUT (qi=%0d sem1=%0d sem2=%0d inf=%0d)", PRE, qi, sem[1], sem[2], dut.inf_cnt);
+        errors++; $display("%s: TIMEOUT (qi=%0d sem1..5=%0d %0d %0d %0d %0d inf=%0d)", PRE, qi, sem[1], sem[2], sem[3], sem[4], sem[5], dut.inf_cnt);
       end
     join_any
     disable w_done; disable w_time;
@@ -239,7 +243,13 @@ module mxu_tc #(
           errors++; if (errors < 12) $display("%s: ACC[%0d][%0d] = %h exp %h", PRE, r, c, accm[r*DIM + c], acc1[r][32*c +: 32]);
         end
     if (flags_or !== expv[0][3:0]) begin errors++; $display("%s: fp_flags OR %h exp %h", PRE, flags_or, expv[0][3:0]); end
-    if (sem[1] != expv[1] || sem[2] != expv[2]) begin errors++; $display("%s: sem %0d %0d exp %0d %0d", PRE, sem[1], sem[2], expv[1], expv[2]); end
+    for (int i = 1; i <= 5; i++)
+      if (sem[i] != expv[i]) begin errors++; $display("%s: sem[%0d] = %0d exp %0d", PRE, i, sem[i], expv[i]); end
+    // retirement in order: the first increment of sem[A] (an instruction with rows) comes before the first one of sem[B] (an M = 0
+    // instruction queued behind it)
+    if (expv[6] != 0 && (first_inc[expv[6][11:6]] < 0 || first_inc[expv[6][5:0]] < 0 || first_inc[expv[6][11:6]] >= first_inc[expv[6][5:0]])) begin
+      errors++; $display("%s: sem[%0d] incremented (cycle %0d) before sem[%0d] (cycle %0d): out-of-order completion", PRE, expv[6][5:0], first_inc[expv[6][5:0]], expv[6][11:6], first_inc[expv[6][11:6]]);
+    end
     if (rows_seen == 0) begin errors++; $display("%s: no rows reached the ACC", PRE); end
     $display("%s: %0d ACC rows in %0d cycles, flags %h", PRE, rows_seen, cyc, flags_or);
     done = 1;
@@ -253,7 +263,7 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   localparam int LB = DIM;
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
-  logic [4+256+256+128+6*64+32-1:0] mem [0:N-1];
+  logic [4+64+256+256+128+6*64+32-1:0] mem [0:N-1];
   logic q_valid = 0, q_ready;
   logic [127:0] q_instr = '0;
   logic [6*64-1:0] q_regs = '0;
@@ -263,6 +273,7 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   logic [7:0] dtab_idx;
   logic [255:0] dtab_data, td_a, td_w;
   logic [3:0] a_req_v, sem_inc_amt, fp_flags, fault_cause, cause_exp;
+  logic [63:0] addr_exp;
   logic [4*22-1:0] a_req_addr;
   logic [7:0] w_req_v;
   logic [8*22-1:0] w_req_addr;
@@ -271,7 +282,8 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   logic [10:0] acc_row;
   logic [DIM*32-1:0] acc_part, acc_cs;
   logic [6:0] acc_ncols;
-  logic [31:0] acc_rowscale, fault_addr;
+  logic [31:0] acc_rowscale;
+  logic [63:0] fault_addr;
   logic [5:0] sem_inc_idx;
   mxu #(.DIM(DIM), .ACC_ROWS(ACCR), .SPM_BYTES(SPMB)) dut (
     .clk, .rst_n, .q_valid, .q_ready, .q_instr, .q_regs, .q_wval, .sem_rd_idx, .sem_rd_val(32'd0),
@@ -293,11 +305,13 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
     for (int k = 0; k < N; k++) begin
       rst_n = 0; q_valid = 0; spm_touch = 0;
       repeat (3) @(posedge clk);
-      {cause_exp, td_w, td_a, q_instr, q_regs, q_wval} = mem[k];
+      {cause_exp, addr_exp, td_w, td_a, q_instr, q_regs, q_wval} = mem[k];
       #1 rst_n = 1; q_valid = 1;
       repeat (60) @(posedge clk);
       if (!fault_valid || fault_cause !== cause_exp) begin
         errors++; $display("fault case %0d: valid %b cause %0d expected %0d", k, fault_valid, fault_cause, cause_exp);
+      end else if (fault_addr !== addr_exp) begin
+        errors++; $display("fault case %0d: cause %0d FAULT_ADDR %h expected %h", k, fault_cause, fault_addr, addr_exp);
       end
       if (spm_touch != 0) begin errors++; $display("fault case %0d: %0d SPM / ACC / semaphore actions", k, spm_touch); end
       if (q_ready) begin errors++; $display("fault case %0d: queue still popping", k); end

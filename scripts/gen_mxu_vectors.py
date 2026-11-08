@@ -32,6 +32,7 @@ OUT = _ARGS[0] if _ARGS else os.path.join(ROOT, "build", "mxu")
 os.makedirs(OUT, exist_ok=True)
 RNG = np.random.default_rng(20261108)
 WL_WORDS = 128
+SPM_BYTES = {8: 1 << 17, 16: 1 << 17, 32: 1 << 16}       # SPM size of the tb_mxu models (a power of two)
 META_W = 16
 NANIN, OVF, INV = R.NANIN, R.OVF, R.INV
 
@@ -305,14 +306,21 @@ def build_top(dim, decode_only=False):
     """A list of MXU_MM instructions on a DIM x DIM MXU with their SPM image, DTAB, initial / expected ACC and flags."""
     LB = dim
     KB = 4 * dim
-    SPM = 1 << 15 if dim == 8 else 1 << 16
+    SPM = SPM_BYTES[dim]
     spm = bytearray(b"\xff\x7f" * (SPM // 2))      # NaN-valued garbage everywhere (E4M3 and BF16): any unmasked tail shows up
     top = [0]
+    end = [SPM]                                     # operands placed at the end of the SPM grow downwards from here
 
-    def alloc(nbytes):
-        base = (top[0] + 2 * LB - 1) // (2 * LB) * (2 * LB)
+    def alloc(nbytes, at_end=False):
+        """64 B aligned base (the alignment rule of every config, M-10); at_end: the extent ends in the last 64 B granule."""
+        if at_end:
+            base = (end[0] - nbytes) // 64 * 64
+            end[0] = base
+            assert top[0] <= end[0]
+            return base
+        base = (top[0] + 63) // 64 * 64
         top[0] = base + nbytes
-        assert top[0] <= SPM
+        assert top[0] <= end[0]
         return base
 
     ACC_ROWS = 256
@@ -327,7 +335,7 @@ def build_top(dim, decode_only=False):
         return len(tds) - 1
 
     def case(M, K, N, bf16, trans, accm, cs, rs, acc_row, pad_a=0, pad_w=0, wsem=0, wval=0, ssem=0, sinc=0, special=False,
-             m_reg=False):
+             m_reg=False, cs_end=False, decoy=None):
         nonlocal flags_or
         eb = 2 if bf16 else 1
         gen = bf16_clean if bf16 else fp8_clean
@@ -335,21 +343,23 @@ def build_top(dim, decode_only=False):
         g = spec if special else gen
         A = [[g() for _ in range(K)] for _ in range(M)]
         W = [[gen() for _ in range(N)] for _ in range(K)]               # logical K x N
-        a_pitch = (K * eb + LB - 1) // LB * LB + pad_a
+        a_pitch = (K * eb + 63) // 64 * 64 + pad_a
         a_base = alloc(M * a_pitch)
         for m in range(M):
             for k in range(K):
                 spm[a_base + m * a_pitch + k * eb: a_base + m * a_pitch + (k + 1) * eb] = A[m][k].to_bytes(eb, "little")
         if trans:
-            w_pitch = (K * eb + LB - 1) // LB * LB + pad_w
+            w_pitch = (K * eb + 63) // 64 * 64 + pad_w
             w_base = alloc(N * w_pitch)
             for n in range(N):
                 for k in range(K):
                     spm[w_base + n * w_pitch + k * eb: w_base + n * w_pitch + (k + 1) * eb] = W[k][n].to_bytes(eb, "little")
             w_td = td(1 if bf16 else 3, K, N, w_pitch)
         else:
-            w_pitch = (N * eb + LB - 1) // LB * LB + pad_w
-            w_base = alloc(K * w_pitch)
+            w_pitch = (N * eb + 63) // 64 * 64 + pad_w
+            # a guard of one K tile of rows behind W stays NaN-valued garbage: a lane requested for a k-row >= K reads NaN there (and
+            # 0 x NaN flags), whatever the next operand is
+            w_base = alloc(K * w_pitch + (2 if bf16 else 4) * dim * w_pitch)
             for k in range(K):
                 for n in range(N):
                     spm[w_base + k * w_pitch + n * eb: w_base + k * w_pitch + (n + 1) * eb] = W[k][n].to_bytes(eb, "little")
@@ -363,16 +373,17 @@ def build_top(dim, decode_only=False):
         if cs:
             fold = (128 if bf16 else 256)                # the DMA's fold tile, the same in every config (M-13)
             rep_ = fold // kte                          # = 64 / DIM MXU passes per scale row
-            cs_fold = [[f32bits(2.0 ** int(RNG.integers(-3, 4)) * RNG.uniform(0.75, 1.25)) for _ in range(N)]
-                       for _ in range((K + fold - 1) // fold)]
-            cs_vals = [cs_fold[t // rep_] for t in range(KT)]        # SPM image: each scale row replicated per MXU pass
-            cs_base = alloc(4 * KT * N + LB)
-            for t in range(KT):
+            KTF = (K + fold - 1) // fold
+            CSP = (4 * N + 63) // 64 * 64               # row pitch of the scale array (M-11)
+            cs_fold = [[f32bits(2.0 ** int(RNG.integers(-3, 4)) * RNG.uniform(0.75, 1.25)) for _ in range(N)] for _ in range(KTF)]
+            cs_vals = [cs_fold[t // rep_] for t in range(KT)]        # the scale row of MXU pass t (what the MXU must apply)
+            cs_base = alloc((KTF - 1) * CSP + 4 * N, at_end=cs_end)  # exactly the bytes the DMA writes: nothing behind the last row
+            for r_ in range(KTF):
                 for n in range(N):
-                    spm[cs_base + 4 * (t * N + n): cs_base + 4 * (t * N + n) + 4] = cs_vals[t][n].to_bytes(4, "little")
+                    spm[cs_base + CSP * r_ + 4 * n: cs_base + CSP * r_ + 4 * n + 4] = cs_fold[r_][n].to_bytes(4, "little")
         if rs:
             rs_vals = [f32bits(RNG.uniform(0.25, 1.5)) for _ in range(M)]
-            rs_base = alloc(4 * M + LB)
+            rs_base = alloc(4 * M)
             for m in range(M):
                 spm[rs_base + 4 * m: rs_base + 4 * m + 4] = rs_vals[m].to_bytes(4, "little")
         acc_init = [[acc[acc_row + (n // dim) * M + m][n % dim] for n in range(N)] for m in range(M)]
@@ -398,14 +409,15 @@ def build_top(dim, decode_only=False):
                                             cs_vals[t][n] if cs else 0, accm == 2 and t == 0, bool(cs), accm == 0 and t == 0)
                         acc[r][c] = y
         assert rs or accm != 2, "RESCALE needs a rowscale vector"
-        golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc, acc_row)
+        if M:
+            golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc, acc_row)
         regs = [a_base, w_base, acc_row, M if m_reg else 0, rs_base, cs_base]
         ins = (0x60 << 120) | (wsem << 114) | (ssem << 95) | (sinc << 91) | (1 << 86) | (a_td << 78) | (2 << 73) | (w_td << 65) | \
               (3 << 60) | ((4 if m_reg else 0) << 55) | ((5 if (rs and accm == 2) else 0) << 50) | ((6 if cs else 0) << 45) | \
               (accm << 43) | (int(trans) << 39)
         if m_reg:
             # the TD's n1 is a decoy: the register wins
-            tds[a_td] = (tds[a_td] & ~(0xFFFF << 32)) | (((M + 7) & 0xFFFF) << 32)
+            tds[a_td] = (tds[a_td] & ~(0xFFFF << 32)) | (((M + 7 if decoy is None else decoy) & 0xFFFF) << 32)
         instrs.append((ins, regs, wval))
         if ssem:
             sem_cnt[ssem] = sem_cnt.get(ssem, 0) + sinc
@@ -414,16 +426,27 @@ def build_top(dim, decode_only=False):
     if decode_only:       # one M = 1 instruction, 4 passes: the tile period measurement on a larger array
         case(1, 8 * D, 2 * D, False, True, 0, False, False, 100, ssem=1, sinc=1)
         return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
-                    sem=sem_cnt, spm_bytes=SPM)
+                    sem=sem_cnt, spm_bytes=SPM, order=(0, 0))
+    case(0, 4 * D, D, False, True, 0, False, False, 20, ssem=5, sinc=1)                                     # M = 0 from the TD, first in the queue (S-7)
     case(5, 256 + 6 * D + 3, D + D // 2, False, True, 0, True, False, 0, ssem=1, sinc=1)                   # FP8 trans OVERWRITE + cs, 2 fold tiles (2 scale rows)
     case(3, 4 * D, D, False, False, 1, False, False, 2, wsem=1, wval=1)                                     # FP8 non-trans ACCUM onto rows of #1
-    case(D // 4 + 1, 128 + 2 * D + 5, D + D // 4, True, True, 2, True, True, 0, ssem=2, sinc=3, pad_a=LB)             # BF16 trans RESCALE + cs + rowscale, 2 fold tiles
+    case(D // 4 + 1, 128 + 2 * D + 5, D + D // 4, True, True, 2, True, True, 0, ssem=2, sinc=3, pad_a=64)             # BF16 trans RESCALE + cs + rowscale, 2 fold tiles
     case(2 * D + 3, D + 1, D, True, False, 0, False, False, 40)                                              # BF16 non-trans OVERWRITE, many rows
-    case(1, 4 * D, 2 * D, False, True, 0, True, False, 100, pad_w=2 * LB)                                    # decode-like M = 1
+    case(1, 4 * D, 2 * D, False, True, 0, True, False, 100, pad_w=128)                                       # decode-like M = 1
     case(6, 5 * D + 1, D + 3, False, False, 1, False, False, 100, special=True, m_reg=True)                  # specials, M from register, ACCUM
+    # RESCALE whose rowscale reaches the result: one K pass (a later pass would add partial sums that swamp the rescaled old value),
+    # onto rows an earlier instruction filled with values as large as the partial sums; 3 rowscale lanes, 2 N tiles (rowscale re-read)
+    case(2 * (D // 4) + 1, 4 * D, D + 1, False, True, 0, False, False, 140)
+    case(2 * (D // 4) + 1, 4 * D, D + 1, False, True, 2, False, True, 140)
+    # ---- one case per rule changed by M-10 .. M-18 (rtl follows review S-1, S-7, S-10)
+    case(2, 128 + 3, 40, True, True, 0, True, False, 120, ssem=3, sinc=1)                                    # S-1: trans_w = 1, N = 40, cs_reg != 0, 2 scale rows, CSP = 192
+    case(0, 4 * D, D, False, True, 1, False, False, 120, m_reg=True, decoy=5, ssem=4, sinc=2)                # S-7: R[m_reg] = 0 (TD n1 is a decoy): a no-op that completes after the case above
+    case(3, 200, 16, False, True, 0, True, False, 200, wsem=4, wval=2, cs_end=True, ssem=5, sinc=1)          # S-10: K = 200 is one fold tile (one 64 B scale row, at the very end of the SPM) and 7 / 4 MXU passes; waits for the M = 0 above
+    case(0, 2 * D, 2 * D + 1, True, False, 1, True, False, 120, ssem=4, sinc=1)                              # S-7: M = 0 from the TD again, with cs: its checks run, nothing is read
     flags_or &= 0xF
+    # the first increment of semaphore 3 (the case before the M = 0) must come before the first one of semaphore 4
     return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or,
-                sem=sem_cnt, spm_bytes=SPM)
+                sem=sem_cnt, spm_bytes=SPM, order=(3, 4))
 
 
 def write_top(tc, counts):
@@ -441,67 +464,123 @@ def write_top(tc, counts):
     wr("prog", prog)
     wr("acc0", [format(sum(v << (32 * c) for c, v in enumerate(r)), "0%dx" % (dim * 8)) for r in tc["acc0"]])
     wr("acc1", [format(sum(v << (32 * c) for c, v in enumerate(r)), "0%dx" % (dim * 8)) for r in tc["acc1"]])
-    # misc: [flags, sem1, sem2]
-    wr("exp", [format(tc["flags"], "x"), format(tc["sem"].get(1, 0), "x"), format(tc["sem"].get(2, 0), "x")])
+    # misc: [flags, sem1 .. sem5, ordering pair {A, B}: the first increment of sem[A] comes before the first one of sem[B] (0: none)]
+    wr("exp", [format(tc["flags"], "x")] + [format(tc["sem"].get(i, 0), "x") for i in range(1, 6)] +
+       [format(tc["order"][0] * 64 + tc["order"][1], "x")])
 
 
 def build_fault(dim):
-    """Illegal MXU_MM instructions: (instr, regs, wval, td_a, td_w, expected cause). FP8 trans M = 2, K = 4 DIM, N = DIM is the valid base."""
+    """Illegal MXU_MM instructions: (instr, regs, wval, td_a, td_w, expected cause, expected FAULT_ADDR). Valid base: FP8 trans M = 2,
+    K = 4 DIM, N = DIM, s1 = 64. Every rule of mxu.md 4.1 and the priority of M-18 has a case; the expected address is
+    R[reg] of the offending operand (TD_SPACE, alignment, SPM RANGE), R[acc_reg] | 1 << 63 (ACC RANGE), 0 (every other fault)."""
     LB = dim
-    SPM = 1 << 15 if dim == 8 else 1 << 16
+    SPM = SPM_BYTES[dim]
     ACCR = 256
+    B63 = 1 << 63
+    BIG = 0x7F00_0000_0000_0000          # a 49-bit-GPA-like value that does not fit 32 bits
 
     def td(dtype=3, n0=0, n1=0, s1=0, space=1, n2=1, n3=1, flags=0):
         return dtype | (space << 5) | (flags << 8) | (n0 << 16) | (n1 << 32) | (n2 << 48) | (n3 << 64) | (s1 << 80)
 
     def base(**kw):
-        d = dict(op=0x60, accm=0, mode=0, trans=1, rs_idx=0, cs_idx=0, m_idx=0, a_base=0, w_base=8 * LB * 8, acc=0, m=0, rs=0, cs=0,
-                 a=dict(n0=4 * dim, n1=2, s1=4 * dim), w=dict(n0=4 * dim, n1=dim, s1=4 * dim))
+        d = dict(op=0x60, accm=0, mode=0, trans=1, rs_idx=0, cs_idx=0, m_idx=0, a_base=0, w_base=1024, acc=0, m=0, rs=0, cs=0, ins_or=0,
+                 a=dict(n0=4 * dim, n1=2, s1=64), w=dict(n0=4 * dim, n1=dim, s1=64))
         for k, v in kw.items():
             if k in ("a", "w"):
                 d[k] = dict(d[k], **v)
             else:
                 d[k] = v
         ins = (d["op"] << 120) | (1 << 86) | (2 << 73) | (3 << 60) | (d["m_idx"] << 55) | (d["rs_idx"] << 50) | (d["cs_idx"] << 45) | \
-              (d["accm"] << 43) | (d["mode"] << 40) | (d["trans"] << 39)
+              (d["accm"] << 43) | (d["mode"] << 40) | (d["trans"] << 39) | d["ins_or"]
         regs = [d["a_base"], d["w_base"], d["acc"], d["m"], d["rs"], d["cs"]]
         return ins, regs, d
 
     out = []
-    def add(cause, a_over=None, w_over=None, **kw):
+
+    def add(cause, addr, a_over=None, w_over=None, **kw):
         ins, regs, d = base(**kw)
         ta = td(**dict(d["a"], **(a_over or {})))
         tw = td(**dict(d["w"], **(w_over or {})))
-        out.append((ins, regs, 0, ta, tw, cause))
+        out.append((ins, regs, 0, ta, tw, cause, addr))
     FIELD, SPACE, RANGE, OP = 2, 3, 7, 1
-    add(SPACE, a_over=dict(space=2))
-    add(SPACE, w_over=dict(space=0))
-    add(FIELD, a_over=dict(dtype=3), w_over=dict(dtype=1))
-    add(FIELD, a_over=dict(dtype=0), w_over=dict(dtype=0))
-    add(FIELD, mode=1)
-    add(FIELD, accm=3)
-    add(FIELD, accm=2)                                  # RESCALE without rs_reg
-    add(FIELD, w_over=dict(n0=4 * dim + 4))             # K mismatch
-    add(FIELD, a_over=dict(n2=2))
-    add(FIELD, w_over=dict(n3=0))
-    add(FIELD, a_over=dict(flags=1))
-    add(FIELD, a_over=dict(n1=0))                       # M = 0
-    add(FIELD, w_over=dict(n1=0))                       # N = 0
-    add(FIELD, a_base=LB // 2)                          # unaligned A base
-    add(FIELD, w_base=8 * LB * 8 + 1)
-    add(FIELD, a_over=dict(s1=4 * dim + 1))
-    add(FIELD, w_over=dict(s1=(1 << 31) | 64))          # negative pitch
-    add(FIELD, cs_idx=6, cs=2048, w_over=dict(n1=dim - 1))   # 4 N not a multiple of the lane
-    add(FIELD, cs_idx=6, cs=2048 + 1)
-    add(FIELD, accm=2, rs_idx=5, rs=4096 + 4)
-    add(RANGE, acc=ACCR - 1)                            # 2 rows from the last ACC row
-    add(RANGE, acc=ACCR)
-    add(RANGE, a_base=SPM - 4 * dim, a_over=dict(n1=2))
-    add(RANGE, w_base=SPM)                              # base outside
-    add(RANGE, w_over=dict(n1=dim, s1=1 << 20))         # W rows run off the end
-    add(RANGE, cs_idx=6, cs=SPM - LB)                   # scales run off the end
-    add(RANGE, m_idx=4, m=ACCR + 1)                     # M from the register, too many rows
-    add(OP)                                             # patched below
+    # ---- word fields (first; FAULT_ADDR 0)
+    add(FIELD, 0, ins_or=1 << 0)                                      # reserved bit 0 of the word
+    add(FIELD, 0, ins_or=1 << 38)                                     # reserved bit 38
+    add(FIELD, 0, mode=1)                                             # BF16X3 is reserved in v1 (M-15)
+    add(FIELD, 0, mode=2)
+    add(FIELD, 0, mode=7)
+    add(FIELD, 0, accm=3)
+    add(FIELD, 0, accm=2)                                             # RESCALE without rs_reg
+    add(FIELD, 0, accm=0, rs_idx=5, rs=4096)                          # rs_reg without RESCALE (M-18)
+    add(FIELD, 0, accm=1, rs_idx=5, rs=4096)
+    add(FIELD, 0, mode=1, a_over=dict(space=2), a_base=BIG + 0x1000)   # a word field beats TD_SPACE
+    # ---- TD_SPACE (A before W; address = R[reg], 64 bits)
+    add(SPACE, 0, a_over=dict(space=2))
+    add(SPACE, 1024, w_over=dict(space=0))
+    add(SPACE, BIG + 0x1000, a_over=dict(space=2), a_base=BIG + 0x1000)
+    add(SPACE, BIG + 0x2000, w_over=dict(space=0), w_base=BIG + 0x2000)
+    add(SPACE, 0x40, a_over=dict(space=2), w_over=dict(space=0), a_base=0x40, w_base=0x80)           # both: A first
+    add(SPACE, 0, a_over=dict(space=2, dtype=0), w_over=dict(dtype=1))                                # beats the descriptor rows
+    # ---- descriptor ILLEGAL_FIELD that carry no address
+    add(FIELD, 0, a_over=dict(dtype=3), w_over=dict(dtype=1))
+    add(FIELD, 0, a_over=dict(dtype=0), w_over=dict(dtype=0))
+    add(FIELD, 0, w_over=dict(n0=4 * dim + 4))                        # K mismatch
+    add(FIELD, 0, a_over=dict(n2=2))
+    add(FIELD, 0, w_over=dict(n3=0))
+    add(FIELD, 0, a_over=dict(flags=1))
+    add(FIELD, 0, a_over=dict(flags=4))                               # WRAP is DMA-only (M-16)
+    add(FIELD, 0, w_over=dict(flags=4))
+    add(FIELD, 0, a_over=dict(n0=0), w_over=dict(n0=0))               # K = 0
+    add(FIELD, 0, w_over=dict(n1=0))                                  # N = 0
+    add(FIELD, 0, w_over=dict(n1=0), a_base=LB, acc=ACCR)             # N = 0 beats alignment and RANGE
+    add(FIELD, 0, a_over=dict(dtype=3), w_over=dict(dtype=1), a_base=LB)                    # dtype beats alignment
+    add(FIELD, 0, a_over=dict(dtype=3), w_over=dict(dtype=1), acc=ACCR)                     # ... and RANGE
+    # ---- alignment: 64 B in every config (address = R[reg] of the operand)
+    add(FIELD, LB, a_base=LB)                                         # aligned for the lane, not for the bank (M-10)
+    add(FIELD, 32, a_base=32)
+    add(FIELD, BIG + 8, a_base=BIG + 8)
+    add(FIELD, 1024 + LB, w_base=1024 + LB)
+    add(FIELD, 0, a_over=dict(s1=64 + LB))                            # s1 of A: R[a_reg] = 0 here
+    add(FIELD, 1024, w_over=dict(s1=64 + LB))                         # s1 of W: R[w_reg]
+    add(FIELD, 0, a_over=dict(s1=(1 << 31) | 64))                     # negative pitch
+    add(FIELD, 1024, w_over=dict(s1=(1 << 31) | 64))
+    add(FIELD, 2048 + LB, cs_idx=6, cs=2048 + LB)
+    add(FIELD, 4096 + LB, accm=2, rs_idx=5, rs=4096 + LB)
+    add(FIELD, LB, a_base=LB, w_base=1024 + LB)                       # A base before W base
+    add(FIELD, 1024 + LB, w_base=1024 + LB, a_over=dict(s1=64 + LB))  # W base before s1 of A
+    add(FIELD, 0, a_over=dict(s1=64 + LB), w_over=dict(s1=64 + LB))   # s1 of A before s1 of W (R[a_reg] = 0)
+    add(FIELD, 2048 + LB, cs_idx=6, cs=2048 + LB, accm=2, rs_idx=5, rs=4096 + LB)   # cs before rs
+    add(FIELD, 1024, w_over=dict(s1=64 + LB), cs_idx=6, cs=2048 + LB)               # s1 of W before cs
+    # alignment beats RANGE (ACC and SPM), a word field beats both
+    add(FIELD, LB, a_base=LB, acc=ACCR)
+    add(FIELD, 2048 + LB, cs_idx=6, cs=2048 + LB, w_base=SPM)
+    add(FIELD, 0, mode=1, a_base=LB, acc=ACCR)
+    # ---- RANGE: ACC first (address | 1 << 63), then the SPM operands A, W, cs, rs (address = R[reg])
+    add(RANGE, (ACCR - 1) | B63, acc=ACCR - 1)                        # 2 rows from the last ACC row
+    add(RANGE, ACCR | B63, acc=ACCR)
+    add(RANGE, (ACCR - 9) | B63, acc=ACCR - 9, w_over=dict(n1=40))   # NT * M rows: 5 N tiles at DIM 8, 3 at DIM 16
+    add(RANGE, ((1 << 64) - 1) | B63, acc=(1 << 64) - 1)              # the sum must not wrap
+    add(RANGE, B63, m_idx=4, m=(1 << 16) + 1)                         # M from the register is not truncated to 16 bits (S-7)
+    add(RANGE, B63, m_idx=4, m=1 << 63)
+    add(RANGE, B63, m_idx=4, m=ACCR + 1)
+    add(RANGE, B63, m_idx=4, m=1 << 63, w_over=dict(n1=2 * dim))      # NT * M = 2^64 wraps to 0 in 64 bits: M alone must fault
+    add(RANGE, (ACCR + 1) | B63, m_idx=4, m=0, acc=ACCR + 1)          # M = 0 still checks the ACC base
+    add(RANGE, 1024 + SPM, m_idx=4, m=0, w_base=1024 + SPM)                 # M = 0: W is still checked (no A rows, no rowscale)
+    add(FIELD, LB, m_idx=4, m=0, a_base=LB)                           # M = 0: alignment is still checked
+    add(FIELD, 0, m_idx=4, m=0, mode=1)
+    add(RANGE, SPM - 64, a_base=SPM - 64)                             # A: second row ends past the end
+    add(RANGE, SPM, a_base=SPM)
+    add(RANGE, SPM, w_base=SPM)                                       # base outside
+    add(RANGE, BIG, w_base=BIG)
+    add(RANGE, 1024, w_over=dict(n1=dim, s1=1 << 20))                 # W rows run off the end
+    add(RANGE, SPM - 64, cs_idx=6, cs=SPM - 64, w_over=dict(n1=17))   # 4 N = 68 B of scales from 64 B before the end
+    add(RANGE, SPM - 64, cs_idx=6, cs=SPM - 64, a_over=dict(n0=257, s1=320), w_over=dict(n0=257, s1=320))   # second scale row (K tile 257) past the end
+    add(RANGE, SPM - 64, accm=2, rs_idx=5, rs=SPM - 64, m_idx=4, m=17)    # 17 rowscale values, 68 B
+    add(RANGE, ACCR | B63, acc=ACCR, a_base=SPM)                      # ACC before A
+    add(RANGE, SPM, a_base=SPM, w_base=SPM + 64)                      # A before W
+    add(RANGE, SPM, w_base=SPM, cs_idx=6, cs=SPM + 64)                # W before cs
+    add(RANGE, SPM + 64, cs_idx=6, cs=SPM + 64, accm=2, rs_idx=5, rs=SPM + 128, m_idx=4, m=1)   # cs before rs
+    add(OP, 0)                                                        # patched below
     out[-1] = (out[-1][0] & ~(0xFF << 120) | (0x61 << 120),) + out[-1][1:]
     return out
 
@@ -509,8 +588,8 @@ def build_fault(dim):
 def write_fault(dim, counts):
     pre = "mxu_fault_%d" % dim
     lines = []
-    for ins, regs, wval, ta, tw, cause in build_fault(dim):
-        lines.append(hexw([(cause, 4), (tw, 256), (ta, 256), (ins, 128)] + [(r, 64) for r in reversed(regs)] + [(wval, 32)]))
+    for ins, regs, wval, ta, tw, cause, addr in build_fault(dim):
+        lines.append(hexw([(cause, 4), (addr, 64), (tw, 256), (ta, 256), (ins, 128)] + [(r, 64) for r in reversed(regs)] + [(wval, 32)]))
     with open(os.path.join(OUT, pre + ".hex"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
     counts.append((pre.upper(), len(lines)))
