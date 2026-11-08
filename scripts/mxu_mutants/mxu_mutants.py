@@ -176,7 +176,10 @@ def run_tb(m, quick):
     c = subprocess.run(cmd, cwd=vec, capture_output=True, text=True)
     if c.returncode != 0:
         return "COMPILE-ERROR", c.stderr[-400:]
-    r = subprocess.run(["vvp", "-n", exe], cwd=vec, capture_output=True, text=True, timeout=900)
+    try:
+        r = subprocess.run(["vvp", "-n", exe], cwd=vec, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return "fails", "HANG: no PASS or FAIL within 1800 s (a legal run takes 3 to 40 minutes on this machine, a mutant that stalls the testbench never ends)"
     out = r.stdout
     if re.search(r"^PASS mxu", out, re.M):
         return "passes", ""
