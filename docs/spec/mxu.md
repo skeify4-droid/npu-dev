@@ -184,21 +184,22 @@ All ports are packed vectors (CLAUDE.md). `valid/ready` unless marked.
 | `a_rsp_data` | in | `A_LANES · 8·LB` | exactly `SPM_LAT` cycles after the grant, never back-pressured |
 | `w_req_*`, `w_rsp_data` | | 8 lanes | same, stationary load |
 | `s_req_*`, `s_rsp_data` | | 1 lane | same, rowscale and column scales (two sources, rowscale first) |
-| `acc_valid` | out | 1 | an output row; no `ready`: the ACC accepts one MXU row per cycle (MXU has priority over the VPU port, microarch.md §5 `conflict`) |
+| `acc_valid` | out | 1 | an output row; no `ready`: the ACC accepts one MXU row per cycle (MXU has priority on every ACC SRAM port conflict, [acc.md](acc.md) §7, M-19) |
 | `acc_row` | out | 11 | row index |
 | `acc_part` | out | `COLS · 32` | partial sum row |
 | `acc_ncols` | out | 7 | columns `< N` of this N tile; the ACC writes and flags only those |
 | `acc_rescale`, `acc_overwrite`, `acc_use_cs` | out | 1 each | lane controls (§4.2) |
 | `acc_rowscale` | out | 32 | `rowscale[m]` (valid with `acc_rescale`) |
-| `acc_cs` | out | `COLS · 32` | column scales of the pass; changes only with the first row of a pass; the ACC latches it with the row |
+| `acc_cs` | out | `COLS · 32` | column scales of the pass; the MXU holds it for the pass, but **only the value in the `acc_valid` cycle is contract** (the ACC samples it there, acc.md ACC-4) |
 | `acc_last` | out | 1 | last row of the instruction |
-| `acc_done` | in | 1 | pulse: the write of the `acc_last` row is visible |
+| `acc_done` | in | 1 | pulse exactly `ACC_LAT` cycles after the `acc_last` row (`ACC_LAT` = `acc_pkg::ACC_LAT`, acc.md §5): its write is visible and its flags are out. None for an `M = 0` instruction |
 | `sem_inc_valid`, `sem_inc_idx`, `sem_inc_amt` | out | 1, 6, 4 | completion |
 | `fp_flags` | out | 4 | valid-qualified `mxu_pe` flags (microarch.md §5) |
 | `fault_valid`, `fault_cause`, `fault_addr` | out | 1, 4, 64 | to `core/seq` `fault_in` (microarch.md §5). 64 bits since M-18; the first RTL has a 32-bit port |
 
-The ACC (`core/acc`) instantiates `acc_update` (arith.md): this interface fixes what it must accept. `acc_cs` is `COLS · 32` wide
-and held; if the ACC pipeline is deeper than its latch, it copies `acc_cs` into its own stage registers.
+The ACC (`core/acc`) is specified in [acc.md](acc.md) (review S-11, M-19): the stream above, the `ACC_LAT` contract, masked
+writes, flags before `acc_done`, row width `DIM`. `ACC_LAT` is `acc_pkg::ACC_LAT`; this module's parameter defaults to it and fails
+elaboration below it.
 
 ## 6. Verification
 
@@ -265,6 +266,7 @@ cost one stall cycle.
 | M-17 | **Load beats and the tile period** (review S-4, S-5). No change to the beat order or the buffers. The pitch rule (microarch.md §2.3, memmap.md §4) is re-derived for the 8-row beat (`scripts/mxu_review/spec_checks.py`, pitch scan): pad a 2 KiB pitch by 1 KiB (3072 B); 4 KiB + 512, 8 KiB + 512, 16 KiB + 1 KiB and 32 KiB or more + 512 stay as they are. Only 26 of the 256 pitches 64 B..16 KiB are conflict-free for all three beat shapes at 2 KiB-aligned bases, so a compiler pitch table covers the other (non-power-of-two) pitches; the shim of M-10 makes a collision slower (one stall per colliding beat) but never wrong. The tests I-13 / V-8 of `test_isa.py` are replaced by an 8-row-beat test. §2 M-2 and §7 are corrected: the A read is conflict-free for 256 B-aligned A bases and `s1` (at 64 B alignment 6 of 1,024 starts cost one stall cycle); the period for `M < 40` is `max(M, ~39)`, not `M`; the decode margins (microarch.md §2.2 / §6, numerics.md D1, status.md) are restated with the 39-cycle period: FP8 2.2x, NVFP4 -> BF16 1.16x at the peak HBM share (1.36x at 0.85). The 39 is an extrapolation; simulating `DIM` 64 at `M = 1` is still open (§9) and decides on a third shadow buffer (period 32, +131 k flops) | no MXU RTL change; the buffer decision waits for a measured period |
 
 | M-18 | **Faults of `MXU_MM`** (review S-9; the points of S-9 that M-10 .. M-17 left open, chosen when the specs were updated, 2026-11-08). Undefined values fault `ILLEGAL_FIELD`: `mode` 2-7, `acc_mode` 3, non-zero bits `[38:0]` of the word, `rs_reg != 0` without `RESCALE`, `RESCALE` with `rs_reg = 0`. `FAULT_ADDR` is the 64-bit CSR: `R[reg]` of the offending operand for `TD_SPACE`, alignment and an SPM `RANGE`; `R[acc_reg] \| 1<<63` for an ACC `RANGE`; 0 for every other `ILLEGAL_FIELD` (a queue entry has no PC). Priority: word fields, `TD_SPACE` (A, W), descriptor `ILLEGAL_FIELD` in table order, `RANGE` (ACC, SPM). In-flight instructions of any engine when a fault occurs may be cut off or complete: software relies on neither. `core/seq` gets a `fault_in` (first fault latched, simultaneous ones in the order front end, DMA, MXU, VPU, NI) and an `eng_stop` (microarch.md §5). The `aux_reg` of the DMA is 64 B aligned (partner of the alignment of `cs_reg`) | one deterministic fault per program, independent of the config and the data, so the golden ISA model predicts `FAULT_CAUSE` / `FAULT_ADDR`; a stale `rs_reg` is a compiler bug worth a fault |
+| M-19 | **`core/acc` stream contract** (review S-11, all seven items; [acc.md](acc.md) ACC-1 .. ACC-9, 2026-11-08). `acc_*` replaces `acc_rmw` / `mxu_rmw`; no `ready`, MXU priority on every ACC SRAM port conflict; one `ACC_LAT` owned by `acc_pkg` (this module's parameter defaults to it, elaboration error below it or above 255) and equal to the `acc_done` delay; ACC `fp_flags` of the `acc_last` row no later than `acc_done`; `cs` applied to `part` in the ACC input stage; word-masked writes for columns `>= ncols`; ACC row `DIM` words per config. RTL changes listed in acc.md §10, not made | the MXU spacing proof (P3) and the `sem_inc` ordering need these as stated obligations of `core/acc` |
 
 Decisions M-10 .. M-17 were taken 2026-11-08, answering review part S (S-1 .. S-8; docs/reports/mxu_review.md); M-18 completes S-9.
 **Specs updated** (S-n cited at each change): isa.yaml (`MXU_MM`, `DMA_COPY` `aux_reg`, `mxu_mode`, `WRAP`, fault CSRs; `make isa`),
@@ -275,7 +277,7 @@ isa.md §4-8, memmap.md §4 / §7, numerics.md N-2 / N-3 / N-8 / D1, microarch.m
 the `M = 0` change), `sw/npumodel/numerics.py` (`mxu_mm` `dim`, `fold_e4m3` / `unfold` / `cvt_source_check` orientation) with
 `test_arith.py` / `test_numerics.py` and the generated `numerics_experiments.md`, `scripts/gen_mxu_vectors.py`, `core/seq` (`fault_in`,
 `eng_stop`), `core/spm`, and `docs/reports/status.md` (line 191 "the MXU is never the decode bottleneck"). Review items not decided
-here: S-10 (`RANGE` on operand extents), S-11 (`core/acc` stream contract), S-12 (DTAB / prefetch ordering wording).
+here: S-10 (`RANGE` on operand extents), S-12 (DTAB / prefetch ordering wording). S-11 is decided by M-19 ([acc.md](acc.md); the RTL list is acc.md §10, not yet done).
 
 ## 9. Open items
 - `BF16X3` (FP32 operands split into BF16 hi / lo on the fly: three passes per K tile, the W fetch reads 4 B elements, A likewise):
@@ -283,6 +285,6 @@ here: S-10 (`RANGE` on operand extents), S-11 (`core/acc` stream contract), S-12
   order in the loop (§4.2 `t` becomes `(t, pass)`) and a legality row. The hyper-connection mixer uses two `NORMAL` BF16 passes
   with pre-split weights (numerics.md D2), so it does not need the instruction.
 - A third shadow buffer would take the period from about 39 to the 32-beat port limit. Not "not needed": on the exact NVFP4 -> BF16 decode path the MXU is the narrowest stage at 1.16x (§7, review S-5), so the decision waits for a simulation of `DIM` 64 at `M = 1`. Bank-conflict-aware beat order.
-- `RANGE` is defined on bytes read, but the MXU reads past its operands by design (4 `cs` lanes per pass, rowscale lanes past `M`, non-trans bytes past `N`): define it on the operand extents and let over-reads wrap (review S-10, undecided). `core/acc` stream contract (S-11, undecided). DTAB read and weight prefetch start after the instruction's own semaphore wait, and §4.4 (b) includes the last pass of the previous instruction (S-12).
+- `RANGE` is defined on bytes read, but the MXU reads past its operands by design (4 `cs` lanes per pass, rowscale lanes past `M`, non-trans bytes past `N`): define it on the operand extents and let over-reads wrap (review S-10, undecided). `core/acc` stream contract: decided, M-19 and [acc.md](acc.md). DTAB read and weight prefetch start after the instruction's own semaphore wait, and §4.4 (b) includes the last pass of the previous instruction (S-12).
 - Timing (Phase 6): the fan-out of A and `swap`/mode along a PE row, the 66-stage sideband, whether `REG_DOT` is enough.
 - Formal: k-induction does not close (its step starts from arbitrary pipeline contents; P1 and P3 need a joint invariant of the free flags, the weight-tag pipeline and the shadow bookkeeping, and of the sideband chain against the gap counter), so P1-P5 are bounded to depth 56. Bounded liveness (an instruction in flight completes within N cycles) did not scale (16 minutes per step at depth 52); deadlock freedom rests on simulation (random and 40-cycle A stalls) and on the cover points. Tap timing relative to the swap is checked by `tb_mxu_array`, not by P1, which uses the tap signal itself. Larger tiles (`BPG > 1`, `DIM = 16`) are not covered by the proofs. With M <= 2 a pass is too short for the next instruction's token to arrive during it, so the proofs cannot see a stream FSM that reads the token registers instead of its own copy (mutant `token_live`, not caught at depth 72); the system test kills it by a wide margin (long passes).

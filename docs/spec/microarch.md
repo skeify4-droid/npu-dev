@@ -720,7 +720,7 @@ Conventions:
 | w_rd | out/in | 512 B/cycle | valid/ready | stationary loads (8 lanes per beat) |
 | scale_rd | out/in | 64 B/cycle | valid/ready | rowscale / colscale |
 | fault | out | valid 1, cause 4, addr 64 | pulse | legality faults of `MXU_MM` (isa.yaml, review finding S-9) to `core/seq` `fault_in`; the MXU stops taking instructions |
-| acc_rmw | out/in | `DIM` x 32 read + `DIM` x 32 write per cycle (`FULL` 64) | fixed latency | ACC update |
+| acc_* stream | out | row 11, part `DIM` x 32, ncols 7, rescale / overwrite / use_cs 1 each, rowscale 32, cs `DIM` x 32, last 1; in: `acc_done` | push, **no ready**; `acc_done` exactly `ACC_LAT` cycles after the `acc_last` row | one output row per cycle to the ACC, which does the read-modify-write; payload valid only in the `acc_valid` cycle; `ACC_LAT` from `acc_pkg`, checked at elaboration. [acc.md](acc.md) §3, §5 (review finding S-11) |
 | sem_inc | out | 6 + 4 | pulse | completion |
 | fp_flags | out | 4 | pulse, valid-qualified | `mxu_pe` flags at the bottom of each column, for rows `< M` and columns `< N` only, masked for `REG_DOT + 64·REG_OUT` cycles plus the A skew after reset (arith.md contract items 2-4) |
 
@@ -730,7 +730,7 @@ Conventions:
 |---|---|---|---|---|
 | q_pop | in | instruction + operands | valid/ready | VQ |
 | spm_rd[2] / spm_wr | out | 512 B/cycle each | valid/ready, banked | operand streams |
-| acc_rd | out/in | 4 rows x 64 x 32 | fixed latency | ACC epilogues |
+| acc_rd / acc_wr | out/in | 4 rows x `DIM` x 32 | valid/ready, fixed latency | ACC epilogues; ACC as source / destination (the ACC table's `vpu_rd` / `vpu_wr`) |
 | dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant (review finding V-9) | operand shapes when an instruction starts |
 | sem_inc | out | 6 + 4 | pulse | completion |
 | fp_flags | out | 4 | pulse, valid-qualified | VPU and SFU arithmetic and conversions, including `VQUANT` (Inf and NaN in a block detected from its inputs; arith.md contract item 8) |
@@ -816,10 +816,10 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| mxu_rmw | in/out | `DIM` x 32 read + `DIM` x 32 write per cycle (`FULL` 64), row index 11 | fixed latency (read 2 cycles) | K-tile accumulation, `rowscale` / `colscale` at the input |
-| vpu_rd / vpu_wr | in/out | 4 rows x 64 x 32 per cycle | fixed latency | epilogues; ACC as a VPU operand or destination (space `ACC`) |
-| conflict | out | 1 | level | same-row MXU write and VPU access in one cycle: the VPU stalls (semaphores make this rare) |
-| fp_flags | out | 4 | pulse, valid-qualified | `acc_update` lanes (rowscale, colscale, add) of the columns `< N` (arith.md contract item 5) |
+| acc_* stream | in/out | as the MXU table (inputs) + `acc_done` (out) | push, no ready; one row per cycle always accepted; fixed latency `ACC_LAT` = `acc_pkg::ACC_LAT` (8 budget) | K-tile accumulation: `colscale` of `part` in an input stage in parallel with the SRAM read, `rowscale` of the old row, add or overwrite; word-masked write for columns `< ncols`; row = `DIM` FP32. [acc.md](acc.md) §3-§6 |
+| vpu_rd / vpu_wr | in/out | 4 rows x `DIM` x 32 per cycle (`FULL` 64) | valid/ready (ready per port), fixed latency after acceptance; a 4-row request is accepted whole or refused and repeated | epilogues; ACC as a VPU operand or destination (space `ACC`) |
+| (priority) | | | rule, no port | **the MXU stream wins every SRAM port conflict, on any row**, via `vpu_rd` / `vpu_wr` `ready`; the MXU is never delayed (replaces the same-row `conflict` level, review finding S-11; acc.md §7) |
+| fp_flags | out | 4 | pulse, valid-qualified | `acc_update` lanes (rowscale, colscale, add) of the columns `< ncols` (arith.md contract item 5); a row's flags no later than its write-visible cycle, so those of the `acc_last` row no later than `acc_done` and the MXU's `sem_inc` (acc.md §6) |
 
 **Leaf router (`noc/leaf`)**, 24 per die
 
