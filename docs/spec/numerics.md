@@ -111,7 +111,7 @@ blocks; the last tile may be shorter):
    written `0x7F` with `NAN_IN`). The DMA engine drops the written value and the flags of those positions.
 2. Choose `c`, the smallest integer with `amax ≤ 448 · 2^c` (`c = 0` for an all-zero tile).
 3. Write the elements `v = RNE_E4M3(w · 2^-c)` with `sat`. Because of step 2 it never saturates.
-4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). `fold_c` (`rtl/arith`) produces
+4. Write the column scale `cs[t][r] = 2^c` (× the FP32 tensor scale `R[ts_reg]` for NVFP4). The array is `[K tiles, N]` (`r` is the column `n`), the orientation of `mxu_mm` and the ISA (review finding S-1; the golden `fold_e4m3` and `unfold` still use `[N, K tiles]` and change to this orientation, mxu.md M-12). `fold_c` (`rtl/arith`) produces
    `2^c`.
    - **NVFP4:** the DMA engine multiplies it by `R[ts_reg]` with one `fp32_mul` (RNE, DAZ/FTZ) and ORs that multiply's flags
      into `FP_STATUS` (OVERFLOW for a huge `T`, NAN_IN for a NaN `T`). The operand is named in isa.md §5; the multiply, its
@@ -164,7 +164,14 @@ a block with a NaN input sets `NAN_IN`; a block with an Inf and no NaN makes a N
 - E5M2 and FP16 tensors are converted to BF16 by the DMA; the MXU has no E5M2 or FP16 datapath. E5M2 → BF16 is exact; FP16 →
   BF16 rounds (RNE, 11 to 8 significand bits, relative error ≤ 2^-9), so an FP16 tensor loses 3 significand bits on the way
   to the MXU.
-- `BF16X3` (below).
+- `BF16X3`: **reserved in v1** (`ILLEGAL_FIELD`, isa.md §5; review finding S-6). Its definition is kept below for a later version.
+
+**Geometry parameter `DIM`** (review finding S-2; mxu.md M-13). The array is `DIM` × `DIM` PEs: `DIM` = 64 in `FULL`, 16 in `MID`, 8 in
+`TINY`. Everything below that says 64 is `DIM`: the K tile is `4·DIM` FP8 or `2·DIM` BF16 elements (256 / 128 in `FULL`), the N
+tile is `DIM`, the partial sum passes PE rows `0..DIM-1`. **The accumulation order, so the last bits of a result, depend on `DIM`**:
+a K = 64 FP8 instruction is one chain of 16 PE rows in `FULL` and two chains of 8 rows (their partials added in the ACC) in `TINY`.
+Bit-exactness is therefore per config (N-8); a `TINY` result differs from `FULL` by FP32 rounding (15 of 32 outputs of a
+M = 4, K = 64, N = 8 example). The fold tile does not change with `DIM` (step 4 below).
 
 **FP8 PE.**
 - Each PE holds 4 stationary E4M3 weights.
@@ -176,30 +183,32 @@ a block with a NaN input sets `NAN_IN`; a block with an Inf and no NaN makes a N
 **BF16 PE.**
 - At half rate the PE holds 2 stationary BF16 weights and forms 2 exact products (16 significant bits each).
 - It rounds their exact sum once to FP32, then does the same FP32 add as in FP8 mode.
-- A BF16 stationary tile is K = 128 × N = 64. A rows (128 BF16 = 256 B) stream one per cycle, so the array does 8,192 BF16 MAC/cycle,
+- A BF16 stationary tile is K = `2·DIM` × N = `DIM` (`FULL`: 128 × 64). A rows (`FULL`: 128 BF16 = 256 B) stream one per cycle, so the array does 8,192 BF16 MAC/cycle,
   half the FP8 rate (arch.md). This corrects microarch.md §2.2, which had each BF16 row taking 2 cycles (quarter rate).
 - Each PE needs two BF16 multipliers next to its four FP8 ones. Phase 6 synthesis costs this, since sharing the FP8 multipliers would
   give quarter rate.
 
 **Order** (bit-reproducible):
 1. Per K tile, the partial sum enters the top PE row as +0.
-2. It passes PE rows 0..63 in order. PE row i holds K elements `4i .. 4i+3` (FP8) or `2i, 2i+1` (BF16) of the tile.
+2. It passes PE rows `0..DIM-1` in order (`FULL`: 0..63). PE row i holds K elements `4i .. 4i+3` (FP8) or `2i, 2i+1` (BF16) of the tile.
 3. The tile's partial P_t (FP32) leaves the bottom of the array.
 4. At the ACC input:
    - `RESCALE`, once before the first tile: `ACC ← RNE(ACC × rowscale[m])`.
-   - if `cs_reg` is set: `P_t ← RNE(P_t × cs[t][n])`;
+   - if `cs_reg` is set: `P_t ← RNE(P_t × cs[t // R][n])`, with `R = 64 / DIM` (`R = 1` in `FULL`): the scale array is per 256-deep
+     FP8 / 128-deep BF16 fold tile in every config (isa.md §5), and a shorter MXU tile of a reduced config uses the scale row that
+     covers it (review finding S-2). The array is `[K tiles, N]`, row pitch `roundup(4·N, 64)` B (review finding S-1);
    - `OVERWRITE` on the first tile: `ACC ← P_t`;
    - otherwise: `ACC ← RNE(ACC + P_t)`.
-5. K tiles are taken in ascending K, starting at the instruction's K origin.
+5. K tiles (`4·DIM` / `2·DIM` deep) are taken in ascending K, starting at the instruction's K origin.
    - Splitting K differently (across instructions, or across cores followed by a reduction) changes results only at FP32 rounding level.
    - The compiler records the split, so the golden model can follow it.
 
-**`BF16X3`.**
+**`BF16X3`** (reserved in v1, see above; the definition is the contract of a later version and of `numerics.mxu_mm_bf16x3`).
 - The operands are split as `A = A_hi + A_lo` and `W = W_hi + W_lo`, where `x_hi = RNE_BF16(x)` and `x_lo = RNE_BF16(x − x_hi)`.
-- Per 128-deep K tile there are three passes, `A_lo·W_hi`, `A_hi·W_lo`, `A_hi·W_hi`, accumulated into ACC in that order.
+- Per `2·DIM`-deep K tile there are three passes, `A_lo·W_hi`, `A_hi·W_lo`, `A_hi·W_hi`, accumulated into ACC in that order.
 - The result is FP32-class: it drops `A_lo·W_lo` (about 2^-16 of each product) and the rounding of the lo parts.
 - When A is exactly BF16 (`A_lo = 0`, as for the hyper-connection stream), the compiler issues two `NORMAL` BF16 passes instead:
-  `W_lo` with `ACCUM`, then `W_hi`. The result is identical in 2/3 of the time.
+  `W_lo` with `ACCUM`, then `W_hi`. The result is identical in 2/3 of the time. This is the only form v1 runs (the mHC mixer, D2).
 
 **Accuracy (E4).**
 - K = 16384, measured: the specified order is within 2.1 ulp (FP8) and 3.8 ulp (BF16) of the exact result at the largest output.
@@ -319,11 +328,17 @@ Measured (MiniMax expert shape, three weight distributions):
 | Exact BF16 path | 2e-7 |
 
 Decision D1:
-- **Decode and other memory-bound GEMMs use the exact path** (`cvt NVFP4_BF16`). Decode is HBM-bound, and every stage of the weight
-  path keeps a 1.60x margin over a core's HBM share at 0.85 with NVFP4 expanded to BF16 (1.36x at peak share): the DMA converter
-  (256 elements/cycle) and the stationary-load port (512 B/cycle) carry 256 BF16 elements per cycle, and the DMA SPM write port
-  (512 B/cycle) carries 248, because it also writes the block scales into the staging ring before the data (review finding V-1;
-  numerics_experiments.md E1).
+- **Decode and other memory-bound GEMMs use the exact path** (`cvt NVFP4_BF16`). Decode is HBM-bound, and the stages of the weight
+  path before the MXU keep a 1.60x margin over a core's HBM share at 0.85 with NVFP4 expanded to BF16 (1.36x at peak share): the
+  DMA converter (256 elements/cycle) carries 256 BF16 elements per cycle, and the DMA SPM write port (512 B/cycle) carries 248,
+  because it also writes the block scales into the staging ring before the data (review finding V-1; numerics_experiments.md E1).
+  - **The MXU is the narrowest stage on this path** (review finding S-5, mxu.md M-17). The stationary-load port could carry 256
+    BF16 elements per cycle (512 B / 32 cycles), but a tile period of about 39 cycles at `M = 1` (two shadow buffers; measured
+    21-22 cycles at `DIM` 32, **extrapolated** to `FULL`, not simulated) gives 16 KiB / 39 = 420 B/cycle, **210 BF16 elements per
+    cycle**: **1.16x** the core's peak HBM share (181 elements/cycle for NVFP4) and 1.36x at 0.85 (154). At a 48-cycle period
+    (a colliding pitch, memmap.md §4) it would be 0.94x, so decode GEMMs need a conflict-free pitch. Closing the gap needs a
+    third shadow buffer (period 32, mxu.md §9) or a measured period at `DIM` 64.
+  - The FP8 paths (always the fold for MXFP4 / MXFP8) keep 420 B/cycle against 193 elements/cycle at peak share: 2.2x (2.6x at 0.85).
   - Review finding I-3: the margin was first checked at the stationary-load port only. The DMA SPM write port was then 256 B/cycle,
     which held the exact path to 0.83x of the HBM share. It is now 512 B/cycle (microarch.md §2.5).
   - The fold paths are also held to 256 elements per cycle by the converter: 1.56x (MXFP4) and 1.65x (NVFP4) over the share.
@@ -384,7 +399,10 @@ Kahan-style compensation are needed.
     bit-exact tests of the ACC and the MXU keep tiles out of that range. No real weight reaches it.
 - Reference libraries: `ml_dtypes` agrees with the golden model on FP32 inputs. It rounds float64 inputs twice (through float32), so
   tests compare on FP32 values, which is all the hardware ever converts.
-- **MXU, bit-exact** against `mxu_mm` for the same tiling, except the fold tiles exempted above.
+- **MXU, bit-exact** against `mxu_mm(…, dim=DIM)` for the config's `DIM` and the same tiling, except the fold tiles exempted above
+  (review finding S-2). The model takes a `dim` parameter (default 64): PE rows `0..dim-1`, K tile `4·dim` / `2·dim`, `cs[t // R]`.
+  `TINY` (8) and `MID` (16) tests compare with `dim` 8 and 16 and the ACC image has `dim` FP32 per row; they do not compare with
+  the `FULL` order, which rounds differently. *(Implemented in `numerics.py`: not yet. mxu.md M-12 / M-13 list the model changes.)*
 - **SFU:** the ulp bounds of N-4.
 - **Fused VPU instructions:**
   - FP32 outputs within the composed bound: the sum of the SFU bounds used plus 1 ulp per lane operation, against a golden model that

@@ -259,7 +259,8 @@ def test_diectl_and_corectl(isa):
 
 def test_spm_bank_strides():
     """I-13(a), memmap.md section 4: row starts at power-of-two pitches do not all spread, and a stationary load of two
-    256 B rows per cycle collides at 2, 4 and 64 KiB pitches; padding the pitch (512 B, or 1 KiB at 16 KiB) removes it."""
+    256 B rows per cycle collides at 2, 4 and 64 KiB pitches; padding the pitch (512 B, or 1 KiB at 16 KiB) removes it. These are
+    facts of the hash; the MXU's 8-row beat has its own pitch rule (test_mxu_load_beat_pitches, review S-4)."""
     def pair_ok(pitch):
         rb = lambda base: {I.spm_bank(base + o) for o in range(0, 256, 64)}
         return all(not (rb(i * pitch) & rb((i + 1) * pitch)) for i in range(0, 128, 2))
@@ -270,20 +271,24 @@ def test_spm_bank_strides():
         assert pair_ok((1 << k) + (1024 if k == 14 else 512))
 
 
-def test_spm_bank_strides_over_tile_bases():
-    """V-8: the padded pitches are conflict-free for two-row stationary loads at every 2 KiB-aligned tile base (the rule in
-    memmap.md section 4), and every one except 8 KiB + 512 B also at every 256 B-aligned base. At 8 KiB + 512 B half of the
-    256 B-aligned bases collide, which is why the rule asks for 2 KiB."""
-    def pair_ok(pitch, base):
-        rb = lambda b: {I.spm_bank(b + o) for o in range(0, 256, 64)}
-        return all(not (rb(base + i * pitch) & rb(base + (i + 1) * pitch)) for i in range(0, 128, 2))
-    padded = [(1 << k) + (1024 if k == 14 else 512) for k in range(11, 18)]
-    for p in padded:
-        assert all(pair_ok(p, b) for b in range(0, 1 << 17, 2048))
-        bad = sum(not pair_ok(p, b) for b in range(0, 1 << 17, 256))
-        assert bad == (256 if p == 8192 + 512 else 0)
-    assert pair_ok(8192 + 512, 0) and not pair_ok(8192 + 512, 0x200)       # the verifier's example base
-    assert all(len({I.spm_bank(b + o) for o in range(0, 2048, 64)}) == 32 for b in range(0, 1 << 22, 2048 * 7))
+def test_mxu_load_beat_pitches():
+    """S-4, M-17 (replaces the two-row V-8 test): the MXU loads a stationary tile in beats of 8 rows x 64 B (trans, non-trans FP8)
+    or 4 rows x 128 B (non-trans BF16), mxu.md section 4.3. With 1R per bank a beat takes as many cycles as its busiest bank has
+    lanes; a FULL tile is 32 beats, so 32 cycles is conflict-free. The pitch rule of memmap.md section 4 (2 KiB + 1 KiB, 4 KiB
+    and 8 KiB + 512 B, 16 KiB + 1 KiB, 32 KiB and up + 512 B) must be conflict-free at every 2 KiB-aligned base; the old rule
+    (2 KiB + 512 B) costs 48 cycles per tile; and only 26 of the 256 pitches 64 B..16 KiB are conflict-free for all three shapes."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts", "mxu_review"))
+    import pitch_scan as P
+    import spec_checks as S
+    for a in range(0, 1 << 22, 64 * 37):                                  # the review script's hash is the ISA's
+        assert S.bank(a) == I.spm_bank(a)
+    for p in P.PADDED:
+        assert P.tile_cycles(p) == {"trans": 32, "non-trans FP8": 32, "non-trans BF16": 32}, p
+    assert P.tile_cycles(2048 + 512) == {"trans": 48, "non-trans FP8": 48, "non-trans BF16": 32}    # the pre-S-4 rule
+    assert P.tile_cycles(2048)["non-trans BF16"] == 64 and P.tile_cycles(16384)["trans"] == 64     # unpadded
+    ok = P.conflict_free_pitches()
+    assert len(ok) == 26 and 3072 in ok and 2560 not in ok
+    assert P.tile_cycles(4096 + 512, bases=[i * 256 for i in range(256)])["non-trans BF16"] == 40     # 256 B bases: why 2 KiB
 
 
 def _td(isa, **f):

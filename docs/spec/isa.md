@@ -186,7 +186,8 @@ Rules:
 - The descriptor gives:
   - dtype and space (GLOBAL, SPM, ACC, DTAB, IMEM);
   - flags (PAGED, IDX64, WRAP, SCALE_INLINE, SCALE_REGION; SCALE_INLINE is reserved in v1 and faults `ILLEGAL_FIELD`,
-    review finding X-16);
+    review finding X-16; `WRAP` is for DMA operands only, and an `MXU_MM` operand with any flag faults `ILLEGAL_FIELD`, review
+    finding S-8);
   - up to 4 dimensions (`n0` contiguous, `n1`-`n3` with signed byte strides `s1`-`s3`; stride 0 broadcasts);
   - `aux0`: the scale row stride of a block format (or the `VSOFTMAX` softcap);
   - `row_bytes`: the row size of a gather or scatter;
@@ -231,7 +232,7 @@ Rules:
   | `idx_reg` | SPM offset of the index list (gather, scatter) |
   | `n_reg` | override of the outermost count (0: from the TD) |
   | `scale_reg` | address of the scale of the base element's block, in the scale array of a non-paged block-format operand (row stride TD `aux0`; memmap.md §6). The base element starts a block (review finding W-5). Unused with `SCALE_INLINE` (Z-4) |
-  | `aux_reg` | SPM offset where the FP8-target conversions and `NVFP4_BF16` write the FP32 column scales (R0: none) |
+  | `aux_reg` | SPM offset where the FP8-target conversions and `NVFP4_BF16` write the FP32 column scales (R0: none); 64 B aligned, layout below (review finding S-1) |
   | `pt_reg` | SPM offset of the page table of the PAGED operand (at most one operand is PAGED) |
   | `ts_reg` | NVFP4 FP32 tensor scale in bits [31:0] (R0: 1.0) |
 
@@ -254,7 +255,18 @@ Rules:
 - **Block-scale contract:**
   - Converting MXFP4 / NVFP4 / MXFP8 to E4M3 writes the elements plus one FP32 **column scale** per (output row of the weight,
     256-deep K tile) to `aux_reg`.
-  - `MXU_MM` multiplies each K tile's partial sum by it (`cs_reg`).
+  - **Layout of the column-scale array** (review finding S-1; one definition for `DMA_COPY` and `MXU_MM`, `isa.yaml`): FP32
+    `[KT x N]`, row-major, row pitch `CSP = roundup(4·N, 64)` bytes. The scale of K tile `t` and destination row (column of the
+    GEMM) `n` is at `R[aux_reg] + t·CSP + 4·n`. `N` is the destination row count (`n1·n2·n3`), `KT = ceil(n0 / 256)` (128 for
+    `NVFP4_BF16`). The pitch is derived, not a field, so `N` is free (a ragged 40-key tail works) and the DMA never pads; the
+    words of a row past `N` are not written, and the MXU's column mask `ncols` ignores them. `aux_reg`, and so `R[cs_reg]` of the
+    `MXU_MM` that reads the array, is 64 B aligned.
+  - `MXU_MM` multiplies each K tile's partial sum by it (`cs_reg`, same formula: tile `t`, column `n` at `R[cs_reg] + t·CSP +
+    4·n`).
+  - **Reduced configs** (review finding S-2). The fold tile written by the DMA stays 256 FP8 / 128 BF16 deep in every config, so
+    the DMA and the fold numerics do not depend on the config. The MXU of `TINY` / `MID` has a shorter K tile (`4·DIM` FP8 /
+    `2·DIM` BF16); its pass `t` reads scale row `t >> log2(64 / DIM)` (numerics.md N-3), i.e. the DMA's scale is used for
+    `64 / DIM` consecutive MXU tiles (`DIM` 8: 8 tiles). No scale is replicated in SPM.
   - The per-16 / per-32 block scales inside a K tile are folded into the elements (exact for MX formats unless an element underflows;
     NVFP4 rounds, see numerics.md N-2).
   - Converting to BF16 is exact and needs no column scales. The NVFP4 FP32 tensor scale `R[ts_reg]` still goes into `aux_reg` as a
@@ -295,15 +307,28 @@ Rules:
   (`DMA_SCATTER`) form (review finding W-4).
 
 **MXU (`MQ`):**
-- `MXU_MM` computes `ACC (+)= A x W` for any M (≤ ACC rows / N tiles), K and N. Inside the instruction the MXU tiles K (256 FP8 or
-  128 BF16 deep) and N (64 wide).
+- `MXU_MM` computes `ACC (+)= A x W` for any M (≤ ACC rows / N tiles), K and N. Inside the instruction the MXU tiles K (`FULL`:
+  256 FP8 or 128 BF16 deep; a reduced config `4·DIM` / `2·DIM`, which changes the accumulation order and so the last bits of the
+  result, numerics.md N-3, review finding S-2) and N (`FULL` 64 wide, else `DIM`). An ACC row is 64 FP32 in `FULL` and `DIM` FP32
+  in `TINY` / `MID` (memmap.md §4).
 - `trans_w` takes W in `[N, K]` layout: HF weights, and K-cache tiles for `Q K^T`.
 - `acc_mode`:
   - `OVERWRITE` (first K tile writes);
   - `ACCUM`;
   - `RESCALE`: multiply existing ACC rows by `rowscale` first; this is the FlashAttention `O = alpha * O + P V` update.
-- `mode = BF16X3` emulates FP32 with three BF16 passes (numerics.md N-3). The hyper-connection mixer uses its two-pass form (the
-  stream is exact in BF16, so the `A_lo` pass is dropped; numerics.md D2).
+    `rs_reg` is non-zero exactly with `RESCALE` (review finding S-9).
+- **`mode = BF16X3` is reserved in v1** (review finding S-6; like `SCALE_INLINE`): `ILLEGAL_FIELD`, as are the undefined values 2-7
+  of the field. The definition (FP32-like, three BF16 passes) stays in numerics.md N-3 for a later version. The hyper-connection
+  mixer uses its two-pass `NORMAL` form (the stream is exact in BF16, so the `A_lo` pass is dropped; numerics.md D2).
+- **`MXU_MM` legality** (review findings S-1, S-3, S-6 to S-9; the full list, the priority and the `FAULT_ADDR` contents are in
+  `isa.yaml` `MXU_MM`, rendered in isa_ref.md). One rule set for every config:
+  - A base, W base, the `s1` of both, `R[cs_reg]` and `R[rs_reg]` are 64 B aligned, the SPM bank width, whatever the config (a
+    `TINY` program pads `s1` to 64 B); `N` has no alignment rule;
+  - `n2 = n3 = 1` and no TD flag on A and W; A and W both `E4M3` or both `BF16`; K of A equals K of W; `N ≥ 1`;
+  - `mode` is `NORMAL`, bits `[38:0]` of the word are zero, `acc_mode` ≠ 3, `rs_reg ≠ 0` only with `RESCALE`;
+  - **`M = 0` is legal** (review finding S-7): `M` is `R[m_reg]` as a 64-bit unsigned number (compared in full, never truncated)
+    or `a_td` `n1`. With `M = 0` all checks run, but no SPM or ACC is accessed, no flag is set, and the instruction completes in
+    order and adds `sinc` to `ssem`. A decode step that routes no token to an expert needs no branch around the call (§7).
 
 **VPU (`VQ`), all arithmetic in FP32, outputs rounded to the destination dtype:**
 - `VEW`: element-wise, unary/binary/ternary. Includes the router scoring functions, SwiGLU (also clamped), integer index math.
@@ -331,12 +356,12 @@ Rules:
 | Dense / expert GEMM, LM head, MTP and drafters | `MXU_MM` (+ `DMA_COPY` with `cvt` for 4-bit and MXFP8 weights) |
 | MoE routing and dispatch | `VROUTE`, `VBUCKET`, `DMA_GATHER`, `DMA_SCATTER wop=ADD_F32`, `DMA_LIST` (all-to-all) |
 | GQA / MQA / MLA (absorbed) attention | `MXU_MM trans_w` (`Q K^T`), `VSOFTMAX`, `MXU_MM RESCALE` (`P V`) |
-| Sliding window, attention sinks | `VSOFTMAX` mask `WINDOW`, `WRAP` ring buffers, sink logits as initial `m`/`l` |
+| Sliding window, attention sinks | `VSOFTMAX` mask `WINDOW`, `WRAP` ring buffers (DMA appends at `pos mod window`, attention reads slot order; memmap.md §7, S-8), sink logits as initial `m`/`l` |
 | Indexer sparse attention (DeepSeek, GLM, Mistral, Qwen, Step) | `MXU_MM` scores, `VRED WSUM_RELU`, `VTOPK`, `DMA_GATHER` (paged) |
 | Block top-k (MiniMax) | `MXU_MM` index scan, `VTOPK BLOCKMAX` |
 | Step 5 CSA region summaries | `VEW EXP`, `VRED` grouped, `VEW DIV`, `VQUANT E4M3` |
 | Linear attention (KDA, Gated DeltaNet) | `MXU_MM`, `VSCAN`, `VTRINV`, `VEW` |
-| Hyper-connections, n-gram gather | `HC_*`, `VMATVEC` / `MXU_MM BF16X3`, `DMA_GATHER` (MXFP8 rows, separate scale array; Y-7) |
+| Hyper-connections, n-gram gather | `HC_*`, `VMATVEC` / two `MXU_MM NORMAL` BF16 passes (`BF16X3` is reserved in v1, S-6), `DMA_GATHER` (MXFP8 rows, separate scale array; Y-7) |
 | KV writes (NVFP4 / FP8 / BF16) | `VQUANT` + `DMA_COPY` / `DMA_SCATTER` (paged) |
 | Collectives (TP all-reduce, EP all-to-all, HC-5 small all-reduces) | `DMA_LIST`, `DMA_* wop=ADD`, `DMA_MCAST`, `rsem`, `SIGNAL` |
 
@@ -360,10 +385,24 @@ The FFN `down(swiglu(gate(x), up(x)))` for the tokens routed to one expert.
 Each instruction waits on at most one semaphore. The second `MXU_MM` also depends on S2, so in real code the down-weight DMA signals
 S4 as well and the wait is `S4 >= 2`. The compiler's scheduler does this counting.
 - Bigger experts loop the weight DMA over N chunks in ping-pong buffers, with `wreg` holding the loop counter.
+- `R11 = 0` (no token for this expert in this step) is legal: both `MXU_MM` run as no-ops that still add to `S3` and `S5`, so the
+  semaphore counts the surrounding code waits for stay right and no branch is needed (`M = 0`, review finding S-7).
 
 ## 8. Faults
 
 A fault stops the core, records `FAULT_CAUSE` (isa.yaml enum `fault_cause`) and `FAULT_ADDR`, and sends an interrupt to the CP.
+- **`FAULT_ADDR`** is a 64-bit CSR (review finding S-9). It holds the address the cause names: for `TD_SPACE`, an alignment fault
+  and `RANGE` of an SPM operand, the operand's register value in full (a 49-bit GPA is not truncated); for a `RANGE` of an ACC
+  row of `MXU_MM`, `R[acc_reg]` with bit 63 set, so the CP can tell an ACC row from an SPM offset. A fault with no address
+  (an `ILLEGAL_FIELD` that names no operand) reads 0. There is no instruction index: a queue entry does not carry the PC
+  (microarch.md §2.1). Contents of `MXU_MM` faults per check: `isa.yaml` `MXU_MM`.
+- **Several faults in one instruction** are reported in a fixed order, the first applicable winning (so the golden model predicts
+  `FAULT_CAUSE`): for `MXU_MM`, word fields, then `TD_SPACE`, then descriptor `ILLEGAL_FIELD`, then `RANGE` (`isa.yaml`
+  `MXU_MM`, review finding S-9). `core/seq` latches the first fault of the core and drops later ones; faults of different
+  engines in the same cycle are taken in the order front end, DMA, MXU, VPU, NI (microarch.md §5).
+- **Instructions in flight** in an engine when any engine faults may be cut off or may complete (review finding S-9). Software
+  relies on neither their results (ACC rows, SPM bytes) nor their semaphore increments; the CP restarts the core from a clean
+  state. The faulting instruction itself has no effect: no SPM or ACC access and no semaphore increment.
 - "Stops" means the front end and the engines (review finding V-7). The network interface keeps working: responses to the core's
   outstanding requests are still accepted and dropped (their tags freed), and its SPM, GSRAM and CORECTL targets keep serving
   requests. A response for a tag that is not outstanding is dropped, faulted or not. A tag is freed by its response, by an
@@ -384,7 +423,7 @@ Causes:
 - illegal opcode or field value;
 - a descriptor whose space is not allowed for that operand, including a DMA with both operands `GLOBAL` (`TD_SPACE`);
 - address faults (memmap.md §8), including `RAIL`;
-- ACC or SPM range overflow;
+- ACC or SPM range overflow (`RANGE`; for `MXU_MM` also `NT·M` rows, with `M` taken in full 64-bit, §5);
 - write-add to HBM, and HBM writes that are not 32 B aligned in address and size (hbm.md H-2);
 - an invalid page-table entry in paged DMA;
 - a D2D/C2C link going down with transfers outstanding (`LINK`, from the bridge's `ERR` response; d2d_c2c.md L-4). A request the

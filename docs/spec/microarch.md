@@ -77,15 +77,20 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
   for tens to thousands of cycles.
 
 ### 2.2 MXU: weight-stationary *(P2)*
-- 64 x 64 PEs. Each PE holds 4 stationary FP8 values (K = 4) and computes a 4-way dot product plus the partial sum from the PE above.
-  A stationary tile is K = 256 x N = 64 (16 KiB FP8; BF16: K = 128, each PE a 2-way BF16 dot product, A rows still one per cycle, so
-  half the FP8 MAC rate; numerics.md N-3).
+- 64 x 64 PEs (`DIM` x `DIM` with `DIM` a parameter: 64 `FULL`, 16 `MID`, 8 `TINY`). Each PE holds 4 stationary FP8 values (K = 4) and computes a 4-way dot product plus the partial sum from the PE above.
+  A stationary tile is K = 256 x N = 64 in `FULL` (16 KiB FP8; BF16: K = 128, each PE a 2-way BF16 dot product, A rows still one per cycle, so
+  half the FP8 MAC rate; numerics.md N-3); in a reduced config K = `4·DIM` (FP8) / `2·DIM` (BF16) and N = `DIM`, which changes the
+  accumulation order (numerics.md N-3, review finding S-2). The fold's column-scale tile stays 256 / 128 deep in every config (§4).
 - A rows stream from the left (256 B/cycle, skewed). Partial sums flow down the columns and leave at the bottom: 64 FP32 per cycle into ACC.
 - **Stationary load port 512 B/cycle, double-buffered (shadow weights).**
-  - A tile loads in 32 cycles while the previous tile streams.
+  - A tile loads in 32 cycles while the previous tile streams (the port limit). The **tile period at `M = 1` is longer**: with two
+    shadow buffers the skew of tile `n` against the load of tile `n + 2` into the same buffer bounds it at about **39 cycles** in
+    `FULL` (420 B/cycle; measured 21-22 cycles at `DIM` 32, extrapolated, `DIM` 64 not yet simulated; mxu.md §7, review finding S-5).
+    A pitch that makes the 8-row load beat collide costs up to 48 (§2.3). A third buffer would restore 32 (mxu.md §9).
   - Row-wise or column-wise load: a column load takes 256 contiguous bytes, i.e. one row of an HF `[out, in]` weight. So weights stay in
     their published layout (`trans_w = 1`), and attention can use K-cache tiles as `K^T` with no transpose pass.
-- ACC: 2048 rows x 64 FP32 (512 KiB), read-modify-write at 256 B/cycle each way.
+- ACC: 2048 rows x 64 FP32 (512 KiB), read-modify-write at 256 B/cycle each way. A row is `DIM` FP32 in `TINY` / `MID` (256 / 512 rows
+  of 8 / 16 FP32; review finding S-2).
   - Two FP32 multipliers per column at the ACC input: `rowscale` rescales the existing ACC row (online-softmax `alpha`), and
     `colscale` scales a K tile's partial sum (block-scaled weights, NVFP4 tensor scale).
   - The VPU reads ACC directly (4 rows per cycle).
@@ -96,25 +101,31 @@ Why weight-stationary and not output-stationary:
 
 | | Weight-stationary (chosen) | Output-stationary |
 |---|---|---|
-| Decode (M = 1-30 tokens per expert) | MXU-load-bound at 512 B/cycle of weights: 2.9x the core's HBM share with 4-bit weights expanded to FP8 (174 B/cycle at 85%), 1.5x for BF16 | Needs A and W both streaming at 256 B/cycle each; also M/64 utilization |
+| Decode (M = 1-30 tokens per expert) | MXU-load-bound: port 512 B/cycle, but the tile period of ~39 cycles (extrapolated, §2.2) gives 420 B/cycle of weights: 2.2x the core's peak HBM share with 4-bit weights expanded to FP8 (193 elements/cycle; 2.6x at 0.85), **1.16x for the exact NVFP4 → BF16 path** (210 elements/cycle against a need of 181; 1.36x at 0.85; review finding S-5). Before S-5 this row said 2.9x and 1.5x | Needs A and W both streaming at 256 B/cycle each; also M/64 utilization |
 | SPM read bandwidth for a GEMM | A 256 B/cycle + W during loads only | A 256 + W 256 B/cycle every cycle |
 | Long K | Accumulates in ACC (RMW), any K | Accumulates in PE registers; drains 16 KiB per output tile |
 | Epilogue overlap | VPU reads one ACC region while the MXU fills another | Needs double-buffered PE accumulators (2 x 4096 FP32 registers) |
 | Block-scaled weights | One FP32 multiply per column per K tile at the ACC input | Scale per PE or per K step inside the array |
 
 Decode is HBM-bound on every model (arch.md §2), so the MXU's job in decode is only to keep up with weight bytes. Weight-stationary does that
-at any M. It keeps the FP32 accumulators out of the PE array and makes the block-scale contract (DMA writes FP8 plus FP32 column scales;
+at any M, with the margins above (the exact BF16 path is the thin one: the MXU, not the DMA, is its narrowest stage, numerics.md D1). It keeps the FP32 accumulators out of the PE array and makes the block-scale contract (DMA writes FP8 plus FP32 column scales;
 isa.md §5) a cheap multiply at the ACC input.
 
 ### 2.3 Scratchpad (SPM)
 - 4 MiB, 32 banks x 128 KiB, 64 B per bank access, one read and one write port per bank (1R1W): 2 KiB/cycle read plus 2 KiB/cycle write.
 - Bank = `addr[10:6] ^ addr[15:11]`. Contiguous 2 KiB always covers all 32 banks. Power-of-two row pitches do **not** all spread
   (corrected, review finding I-13): over 64 rows the row starts reach 32, 16, 8, 4, 2 and 1 banks at 2, 4, 8, 16, 32 and 64 KiB.
-  A stationary load of two 256 B rows per cycle therefore collides at 2, 4 and 64 KiB pitches. The compiler pads such SPM pitches
-  by 512 B (1 KiB at a 16 KiB pitch), which makes every power-of-two pitch from 2 to 128 KiB conflict-free (`test_isa.py`) for
-  tiles whose base is 2 KiB aligned. The compiler places stationary-load tiles with a padded pitch that way (review finding V-8):
-  at an 8 KiB + 512 B pitch half of the 256 B-aligned bases collide, and at bases that are only 64 B aligned most padded pitches
-  do. Every other padded pitch is also conflict-free at any 256 B-aligned base.
+  A stationary load of two 256 B rows per cycle therefore collides at 2, 4 and 64 KiB pitches (the shape the first rule was derived
+  for). **The MXU's load beat is 8 rows x 64 B (trans and non-trans FP8) or 4 rows x 128 B (non-trans BF16)** (mxu.md §4.3), and
+  the first rule is not conflict-free for it (review finding S-4): at the 2 KiB + 512 B pitch half of the beats collide, 48 cycles
+  per tile instead of 32. **Rule now (mxu.md M-17):** pad a 2 KiB pitch by **1 KiB (3 KiB)**, 4 KiB and 8 KiB by 512 B, 16 KiB by
+  1 KiB, and 32 KiB or more by 512 B. That is conflict-free for all three beat shapes at every 2 KiB-aligned tile base
+  (`scripts/mxu_review/pitch_scan.py`, `test_isa.py::test_mxu_load_beat_pitches`). Stationary-load tiles with a padded pitch start on
+  a 2 KiB boundary (review finding V-8): at 256 B-aligned bases the BF16 non-transposed beat at 4 KiB + 512 B can cost 40 cycles.
+  The other pitches (not powers of two) are mostly not conflict-free: only 26 of the 256 pitches from 64 B to 16 KiB in 64 B steps
+  are, so the compiler keeps a pitch table. A collision is a stall of the beat (the SPM shim of §5), never a wrong result.
+  - MXU A rows (4 lanes, 256 B in `FULL`) are conflict-free for 256 B-aligned A bases and `s1`; at 64 B alignment 6 of 1,024 starts
+    cost one stall cycle (review finding S-4).
   - Not changed: folding `addr[20:16]` into the hash (the review's option) still collides at 2 and 4 KiB, and a hash that spreads
     every row bit over the upper bank bits fixes powers of two but loses on common non-power-of-two pitches (6 and 7 KiB).
 - Peak read clients:
@@ -638,7 +649,14 @@ isa.md §5) a cheap multiply at the ACC input.
 | `MID` | 8 (4 x 2) | 16 x 16 x 4 | 1 MiB / 512 rows | 8 x 16 | 2 stacks, 8 PCs each | 1 D2D | Verilator performance windows, calibration |
 | `FULL` | 32 (8 x 4) | 64 x 64 x 4 | 4 MiB / 2048 rows | 16 x 16 | 4 stacks, 32 PCs each | 4 D2D, 8 C2C | perf simulator only (never built in Verilator) |
 
-Every parameter that differs between configs is a SystemVerilog parameter, and the ISA field widths stay those of `FULL`.
+Every parameter that differs between configs is a SystemVerilog parameter, and the ISA field widths stay those of `FULL`. The
+**semantic widths** (review finding S-2, mxu.md M-13) follow the config where the hardware does, and nowhere else:
+- MXU: K tile `4·DIM` FP8 / `2·DIM` BF16, N tile `DIM`, so a result's last bits depend on `DIM` (numerics.md N-3, N-8);
+  ACC row `DIM` FP32 (`TINY` 8, `MID` 16; `FULL` 64).
+- Not config-dependent: the DMA fold tile (256 FP8 / 128 BF16 elements) and with it the column-scale array (`[K tiles x N]`, row
+  pitch `roundup(4·N, 64)`, isa.md §5); the MXU of a reduced config reads scale row `t >> log2(64 / DIM)` for its tile `t`.
+- Not config-dependent: SPM banks (64 B in every config) and the legality rules of `MXU_MM` (64 B alignment, isa.yaml). The MXU of a
+  reduced config has `DIM`-byte lanes, served by the shim of §5; no SPM client other than the MXU sees `DIM`-byte lanes.
 
 Sizing basis is the Phase 0 calibration (capacity.md):
 - An 8 x 8 PE array synthesizes in 4 s at 0.36 GB.
@@ -675,6 +693,8 @@ Conventions:
 | spm_scalar | out/in | addr 22, data 64 | valid/ready | `LD` / `ST` |
 | csr_if | in/out | addr 12, data 64 | 1-cycle | CSRs |
 | fp_flags_in | in | 6 x 4 | pulse | `fp_flags` of DMA, MXU, ACC, VPU, NI target and the tile's GSRAM slice, ORed into the sticky `FP_STATUS` CSR (write 1 to clear) |
+| fault_in | in | 4 x (valid 1, cause 4, addr 64) | pulse | one per source: DMA (the four DQs merged), MXU, VPU, NI (the front end's own faults enter the same latch). `core/seq` latches the **first** fault into `FAULT_CAUSE` / `FAULT_ADDR`, drops later ones, and takes simultaneous faults in the order front end, DMA, MXU, VPU, NI (review finding S-9). `addr` is the 64-bit `FAULT_ADDR` of isa.md §8, not 32 bits |
+| eng_stop | out | 1 | level | a fault, or a CP stop: the engines stop taking instructions from their queues (isa.md §8). Instructions in flight may be cut off or complete |
 | ctl | in | start, start_pc[11:0] | level | from CORECTL |
 | irq | out | 32 | pulse | to CP via network write |
 
@@ -696,10 +716,11 @@ Conventions:
 |---|---|---|---|---|
 | q_pop | in | instruction + operands | valid/ready | MQ |
 | dtab_rd | out/in | idx 8, data 256 | request/grant (arbitrated in `core/dtab`), data 1 cycle after the grant | `a_td`, `w_td` when an instruction starts (review findings I-11, V-9) |
-| a_rd | out/in | 256 B/cycle | valid/ready | A rows from SPM |
-| w_rd | out/in | 512 B/cycle | valid/ready | stationary loads |
+| a_rd | out/in | 256 B/cycle | valid/ready | A rows from SPM (4 lanes of `DIM` bytes; the shim below turns `DIM`-byte lanes into 64 B bank accesses in `TINY` / `MID`) |
+| w_rd | out/in | 512 B/cycle | valid/ready | stationary loads (8 lanes per beat) |
 | scale_rd | out/in | 64 B/cycle | valid/ready | rowscale / colscale |
-| acc_rmw | out/in | 64 x 32 read + 64 x 32 write per cycle | fixed latency | ACC update |
+| fault | out | valid 1, cause 4, addr 64 | pulse | legality faults of `MXU_MM` (isa.yaml, review finding S-9) to `core/seq` `fault_in`; the MXU stops taking instructions |
+| acc_rmw | out/in | `DIM` x 32 read + `DIM` x 32 write per cycle (`FULL` 64) | fixed latency | ACC update |
 | sem_inc | out | 6 + 4 | pulse | completion |
 | fp_flags | out | 4 | pulse, valid-qualified | `mxu_pe` flags at the bottom of each column, for rows `< M` and columns `< N` only, masked for `REG_DOT + 64·REG_OUT` cycles plus the A skew after reset (arith.md contract items 2-4) |
 
@@ -718,8 +739,23 @@ Conventions:
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| rd_req / rd_rsp [clients] | in/out | addr 22 + 64 B lanes | valid/ready, fixed-latency response | MXU A, MXU W, MXU scales (`scale_rd`), VPU x2, DMA, NI target, scalar |
+| rd_req / rd_rsp [clients] | in/out | addr 22 + 64 B lanes | valid/ready, fixed-latency response | MXU A, MXU W, MXU scales (`scale_rd`), VPU x2, DMA, NI target, scalar. The three MXU clients are **gang requests** (below) |
 | wr_req [clients] | in | addr 22, 64 B lanes, byte mask | valid/ready | VPU, DMA, NI target, scalar |
+
+**MXU ports of the SPM: shim and gang grant** (review finding S-3; mxu.md M-10). The SPM keeps 64 B banks and the same client port in every
+config. The MXU asks for 4 lanes (A), 8 lanes (W) or 1 lane (scales) per request, each lane with its own address, and wants them
+**granted together** with the response exactly `SPM_LAT` cycles after the grant, never back-pressured. A shim `mxu_spm_shim`
+(parameter `DIM`, between the MXU and `core/spm`) serves this:
+- `DIM`-byte lanes are read out of 64 B bank rows (`DIM` divides 64, so a lane never crosses a bank row). At `DIM` 64 the shim only
+  groups the lanes.
+- **The grant is the commit.** When two lanes of one request fall on the same bank (1R per bank), the shim reads the colliding lanes
+  in successive cycles into a collector while `ready` is low, and grants only when the data is complete; the data then follows
+  after exactly `SPM_LAT`. A request therefore never waits for "all its banks free at once", so a bank collision slows the beat by
+  one cycle per extra lane and cannot deadlock the MXU. The MXU needs no change: it already tolerates arbitrary grant stalls
+  (`tb_mxu` runs 30% random stalls).
+- Arbitration with the other clients stays per bank, round-robin with the age bound of §2.3.
+- `core/spm` and the shim are the owners of this contract; `tb_mxu`'s behavioural SPM has no bank model, so the first bank-accurate
+  test is the one for the shim.
 
 **Network interface (`core/ni`)**
 
@@ -776,11 +812,11 @@ The link-layer TX/RX and the behavioral PHY have their own tables in d2d_c2c.md 
 | rd | in/out | idx 8, data 256 | request/grant: one grant per cycle, round-robin over DMA, MXU, VPU; data 1 cycle after the grant | TDs at instruction start |
 | wr | in | 32 B | valid/ready | DMA (space `DTAB`) and CORECTL writes; ordered by software (isa.md §4) |
 
-**Accumulator (`core/acc`)**, 2048 rows x 64 FP32, shared by the MXU and the VPU
+**Accumulator (`core/acc`)**, 2048 rows x 64 FP32 (`FULL`; rows of `DIM` FP32 in `TINY` / `MID`, 256 / 512 rows; review finding S-2), shared by the MXU and the VPU
 
 | Port | Dir | Width | Protocol | Purpose |
 |---|---|---|---|---|
-| mxu_rmw | in/out | 64 x 32 read + 64 x 32 write per cycle, row index 11 | fixed latency (read 2 cycles) | K-tile accumulation, `rowscale` / `colscale` at the input |
+| mxu_rmw | in/out | `DIM` x 32 read + `DIM` x 32 write per cycle (`FULL` 64), row index 11 | fixed latency (read 2 cycles) | K-tile accumulation, `rowscale` / `colscale` at the input |
 | vpu_rd / vpu_wr | in/out | 4 rows x 64 x 32 per cycle | fixed latency | epilogues; ACC as a VPU operand or destination (space `ACC`) |
 | conflict | out | 1 | level | same-row MXU write and VPU access in one cycle: the VPU stalls (semaphores make this rare) |
 | fp_flags | out | 4 | pulse, valid-qualified | `acc_update` lanes (rowscale, colscale, add) of the columns `< N` (arith.md contract item 5) |
@@ -821,7 +857,7 @@ A leaf never forwards between its mesh ports (noc.md §1). Arrivals from a link 
 |---|---|---|
 | HBM to cores (die) | 3,277 B/cycle at peak | 16 HBM leaves x 2 planes x 128 = 4,096 B/cycle (80% at peak); mesh links at most 80% with stack-affine placement, 85% fully interleaved (noc.md §5) |
 | HBM share to one core | 102 B/cycle | 256 B/cycle per network interface (2 planes) |
-| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85) | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle shared with the staged scales, stationary load 512 B/cycle: 248 elements/cycle for NVFP4 → BF16, 256 in FP8 (numerics.md D1) |
+| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85); NVFP4 → BF16: 181 / 154 | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle shared with the staged scales: 248 elements/cycle for NVFP4 → BF16, 256 in FP8. **MXU at the tile period of ~39 cycles (extrapolated, §2.2): 420 B/cycle, 420 FP8 or 210 BF16 elements/cycle: 2.2x (FP8, peak share; 2.6x at 0.85) and 1.16x (NVFP4 → BF16; 1.36x at 0.85), the narrowest stage on the exact path.** The port limit alone (32 cycles) would give 512 B/cycle (2.65x, 1.41x). With a colliding pitch (48 cycles) 0.94x (review finding S-5; numerics.md D1) |
 | D2D | collectives; the Phase 1 roofline is insensitive to D2D bandwidth above 1 TB/s | 1.4 TB/s per direction payload |
 | C2C | 0.8 TB/s per die (8 ports) | 4 leaves x 256 B/cycle = 1.5 TB/s (55% at peak) |
 | Prefill MXU feed | A 256 B/cycle + W 16 KiB per 256 A rows | SPM 2 KiB/cycle read |

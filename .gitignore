@@ -10,6 +10,7 @@ sim/perf/build/
 __pycache__/
 .pytest_cache/
 *.pyc
+logs/*
 logs/*.log
 logs/*.mem.log
 syn/gen/

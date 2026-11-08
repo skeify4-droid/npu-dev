@@ -58,16 +58,16 @@ enums:
   td_flags:          # bit positions inside the TD flags byte
     PAGED: 0         # dim 1 (the row) is translated through a page table (DMA pt_reg; memmap.md section 6)
     IDX64: 1         # index lists are int64 (default int32)
-    WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV)
+    WRAP: 2          # dim-1 index wraps modulo n1 (ring buffers, e.g. sliding-window KV). DMA operands only: an MXU_MM operand with any TD flag faults ILLEGAL_FIELD (review S-8, mxu.md M-16)
     SCALE_INLINE: 3  # RESERVED in v1: a TD with this flag faults ILLEGAL_FIELD (review X-16; no surveyed model uses it). Defined for a later version: block scales follow each row's n0 elements instead of a separate array (MXFP8 rows of 256 + 8 B, for a table a runtime repacks; the Engram table as published keeps a separate scale array, review Y-7); non-paged; base and s1 need no block alignment; a gather's row_bytes must be the row's size, 0 included (memmap.md section 6, isa.inline_addr, review Z-4, Y-7)
     SCALE_REGION: 4  # PAGED: address the scale region of each page (offset sc_off, row stride aux0) instead of its data
   cvt:               # DMA conversion on the way into the destination (source format -> destination format)
     NONE: 0
-    MXFP4_E4M3: 1    # writes E4M3 data + FP32 column scale per (row, 256-element K tile) to aux_reg
+    MXFP4_E4M3: 1    # writes E4M3 data + FP32 column scale per (row, 256-element K tile) to aux_reg, layout [K tiles x N] with row pitch roundup(4N, 64) B (DMA_COPY; review S-1)
     NVFP4_E4M3: 2    # same contract; per-16 scales folded, residual rounded RNE (numerics.md N-2); column scale x R[ts_reg]
     MXFP8_E4M3: 3    # same contract
     MXFP4_BF16: 4    # exact
-    NVFP4_BF16: 5    # exact; the FP32 tensor scale R[ts_reg] goes to aux_reg as column scales (one per 128-deep BF16 K tile)
+    NVFP4_BF16: 5    # exact; the FP32 tensor scale R[ts_reg] goes to aux_reg as column scales (one per 128-deep BF16 K tile; same [K tiles x N] layout and pitch as the E4M3 targets, review S-1)
     MXFP8_BF16: 6
     E4M3_BF16: 7
     E5M2_BF16: 8
@@ -84,7 +84,7 @@ enums:
     RESCALE: 2       # ACC <- rowscale[m] * ACC before the first K tile (online-softmax O update), then accumulate
   mxu_mode:
     NORMAL: 0
-    BF16X3: 1        # FP32-like: A and W split into BF16 hi + lo, 3 passes (hi*hi + hi*lo + lo*hi)
+    BF16X3: 1        # RESERVED in v1: MXU_MM with this mode faults ILLEGAL_FIELD (review S-6; as SCALE_INLINE). Defined for a later version: FP32-like, A and W split into BF16 hi + lo, 3 passes (hi*hi + hi*lo + lo*hi; numerics.md N-3, numerics.mxu_mm_bf16x3). The mHC mixer uses two NORMAL BF16 passes (numerics.md D2). Values 2-7 of the 3-bit mode field are undefined and fault ILLEGAL_FIELD
   vew_func:
     COPY: 0          # also dtype conversion: dst dtype from its TD
     NEG: 1
@@ -175,7 +175,7 @@ enums:
     PC: 0x003
     STATUS: 0x004    # queue busy bits, fault bit; the DMA stays busy while tags or write bursts are outstanding, also after a fault or a CP stop (review W-2, Z-7)
     FAULT_CAUSE: 0x005
-    FAULT_ADDR: 0x006
+    FAULT_ADDR: 0x006  # 64 bits (a 49-bit GPA is kept whole). Contents per cause and instruction: isa.md section 8; MXU_MM: its desc below (review S-9)
     FP_STATUS: 0x007   # sticky FP flags, write 1 to clear: [0] INVALID [1] OVERFLOW [2] SATURATE [3] NAN_IN (numerics.md N-5)
     PERF_SEL: 0x010
     PERF_CNT0: 0x011
@@ -184,7 +184,7 @@ enums:
     DMA_STAGE: 0x021     # DMA staging ring in SPM (microarch.md section 2.5, review V-1, W-1, Z-1, Z-3, Y-1): [21:0] base, [53:32] bytes (both 64 B aligned); below 2 KiB (0 included) or above 32 KiB (the tag table's 11-bit ring offset in 16 B units, review N-4) a block-format conversion faults ILLEGAL_FIELD. An entry's scales and raw slots are taken together at its first scale read, every data read belongs to one entry, and an entry without raw slots covers at most one data request; the DQs allocate in turns of 8 data granules when one waits for the ring, and a turn passes as soon as its holder has no entry it could start but for ring space, credits, pace or the issue turn (review Y-3, X-7, X-10; isa.staging_ring)
     DMA_PACE: 0x022      # converting-read pacing (microarch.md section 2.5, review Z-2, Y-2, Y-6): [17:0] the most weighted bytes of converting reads (scale and data reads of block-format transfers) in flight, 64 B aligned; NVFP4 counts its bytes, MXFP4 half, MXFP8 a quarter, and the reads of an entry whose data is one granule (a row gather) count in full (review X-14); the limit is min(this, 4.5 x the DMA_STAGE size); a converting read may always issue when none is in flight; 18-bit counter; reset 72 KiB (0x12000), about the HBM share x the round trip the 16 KiB ring covers; 0: tags only. Plain reads are limited by tags only
     NI_EPOCH: 0x023      # [0] epoch put in every request header (noc_header epoch); the CP toggles it on every core of a step while the step is stopped, before a restart; a response, ack or LINK ERR whose epoch differs is dropped without a fault (d2d_c2c.md L-4 (f), review Y-10, X-13)
-  fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address or the instruction index
+  fault_cause:         # FAULT_CAUSE CSR values (isa.md section 8); FAULT_ADDR holds the address named by the cause (MXU_MM: desc of MXU_MM). Where a fault has no address FAULT_ADDR is 0: there is no instruction index, a queue entry does not carry the PC (review S-9)
     NONE: 0
     ILLEGAL_OP: 1      # unknown opcode
     ILLEGAL_FIELD: 2   # enum value or field combination not allowed
@@ -192,7 +192,7 @@ enums:
     ADDR_UNMAPPED: 4   # memmap.md section 8: unmapped, reserved, or hole
     ADDR_FORBIDDEN: 5  # access type not allowed for that initiator and region (memmap.md section 8 table)
     RAIL: 6            # destination node is on the other rail of another package (noc.md section 4)
-    RANGE: 7           # ACC rows or SPM offset beyond the end
+    RANGE: 7           # ACC rows or SPM offset beyond the end (MXU_MM: FAULT_ADDR bit 63 set = an ACC row, clear = an SPM offset; review S-9)
     HBM_WADD: 8        # write-add / max to HBM
     HBM_ALIGN: 9       # HBM write not 32 B aligned in address and size (hbm.md H-2)
     SEM_BUSY: 10       # SSET on a semaphore that queued instructions reference
@@ -490,7 +490,14 @@ instructions:
       ts_reg: FP32 NVFP4 tensor scale in bits 31:0 (R0 = 1.0).
       Write packets hold contiguous destination bytes: adjacent runs, also consecutive paged rows of one page, are
       merged up to a 256 B granule boundary, and HBM_ALIGN is checked per packet.
-      FP8-target conversions write FP32 column scales to SPM[R[aux_reg]]. rsem != 0: every packet adds its payload
+      FP8-target conversions and NVFP4_BF16 write FP32 column scales to SPM[R[aux_reg]] (R0: none), one array for the
+      instruction, [K tiles x N], row-major, row pitch CSP = roundup(4*N, 64) bytes, K tile = 256 elements (128 for
+      NVFP4_BF16): the scale of destination row n and K tile t is the FP32 at R[aux_reg] + t*CSP + 4*n (review S-1). N
+      is the destination row count, n1*n2*n3 (row n = i1 + n1*(i2 + n2*i3)); K tiles are counted along dim 0, KT =
+      ceil(n0 / 256). The words of a scale row past N are not written. The pitch is derived, so the destination TD
+      needs no field for it and N need not be a multiple of anything. MXU_MM reads the array with the same
+      formula (cs_reg), whatever the config (reduced configs: numerics.md N-3, review S-2). aux_reg must be 64 B
+      aligned (else ILLEGAL_FIELD). rsem != 0: every packet adds its payload
       bytes to sem[rsem] of the core that owns the destination address once the data is written; SRAM destinations
       only (an HBM destination has no owning core: ILLEGAL_FIELD; end the transfer with a SIGNAL instead).
   DMA_GATHER:
@@ -558,10 +565,37 @@ instructions:
     desc: >-
       ACC(acc_reg) (+)= A x W. A = (a_reg, a_td) in SPM: M rows (a_td n1, or R[m_reg] when m_reg != 0) by K
       (a_td n0). W = (w_reg, w_td) in SPM: K x N, or N x K when trans_w = 1 (the HF [out, in] layout). The MXU
-      loops over 64-column N tiles and K tiles (256 FP8 or 128 BF16 deep) internally; N tile j lands in ACC rows
-      acc + j*M .. acc + j*M + M - 1. acc_mode OVERWRITE / ACCUM / RESCALE (rowscale FP32 [M] at SPM[rs_reg]).
-      cs_reg != 0: column scales FP32 [K tiles x N] at SPM[cs_reg] multiply each K tile's partial sum before it is
-      accumulated (block-scaled weights). mode BF16X3 emulates FP32 with three BF16 passes.
+      loops over N tiles and K tiles internally. FULL: 64 columns, K tiles of 256 FP8 or 128 BF16; a reduced config
+      has DIM columns and K tiles of 4*DIM / 2*DIM (numerics.md N-3, review S-2); N tile j lands in ACC rows
+      acc + j*M .. acc + j*M + M - 1, an ACC row being 64 FP32 in FULL and DIM FP32 in a reduced config.
+      acc_mode OVERWRITE / ACCUM / RESCALE (rowscale FP32 [M] at SPM[rs_reg]).
+      cs_reg != 0: column scales FP32 [K tiles x N] at SPM[cs_reg], with the layout the DMA writes (DMA_COPY aux_reg:
+      row pitch CSP = roundup(4*N, 64) bytes, scale of K tile t and column n at cs + t*CSP + 4*n; review S-1), multiply
+      each K tile's partial sum before it is accumulated (block-scaled weights). The scale rows are 256 FP8 / 128 BF16
+      deep in every config: a reduced config's shorter K tile t uses scale row t >> log2(64 / DIM) (numerics.md N-3,
+      review S-2). mode NORMAL only: BF16X3 is reserved in v1 (review S-6).
+      Legality, the same in every config (review S-3, S-6, S-7, S-8, S-9). All checks run before the first SPM or ACC
+      access, and also when M = 0, so a program faults or not independently of its data. A failure raises the fault
+      below and the core stops (isa.md section 8). ILLEGAL_FIELD: bits [38:0] of the word non-zero; mode other than
+      NORMAL (BF16X3 = 1, 2-7 undefined); acc_mode 3; rs_reg != 0 without RESCALE, or RESCALE with rs_reg = 0; A and W
+      dtypes not both E4M3 or both BF16; n2 or n3 of either TD not 1, or any TD flag set on A or W (WRAP and the others
+      are DMA-only: ring-buffer windows are read in slot order from SPM, memmap.md section 7); K of A not K of W;
+      N < 1; the A base, the W base, the s1 of either TD, R[cs_reg] or R[rs_reg] (when non-zero) not a multiple of
+      64 B, the SPM bank width, whatever the config, or an s1 < 0. N has no alignment rule. TD_SPACE: a_td or w_td
+      space not SPM. RANGE: R[acc_reg] + ceil(N / DIM) * M beyond the ACC rows (ACC_ROWS of the config; 2048 in
+      FULL), or an operand beyond the end of the SPM.
+      M = R[m_reg] as a 64-bit unsigned number when m_reg != 0, compared in full (2^16 + 1 is not truncated to 1);
+      otherwise a_td n1. M = 0 is legal: no SPM or ACC access, no FP flag, and the instruction completes, adding
+      sinc to sem[ssem], in order after the earlier instructions of the queue (a data-dependent token count of
+      zero, isa.md section 7; review S-7).
+      Fault priority, first applicable wins (review S-9): (1) ILLEGAL_FIELD from the instruction word, in the order
+      reserved bits, mode, acc_mode, rs_reg; (2) TD_SPACE, A before W; (3) ILLEGAL_FIELD from the descriptors, in the
+      order dtype, A shape, W shape, K, N, alignment (A base, W base, s1 of A, s1 of W, cs_reg, rs_reg); (4) RANGE, ACC
+      before SPM, SPM operands in the order A, W, cs, rs. FAULT_ADDR (64 bits, review S-9): TD_SPACE and an alignment
+      fault: R[reg] of the offending operand (A, W, cs, rs, 64 bits, a 49-bit GPA whole); RANGE: R[reg] of the SPM
+      operand that leaves the SPM, or R[acc_reg] with bit 63 set for the ACC; every other ILLEGAL_FIELD: 0. MXU_MM
+      instructions in flight when any engine faults may be cut off or complete: software relies on neither their ACC
+      rows nor their semaphore increments, and the CP restarts the core (isa.md section 8).
 
   # ---- VPU / SFU / top-k (queue VQ). All arithmetic is FP32 inside; inputs convert from their TD dtype,
   # ---- outputs round to the destination dtype (RNE, saturating for FP8; numerics.md).

@@ -110,15 +110,29 @@ blocks stay on one leaf and streams stay at full rate (hbm.md H-1, review findin
 ## 4. On-chip SRAM
 
 - **SPM:**
-  - Byte-addressed, 4 MiB, 32 banks of 64 B with `bank = addr[10:6] ^ addr[15:11]` (`isa.spm_bank`). Row pitches that are powers
-    of two from 2 KiB up are padded by 512 B (1 KiB at 16 KiB) so that two-row loads do not collide (microarch.md §2.3).
+  - Byte-addressed, 4 MiB, 32 banks of 64 B with `bank = addr[10:6] ^ addr[15:11]` (`isa.spm_bank`), **in every config**: `TINY` and
+    `MID` change the SPM size, not the bank width. The MXU of a reduced config reads `DIM`-byte lanes; a shim between its ports and
+    the SPM client ports serves them out of 64 B bank rows (microarch.md §5, review finding S-3).
+  - Row pitches of stationary-load (MXU W) tiles: a **2 KiB pitch is padded by 1 KiB (3 KiB)**, 4 KiB and 8 KiB by 512 B, 16 KiB by
+    1 KiB, and 32 KiB or more by 512 B, so that the 8-row load beat of the MXU does not collide (review finding S-4; the frozen
+    two-row rule of V-8, which padded 2 KiB by 512 B, is replaced: at 2 KiB + 512 B half the beats collide and a tile loads in 48
+    cycles instead of 32). Only 26 of the 256 pitches from 64 B to 16 KiB in 64 B steps are conflict-free for all three beat shapes
+    of mxu.md §4.3 (`scripts/mxu_review/pitch_scan.py`, `test_isa.py`); the compiler uses a pitch table for the others, and a
+    colliding beat costs one stall cycle, never a wrong result (microarch.md §2.3).
   - Instructions address the local SPM with offsets (space `SPM`). Other cores' SPMs are reached through the GPA window.
   - Granularity: 32 B (the DMA handles any size; sub-32 B writes use byte masks).
 - **GSRAM:** slice-contiguous 1 MiB windows. Software spreads hot data over slices itself.
-- **ACC:** not memory-mapped. Only MXU and VPU instructions reach it (space `ACC`, addressed in rows of 64 FP32).
-- **Alignment:** tile bases in SPM are 64 B aligned. A stationary-load (MXU W) tile with a padded pitch starts on a 2 KiB boundary,
-  the only base alignment at which every padded pitch is conflict-free (microarch.md §2.3, review finding V-8). Read requests
-  and write bursts do not cross a 2 KiB boundary; the DMA splits them (review finding V-10).
+- **ACC:** not memory-mapped. Only MXU and VPU instructions reach it (space `ACC`, addressed in rows of 64 FP32 in `FULL`, **`DIM`
+  FP32 in `TINY` (8) and `MID` (16)**: the MXU writes one row per output tile row, review finding S-2; `ACC_ROWS` is 2048 / 512 /
+  256 as in microarch.md §4).
+- **Alignment:** tile bases in SPM are 64 B aligned, in every config. `MXU_MM` also requires the `s1` of A and W, `R[cs_reg]` and
+  `R[rs_reg]` to be multiples of 64 B and faults `ILLEGAL_FIELD` otherwise: one rule, independent of the config (review finding
+  S-3), so a `TINY` program pads its row pitches to 64 B. The column-scale array written by the DMA (`aux_reg`) is 64 B aligned
+  with row pitch `roundup(4·N, 64)` (isa.md §5, review finding S-1). A stationary-load (MXU W) tile with a padded pitch starts on a
+  2 KiB boundary (conflict-free at every padded pitch above; at 256 B-aligned bases the BF16 non-transposed beat at 4 KiB + 512 B
+  can cost 40 cycles, microarch.md §2.3, review findings V-8, S-4). A rows are conflict-free for 256 B-aligned A bases and `s1`; at
+  64 B alignment 6 of 1,024 starts cost one stall cycle. Read requests and write bursts do not cross a 2 KiB boundary; the DMA
+  splits them (review finding V-10).
 
 ## 5. Core control block (CORECTL, per core)
 
@@ -263,13 +277,22 @@ Revised for review finding I-2: pages are counted in rows, never split a row, an
 
 - **Weights:** HF `[out, in]` row-major. The MXU loads them column-wise (`trans_w = 1`).
   - Block-scaled formats keep their scale arrays as published.
-  - The DMA produces E4M3 data plus FP32 column scales per 256-deep K tile, or BF16.
+  - The DMA produces E4M3 data plus FP32 column scales per 256-deep K tile, or BF16. The scales are an FP32 `[K tiles x N]` array
+    with row pitch `roundup(4·N, 64)` B at `aux_reg`, which `MXU_MM` reads at `cs_reg` (isa.md §5, review finding S-1).
 - **Hyper-connection residual stream:** `[T][n][d_slice]` BF16 in SPM, where `d_slice = d / cores` along the hidden dimension.
   - `HC_PRE`/`HC_POST` read the n streams of one token contiguously.
   - DeepSeek: 1,024 tokens x 4 x 160 x 2 B = 1.25 MiB per core (HC-1).
 - **MoE dispatch:** routing writes `[T x k]` ids and weights. `VBUCKET` turns them into per-expert offsets and a permutation, and
   `DMA_GATHER` builds each expert's token block.
-- **Ring buffers:** sliding-window KV uses the TD `WRAP` flag (dim-1 index modulo n1), so a 128-token window needs no copy.
+- **Ring buffers** (review finding S-8; `WRAP` is DMA-only):
+  - Sliding-window KV uses the TD `WRAP` flag (dim-1 index modulo n1) on the DMA operand: the DMA appends token `pos` at slot
+    `pos mod window`, so a 128-token window needs no copy.
+  - Attention reads the window in **slot order**, K and V in the same order. The softmax and the `P V` sum are order-invariant
+    (up to FP32 rounding of the sum), so no rotation is needed. An `MXU_MM` operand never carries `WRAP` (any TD flag on A or W
+    faults `ILLEGAL_FIELD`); the ring is a plain linear tile for the MXU.
+  - **Open:** the `WINDOW` mask of `VSOFTMAX` derives key positions from the column index (`p2_reg`: position of column 0). In
+    slot order that is wrong once the ring has wrapped, so either the mask becomes slot-aware or the ring must be full and the
+    positions known per slot. Not yet checked against the VPU spec (mxu.md M-16).
 
 ## 8. Access rules and faults
 
