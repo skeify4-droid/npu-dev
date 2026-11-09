@@ -333,12 +333,14 @@ Decision D1:
   DMA converter (256 elements/cycle) carries 256 BF16 elements per cycle, and the DMA SPM write port (512 B/cycle) carries 248,
   because it also writes the block scales into the staging ring before the data (review finding V-1; numerics_experiments.md E1).
   - **The MXU is the narrowest stage on this path** (review finding S-5, mxu.md M-17). The stationary-load port could carry 256
-    BF16 elements per cycle (512 B / 32 cycles), but a tile period of about 39 cycles at `M = 1` (two shadow buffers; measured
-    21-22 cycles at `DIM` 32, **extrapolated** to `FULL`, not simulated) gives 16 KiB / 39 = 420 B/cycle, **210 BF16 elements per
-    cycle**: **1.16x** the core's peak HBM share (181 elements/cycle for NVFP4) and 1.36x at 0.85 (154). At a 48-cycle period
-    (a colliding pitch, memmap.md §4) it would be 0.94x, so decode GEMMs need a conflict-free pitch. Closing the gap needs a
-    third shadow buffer (period 32, mxu.md §9) or a measured period at `DIM` 64.
-  - The FP8 paths (always the fold for MXFP4 / MXFP8) keep 420 B/cycle against 193 elements/cycle at peak share: 2.2x (2.6x at 0.85).
+    BF16 elements per cycle (512 B / 32 cycles), but the tile period at `M = 1` (two shadow buffers) is **measured: 39.5 cycles at
+    `DIM` 64** (21.5 at `DIM` 32, 13 at `DIM` 16; `tb_mxu` with a 1R-per-bank SPM model, mxu.md §7, M-21). That gives
+    16 KiB / 39.5 = 415 B/cycle, **207 BF16 elements per cycle**: **1.15x** the core's peak HBM share (181 elements/cycle for
+    NVFP4) and 1.35x at 0.85 (154); 1.14x / 1.34x with the A, W and scale ports sharing the banks at a conflict-free pitch (3 KiB,
+    4.5 KiB). At the colliding 2.5 KiB pitch (memmap.md §4) the period is 43 (not the 48 of the load alone): **1.05x** and 1.24x,
+    so the margin survives a bad pitch but only just. A third shadow buffer (period 32, 1.41x, mxu.md §9) would close the gap; it
+    is not simulated.
+  - The FP8 paths (always the fold for MXFP4 / MXFP8) keep 415 B/cycle against 193 elements/cycle at peak share: 2.15x (2.5x at 0.85).
   - Review finding I-3: the margin was first checked at the stationary-load port only. The DMA SPM write port was then 256 B/cycle,
     which held the exact path to 0.83x of the HBM share. It is now 512 B/cycle (microarch.md §2.5).
   - The fold paths are also held to 256 elements per cycle by the converter: 1.56x (MXFP4) and 1.65x (NVFP4) over the share.

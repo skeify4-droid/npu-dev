@@ -84,9 +84,11 @@ the sibling die, C2C SerDes on the outer short edge. The D2D link needs only abo
 - A rows stream from the left (256 B/cycle, skewed). Partial sums flow down the columns and leave at the bottom: 64 FP32 per cycle into ACC.
 - **Stationary load port 512 B/cycle, double-buffered (shadow weights).**
   - A tile loads in 32 cycles while the previous tile streams (the port limit). The **tile period at `M = 1` is longer**: with two
-    shadow buffers the skew of tile `n` against the load of tile `n + 2` into the same buffer bounds it at about **39 cycles** in
-    `FULL` (420 B/cycle; measured 21-22 cycles at `DIM` 32, extrapolated, `DIM` 64 not yet simulated; mxu.md §7, review finding S-5).
-    A pitch that makes the 8-row load beat collide costs up to 48 (§2.3). A third buffer would restore 32 (mxu.md §9).
+    shadow buffers the skew of tile `n` against the load of tile `n + 2` into the same buffer bounds it at **39.5 cycles** in
+    `FULL` (**measured** at `DIM` 64, `M = 1`: 415 B/cycle; 21.5 at `DIM` 32, 13 at `DIM` 16, matching the bound
+    `((DIM - 1) + DIM/8 + 8) / 2`; mxu.md §7, M-21, review finding S-5). With the SPM's 1R banks modelled, conflict-free pitches stay
+    at 39.5-39.75; a pitch that makes the 8-row load beat collide (2.5 KiB) costs **43** (§2.3), not the 48 of the load alone,
+    because the skew sets the period. A third buffer would restore 32 (mxu.md §9, not simulated).
   - Row-wise or column-wise load: a column load takes 256 contiguous bytes, i.e. one row of an HF `[out, in]` weight. So weights stay in
     their published layout (`trans_w = 1`), and attention can use K-cache tiles as `K^T` with no transpose pass.
 - ACC: 2048 rows x 64 FP32 (512 KiB), read-modify-write at 256 B/cycle each way. A row is `DIM` FP32 in `TINY` / `MID` (256 / 512 rows
@@ -101,7 +103,7 @@ Why weight-stationary and not output-stationary:
 
 | | Weight-stationary (chosen) | Output-stationary |
 |---|---|---|
-| Decode (M = 1-30 tokens per expert) | MXU-load-bound: port 512 B/cycle, but the tile period of ~39 cycles (extrapolated, §2.2) gives 420 B/cycle of weights: 2.2x the core's peak HBM share with 4-bit weights expanded to FP8 (193 elements/cycle; 2.6x at 0.85), **1.16x for the exact NVFP4 → BF16 path** (210 elements/cycle against a need of 181; 1.36x at 0.85; review finding S-5). Before S-5 this row said 2.9x and 1.5x | Needs A and W both streaming at 256 B/cycle each; also M/64 utilization |
+| Decode (M = 1-30 tokens per expert) | MXU-load-bound: port 512 B/cycle, but the measured tile period of 39.5 cycles (§2.2) gives 415 B/cycle of weights: 2.15x the core's peak HBM share with 4-bit weights expanded to FP8 (193 elements/cycle; 2.5x at 0.85), **1.15x for the exact NVFP4 → BF16 path** (207 elements/cycle against a need of 181; 1.35x at 0.85; 1.05x / 1.24x at a colliding 2.5 KiB pitch; review finding S-5, mxu.md M-21). Before S-5 this row said 2.9x and 1.5x | Needs A and W both streaming at 256 B/cycle each; also M/64 utilization |
 | SPM read bandwidth for a GEMM | A 256 B/cycle + W during loads only | A 256 + W 256 B/cycle every cycle |
 | Long K | Accumulates in ACC (RMW), any K | Accumulates in PE registers; drains 16 KiB per output tile |
 | Epilogue overlap | VPU reads one ACC region while the MXU fills another | Needs double-buffered PE accumulators (2 x 4096 FP32 registers) |
@@ -118,7 +120,7 @@ isa.md §5) a cheap multiply at the ACC input.
   A stationary load of two 256 B rows per cycle therefore collides at 2, 4 and 64 KiB pitches (the shape the first rule was derived
   for). **The MXU's load beat is 8 rows x 64 B (trans and non-trans FP8) or 4 rows x 128 B (non-trans BF16)** (mxu.md §4.3), and
   the first rule is not conflict-free for it (review finding S-4): at the 2 KiB + 512 B pitch half of the beats collide, 48 cycles
-  per tile instead of 32. **Rule now (mxu.md M-17):** pad a 2 KiB pitch by **1 KiB (3 KiB)**, 4 KiB and 8 KiB by 512 B, 16 KiB by
+  per tile instead of 32 (load alone; the measured MXU tile period at `M = 1` only rises from 39.5 to 43, mxu.md M-21). **Rule now (mxu.md M-17):** pad a 2 KiB pitch by **1 KiB (3 KiB)**, 4 KiB and 8 KiB by 512 B, 16 KiB by
   1 KiB, and 32 KiB or more by 512 B. That is conflict-free for all three beat shapes at every 2 KiB-aligned tile base
   (`scripts/mxu_review/pitch_scan.py`, `test_isa.py::test_mxu_load_beat_pitches`). Stationary-load tiles with a padded pitch start on
   a 2 KiB boundary (review finding V-8): at 256 B-aligned bases the BF16 non-transposed beat at 4 KiB + 512 B can cost 40 cycles.
@@ -857,7 +859,7 @@ A leaf never forwards between its mesh ports (noc.md §1). Arrivals from a link 
 |---|---|---|
 | HBM to cores (die) | 3,277 B/cycle at peak | 16 HBM leaves x 2 planes x 128 = 4,096 B/cycle (80% at peak); mesh links at most 80% with stack-affine placement, 85% fully interleaved (noc.md §5) |
 | HBM share to one core | 102 B/cycle | 256 B/cycle per network interface (2 planes) |
-| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85); NVFP4 → BF16: 181 / 154 | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle shared with the staged scales: 248 elements/cycle for NVFP4 → BF16, 256 in FP8. **MXU at the tile period of ~39 cycles (extrapolated, §2.2): 420 B/cycle, 420 FP8 or 210 BF16 elements/cycle: 2.2x (FP8, peak share; 2.6x at 0.85) and 1.16x (NVFP4 → BF16; 1.36x at 0.85), the narrowest stage on the exact path.** The port limit alone (32 cycles) would give 512 B/cycle (2.65x, 1.41x). With a colliding pitch (48 cycles) 0.94x (review finding S-5; numerics.md D1) |
+| Weights into the MXU in decode | ≤ 193 elements/cycle (4-bit weights at the core's peak HBM share; 164 at 0.85); NVFP4 → BF16: 181 / 154 | DMA converter 256 elements/cycle, DMA SPM write 512 B/cycle shared with the staged scales: 248 elements/cycle for NVFP4 → BF16, 256 in FP8. **MXU at the measured tile period of 39.5 cycles (§2.2): 415 B/cycle, 415 FP8 or 207 BF16 elements/cycle: 2.15x (FP8, peak share; 2.5x at 0.85) and 1.15x (NVFP4 → BF16; 1.35x at 0.85), the narrowest stage on the exact path.** The port limit alone (32 cycles) would give 512 B/cycle (2.65x, 1.41x). With a colliding pitch (43 cycles measured; 48 for the load alone) 1.05x / 1.24x (review finding S-5, mxu.md M-21; numerics.md D1) |
 | D2D | collectives; the Phase 1 roofline is insensitive to D2D bandwidth above 1 TB/s | 1.4 TB/s per direction payload |
 | C2C | 0.8 TB/s per die (8 ports) | 4 leaves x 256 B/cycle = 1.5 TB/s (55% at peak) |
 | Prefill MXU feed | A 256 B/cycle + W 16 KiB per 256 A rows | SPM 2 KiB/cycle read |

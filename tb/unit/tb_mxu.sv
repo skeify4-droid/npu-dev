@@ -5,6 +5,12 @@
 // Models: SPM = byte array, fixed latency SPM_LAT, garbage in lanes that were not requested, optional random grant stalls;
 // DTAB = file; semaphores = counters; ACC = FP32 array updated by the RTL's own acc_update lanes at one row per cycle,
 // with a check that two updates of the same row are at least ACC_LAT cycles apart, acc_done 5 cycles after the last row.
+// Optional bank model (+BANK=1 / +BANK=2 on the vvp command line; default 0 = the ideal ports above): the SPM of memmap.md section 4,
+// 32 banks of 64 B, bank = addr[10:6] ^ addr[15:11], one 64 B granule read per bank and cycle. A gang request (4 A, 8 W or 1 scale
+// lane) is split over as many cycles as its busiest bank has distinct granules (lanes of one 64 B row are one read, which is how the
+// shim of mxu.md M-10 serves DIM-byte lanes); `ready` stays low meanwhile and rises in the cycle the last lane is read (the grant is
+// the commit), the data follow exactly SPM_LAT later. +BANK=1: the three ports have banks of their own (the old S-4 model);
+// +BANK=2: the ports share the banks, rotating priority per cycle. PERF = 1 adds the tile-period report (mxu.md section 7).
 // Checks: final ACC image (bit-exact), OR of fp_flags against the expected PE flags, final semaphore values,
 // sem_inc only after acc_done, no fault, no ACC hazard, program finished within the time limit.
 `timescale 1ns/1ps
@@ -20,6 +26,7 @@ module mxu_tc #(
   parameter int ACC_LAT   = 8,
   parameter int A_BLOCK   = 0,       // cycles the A port refuses requests after each grant (lets the loader run ahead of the swap)
   parameter int MAX_PERIOD = 0,      // > 0: consecutive output rows (M = 1 passes) at most this many cycles apart
+  parameter int PERF      = 0,       // 1: report the distribution of the gaps between consecutive output rows (M = 1: the tile period)
   parameter string PRE    = ""
 ) (
   output logic done,
@@ -51,15 +58,15 @@ module mxu_tc #(
   logic [255:0] dtab_data;
   logic [3:0] a_req_v;
   logic [4*22-1:0] a_req_addr;
-  logic a_req_ready;
+  logic a_req_ready, a_rdy_r, a_bk_rdy;
   logic [4*LB*8-1:0] a_rsp_data;
   logic [7:0] w_req_v;
   logic [8*22-1:0] w_req_addr;
-  logic w_req_ready;
+  logic w_req_ready, w_rdy_r, w_bk_rdy;
   logic [8*LB*8-1:0] w_rsp_data;
   logic s_req_v;
   logic [21:0] s_req_addr;
-  logic s_req_ready;
+  logic s_req_ready, s_rdy_r, s_bk_rdy;
   logic [LB*8-1:0] s_rsp_data;
   logic acc_valid, acc_rescale, acc_overwrite, acc_use_cs, acc_last, acc_done;
   logic [10:0] acc_row;
@@ -141,12 +148,79 @@ module mxu_tc #(
   logic [8*LB*8-1:0] w_nxt;
   logic [LB*8-1:0]   s_nxt;
   int blk = 0;
+  // ready = the random / blocking pattern (registered) and the bank model (combinational, always 1 when it is off)
+  assign a_req_ready = a_rdy_r && a_bk_rdy;
+  assign w_req_ready = w_rdy_r && w_bk_rdy;
+  assign s_req_ready = s_rdy_r && s_bk_rdy;
   always @(posedge clk) begin
-    if (a_req_v != 4'd0 && a_req_ready && A_BLOCK > 0) begin blk <= A_BLOCK; a_req_ready <= 1'b0; end
-    else if (blk > 1) begin blk <= blk - 1; a_req_ready <= 1'b0; end
-    else begin blk <= 0; a_req_ready <= ($urandom_range(0, 99) >= STALL_PCT); end
-    w_req_ready <= ($urandom_range(0, 99) >= STALL_PCT);
-    s_req_ready <= ($urandom_range(0, 99) >= STALL_PCT);
+    if (a_req_v != 4'd0 && a_req_ready && A_BLOCK > 0) begin blk <= A_BLOCK; a_rdy_r <= 1'b0; end
+    else if (blk > 1) begin blk <= blk - 1; a_rdy_r <= 1'b0; end
+    else begin blk <= 0; a_rdy_r <= ($urandom_range(0, 99) >= STALL_PCT); end
+    w_rdy_r <= ($urandom_range(0, 99) >= STALL_PCT);
+    s_rdy_r <= ($urandom_range(0, 99) >= STALL_PCT);
+  end
+
+  // ---------------- bank model (see the header; lanes 0..3 = A, 4..11 = W, 12 = scales)
+  int bank_mode = 0;
+  initial void'($value$plusargs("BANK=%d", bank_mode));
+  logic [12:0]    bk_v;
+  logic [13*22-1:0] bk_addr;
+  assign bk_v    = {s_req_v, w_req_v, a_req_v};
+  assign bk_addr = {s_req_addr, w_req_addr, a_req_addr};
+  logic [12:0]    bk_coll = '0;            // lanes read so far for the gang being held
+  logic [13*22-1:0] bk_key = '0;           // their addresses (a changed request starts again)
+  logic [12:0]    bk_pend, bk_serve, bk_cont;
+  int             bk_rr = 0;
+  int             bk_win, bk_p, bk_pl, bk_pw, bk_dom;
+  logic [21:0]    bk_a1, bk_a2;
+  logic [4:0]     bk_b1, bk_b2;
+  function automatic int lane_port(input int l);
+    return (l < 4) ? 0 : (l < 12) ? 1 : 2;
+  endfunction
+  always @* begin
+    bk_serve = '0; bk_cont = '0; bk_pend = '0;
+    for (int l = 0; l < 13; l++) begin
+      bk_cont[l] = bk_coll[l] && bk_v[l] && (bk_key[22*l +: 22] == bk_addr[22*l +: 22]);
+      bk_pend[l] = bk_v[l] && !bk_cont[l];
+    end
+    if (bank_mode != 0)
+      for (int dom = 0; dom < 3; dom++)           // mode 1: one arbitration domain per port; mode 2: one for all
+        for (int b = 0; b < 32; b++) begin
+          bk_win = -1;
+          for (int pi = 0; pi < 3; pi++) begin
+            bk_p = (bk_rr + pi) % 3;
+            for (int l = 0; l < 13; l++) begin
+              bk_a1 = bk_addr[22*l +: 22];
+              bk_b1 = bk_a1[10:6] ^ bk_a1[15:11];
+              if (bk_win < 0 && lane_port(l) == bk_p && bk_pend[l] && (bank_mode == 2 ? dom == 0 : lane_port(l) == dom) && int'(bk_b1) == b)
+                bk_win = l;
+            end
+          end
+          if (bk_win >= 0)
+            for (int l = 0; l < 13; l++)           // one read serves every lane of the same port in the same 64 B granule
+              if (bk_pend[l] && lane_port(l) == lane_port(bk_win) && bk_addr[22*l+6 +: 16] == bk_addr[22*bk_win+6 +: 16])
+                bk_serve[l] = 1'b1;
+        end
+    else bk_serve = bk_pend;
+  end
+  assign a_bk_rdy = (bk_pend[3:0]  & ~bk_serve[3:0])  == 4'd0;
+  assign w_bk_rdy = (bk_pend[11:4] & ~bk_serve[11:4]) == 8'd0;
+  assign s_bk_rdy = (bk_pend[12]   & ~bk_serve[12])   == 1'b0;
+  // statistics (all ports): beats granted, beats that took more than one cycle, cycles a request waited for the banks
+  longint bk_beats [3], bk_slow [3], bk_wait [3];
+  logic [2:0] bk_first = 3'b111;                   // the port's request is in its first cycle
+  initial for (int i = 0; i < 3; i++) begin bk_beats[i] = 0; bk_slow[i] = 0; bk_wait[i] = 0; end
+  always @(posedge clk) if (rst_n) begin
+    bk_rr <= (bk_rr + 1) % 3;
+    for (int l = 0; l < 13; l++) begin
+      bk_key[22*l +: 22] <= bk_addr[22*l +: 22];
+      // the gang of a port is granted (valid and ready of the bank model; random stalls are not the bank model's business)
+      if ((lane_port(l) == 0 ? a_bk_rdy : lane_port(l) == 1 ? w_bk_rdy : s_bk_rdy)) bk_coll[l] <= 1'b0;
+      else bk_coll[l] <= bk_cont[l] || bk_serve[l];
+    end
+    if (a_req_v != 0) begin if (a_bk_rdy) begin bk_beats[0]++; if (!bk_first[0]) bk_slow[0]++; bk_first[0] <= 1'b1; end else begin bk_wait[0]++; bk_first[0] <= 1'b0; end end
+    if (w_req_v != 0) begin if (w_bk_rdy) begin bk_beats[1]++; if (!bk_first[1]) bk_slow[1]++; bk_first[1] <= 1'b1; end else begin bk_wait[1]++; bk_first[1] <= 1'b0; end end
+    if (s_req_v)      begin if (s_bk_rdy) begin bk_beats[2]++; if (!bk_first[2]) bk_slow[2]++; bk_first[2] <= 1'b1; end else begin bk_wait[2]++; bk_first[2] <= 1'b0; end end
   end
   // The grant of this cycle is (valid && ready); the response is built at the end of the cycle.
   always @(posedge clk) begin
@@ -188,6 +262,7 @@ module mxu_tc #(
   int done_cnt = 0;
   logic [3:0] flags_or = 4'd0;
   int rows_seen = 0;
+  longint rowcyc [0:4095];
   always @(posedge clk) begin
     cyc <= cyc + 1;
     dsr <= {dsr[3:0], rst_n && acc_valid && acc_last};
@@ -197,6 +272,7 @@ module mxu_tc #(
         if (MAX_PERIOD > 0 && rows_seen > 0 && cyc - last_row_cyc > MAX_PERIOD) begin
           errors++; $display("%s: pass period %0d cycles > %0d", PRE, cyc - last_row_cyc, MAX_PERIOD);
         end
+        if (PERF && rows_seen < 4096) rowcyc[rows_seen] = cyc;
         last_row_cyc = cyc;
         rows_seen++;
         if (int'(acc_row) >= ACCR) begin errors++; $display("%s: ACC row %0d out of range", PRE, acc_row); end
@@ -211,6 +287,27 @@ module mxu_tc #(
     end
   end
   initial for (int i = 0; i < ACCR; i++) row_last[i] = -1;
+
+  // ---------------- tile period (PERF): the gaps between consecutive output rows; with M = 1 every pass is one row
+  task automatic perf_report();
+    int n, lo, hi, w0, w1;
+    longint sum, g, mn, mx;
+    int hist [0:127];
+    n = rows_seen - 1;                                  // gaps
+    w0 = 4; w1 = n - 3;                                 // steady state: leave out the first 4 and the last 3 gaps (fill and drain)
+    sum = 0; mn = 1 << 30; mx = 0;
+    for (int i = 0; i < 128; i++) hist[i] = 0;
+    for (int i = w0; i < w1; i++) begin
+      g = rowcyc[i + 1] - rowcyc[i];
+      sum += g; if (g < mn) mn = g; if (g > mx) mx = g;
+      hist[(g > 127) ? 127 : int'(g)]++;
+    end
+    $write("%sPERF DIM %0d bank %0d: passes %0d, first row at cycle %0d, last at %0d; steady-state gaps %0d..%0d: mean %0d.%02d min %0d max %0d, histogram",
+           PRE, DIM, bank_mode, rows_seen, rowcyc[0], rowcyc[rows_seen-1], w0, w1 - 1, sum / (w1 - w0), (sum * 100 / (w1 - w0)) % 100, mn, mx);
+    for (int i = 0; i < 128; i++) if (hist[i] != 0) $write(" %0d:%0d", i, hist[i]);
+    $write("\nPERFALL DIM %0d bank %0d: whole instruction (last row - first row) / (passes - 1) = %0d.%02d\n", DIM, bank_mode,
+           (rowcyc[rows_seen-1] - rowcyc[0]) / (rows_seen - 1), ((rowcyc[rows_seen-1] - rowcyc[0]) * 100 / (rows_seen - 1)) % 100);
+  endtask
 
   // ---------------- run and check
   initial begin
@@ -252,6 +349,10 @@ module mxu_tc #(
     end
     if (rows_seen == 0) begin errors++; $display("%s: no rows reached the ACC", PRE); end
     $display("%s: %0d ACC rows in %0d cycles, flags %h", PRE, rows_seen, cyc, flags_or);
+    if (bank_mode != 0)
+      $display("%s: bank model %0d: beats A %0d W %0d S %0d; beats that took > 1 cycle A %0d W %0d S %0d; cycles waited A %0d W %0d S %0d", PRE, bank_mode,
+               bk_beats[0], bk_beats[1], bk_beats[2], bk_slow[0], bk_slow[1], bk_slow[2], bk_wait[0], bk_wait[1], bk_wait[2]);
+    if (PERF) perf_report();
     done = 1;
   end
 endmodule
@@ -320,6 +421,20 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   end
 endmodule
 
+`ifdef PERF
+// Tile-period measurement (mxu.md section 7; scripts/mxu_perf.sh): one M = 1 instruction on a `PDIM x `PDIM MXU, vectors from
+// `gen_mxu_vectors.py --perf` (hex files and counts.svh in the working directory), banks selected by +BANK=n.
+module tb_mxu;
+  logic d;
+  int e;
+  mxu_tc #(.DIM(`PDIM), .NINS(`CNT_PERF_PROG), .NTD(`CNT_PERF_DTAB), .SPMB(`CNT_PERF_SPM), .ACCR(`CNT_PERF_ACC0), .STALL_PCT(0), .PERF(1), .PRE("")) t (.done(d), .errors(e));
+  initial begin
+    wait (d);
+    if (e == 0) $display("PASS mxu"); else $display("FAIL mxu: %0d errors", e);
+    $finish;
+  end
+endmodule
+`else
 module tb_mxu;
   logic d8, d16, d8s, d16s, d32, d8b;
   int e8, e16, e8s, e16s, e32, e8b;
@@ -358,3 +473,4 @@ module tb_mxu;
     $finish;
   end
 endmodule
+`endif

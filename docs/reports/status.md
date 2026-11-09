@@ -188,8 +188,9 @@
 - **D2D:** the mesh edge feeds at most 1.45 TB/s per direction, so a 5 TB/s D2D link was unusable.
   - At 1.4 TB/s, decode at the serving point changes by at most 0.2% and no package count changes.
   - Prefill with TP = 2 forced across D2D slows by up to 7%.
-- **MXU:** weight-stationary consumes 512 B/cycle of weights at any M, which is 2.9x a core's HBM share with 4-bit weights expanded to
-  FP8. The MXU is never the decode bottleneck.
+- **MXU:** the stationary-load port carries 512 B/cycle, but the measured tile period at M = 1 is 39.5 cycles in `FULL` (415 B/cycle; mxu.md §7, M-21),
+  so the MXU is 2.15x a core's HBM share with 4-bit weights expanded to FP8 (not 2.9x). On the exact NVFP4 -> BF16 decode path it is the narrowest
+  stage of the weight path at 1.15x (1.35x at 0.85 share; 1.05x / 1.24x at a colliding 2.5 KiB pitch). Not "never the bottleneck" (corrected 2026-11-09, review S-5).
 
 ### Tests
 - `make pytest`: 68 passed (53 before, + 7 ISA, + 8 NoC).
@@ -1112,12 +1113,17 @@ stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv
 - Bug found by the 16 x 16 run: the second beat of a group waited for the group's own `free` flag (deadlock for `DIM >= 16`); fixed.
 - **Performance, against my own estimate:** with one shadow buffer the tile period at M = 1 was 25 cycles at DIM 16 (1.25·DIM + 9, about 80 for `FULL`), not 32-40:
   the next pass waited for all four groups, the last of which is free `DIM - 1` cycles after the swap. Decision (user): a second shadow buffer (mxu.md M-9).
-  Measured now: 21-22 cycles per tile at DIM 32 (the one-buffer formula gave 49), extrapolated about 39 for `FULL`, 420 B/cycle of FP8 weights against a decode need of
-  164-193. Not simulated at 64.
-- Bank-conflict note for the compiler: group beats read one lane from 8 consecutive W rows (mxu.md §7).
+  Measured now (2026-11-09, mxu.md M-21): 13 cycles per tile at DIM 16, 21.5 at DIM 32 (the one-buffer formula gave 49), **39.5 at DIM 64** (415 B/cycle of FP8 weights
+  against a decode need of 164-193); the fitted bound `((DIM-1)+DIM/8+8)/2` holds at 64.
+- Bank-conflict note for the compiler: group beats read one lane from 8 consecutive W rows (mxu.md §7). Measured with a 1R-per-bank SPM model (`tb_mxu +BANK=1/2`,
+  `scripts/mxu_perf.sh`): conflict-free pitches (3 KiB, 4.5 KiB) cost at most 0.25 cycle over the ideal SPM; the colliding 2.5 KiB pitch costs 3.4-3.6 cycles per tile
+  at `FULL` (43, not the 48 of the load alone). The whole `tb_mxu` passes with `+BANK=2` (real gang splits; review S-3 deadlock concern not borne out).
 
 ### Open
-- `BF16X3` (faults `ILLEGAL_FIELD`), formal properties, `core/acc` (must accept the `acc_*` stream of mxu.md §5), the small-M period decision, Phase 6 fan-out of A.
+- `BF16X3` (faults `ILLEGAL_FIELD`), formal properties, `core/acc` (must accept the `acc_*` stream of mxu.md §5), Phase 6 fan-out of A.
+- The third shadow buffer (period 39.5 -> 32, exact-path margin 1.15x -> 1.41x, +131 k flops): the period is now measured, the decision is open (mxu.md §9).
+  Not measured: BF16 / non-trans beats, M between 2 and 40, other SPM clients on the banks, the shim as RTL (`mxu_spm_shim` does not exist).
+- `scripts/mxu_mutants` was not re-run after the `tb_mxu` change of 2026-11-09 (bank model, `-DPERF` top; behaviour with `+BANK=0` identical to before, verified by diff of a full run).
 
 ### Formal (mxu.sby)
 `ifdef FORMAL` block in `rtl/core/mxu.sv` (decode split into `mxu_dec` so that it can be stubbed: `tb/formal/mxu_dec_stub.sv`, PE stub `mxu_stubs.sv`). P1-P5 proved to depth 56 on DIM 8 for three size mixes (3-6 min each,

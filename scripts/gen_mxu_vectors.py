@@ -15,6 +15,9 @@ fold tile (256 FP8 / 128 BF16 deep, mxu.md M-13) and the SPM image replicates ea
 Usage: gen_mxu_vectors.py [--lock] [OUTDIR]   (default build/mxu)
   --lock   after generating, (re)write scripts/mxu_vectors.lock (row count and SHA-256 of every file, scripts/mxu_lock.py).
            Do this after an intended change of the generator, arith_ref.py, numerics.py or NumPy, and commit the lock.
+  --perf   instead of the unit vectors, write the tile-period measurement cases (one M = 1 instruction on a DIM x DIM MXU, W at a
+           given pitch and 2 KiB-aligned, A 256 B aligned) to DIR/d<DIM>_p<PITCH>/ (default build/mxu_perf; each directory has its own
+           counts.svh). Not locked, not part of `make unit`; see `scripts/mxu_perf.sh`. Cannot be combined with --lock.
 """
 import os
 import sys
@@ -26,12 +29,14 @@ sys.path.insert(0, os.path.join(ROOT, "sw"))
 from npumodel import arith_ref as R  # noqa: E402
 from npumodel import numerics as nm  # noqa: E402
 
-_ARGS = [a for a in sys.argv[1:] if a != "--lock"]
+_ARGS = [a for a in sys.argv[1:] if a not in ("--lock", "--perf")]
 WRITE_LOCK = "--lock" in sys.argv[1:]
-OUT = _ARGS[0] if _ARGS else os.path.join(ROOT, "build", "mxu")
+PERF = "--perf" in sys.argv[1:]
+OUT = _ARGS[0] if _ARGS else os.path.join(ROOT, "build", "mxu_perf" if PERF else "mxu")
 os.makedirs(OUT, exist_ok=True)
 RNG = np.random.default_rng(20261108)
 WL_WORDS = 128
+PERF_SPM = 1 << 20                                          # SPM size of the --perf cases
 SPM_BYTES = {8: 1 << 17, 16: 1 << 17, 32: 1 << 16}       # SPM size of the tb_mxu models (a power of two)
 META_W = 16
 NANIN, OVF, INV = R.NANIN, R.OVF, R.INV
@@ -302,23 +307,24 @@ def golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc
                                                                    M * N, m, n, got, want))
 
 
-def build_top(dim, decode_only=False):
-    """A list of MXU_MM instructions on a DIM x DIM MXU with their SPM image, DTAB, initial / expected ACC and flags."""
+def build_top(dim, decode_only=False, perf=None):
+    """A list of MXU_MM instructions on a DIM x DIM MXU with their SPM image, DTAB, initial / expected ACC and flags.
+    perf = (K, N, pitch, trans, bf16): only the tile-period measurement instruction (--perf), see PERF_CASES."""
     LB = dim
     KB = 4 * dim
-    SPM = SPM_BYTES[dim]
+    SPM = PERF_SPM if perf else SPM_BYTES[dim]
     spm = bytearray(b"\xff\x7f" * (SPM // 2))      # NaN-valued garbage everywhere (E4M3 and BF16): any unmasked tail shows up
     top = [0]
     end = [SPM]                                     # operands placed at the end of the SPM grow downwards from here
 
-    def alloc(nbytes, at_end=False):
+    def alloc(nbytes, at_end=False, align=64):
         """64 B aligned base (the alignment rule of every config, M-10); at_end: the extent ends in the last 64 B granule."""
         if at_end:
             base = (end[0] - nbytes) // 64 * 64
             end[0] = base
             assert top[0] <= end[0]
             return base
-        base = (top[0] + 63) // 64 * 64
+        base = (top[0] + align - 1) // align * align
         top[0] = base + nbytes
         assert top[0] <= end[0]
         return base
@@ -335,7 +341,7 @@ def build_top(dim, decode_only=False):
         return len(tds) - 1
 
     def case(M, K, N, bf16, trans, accm, cs, rs, acc_row, pad_a=0, pad_w=0, wsem=0, wval=0, ssem=0, sinc=0, special=False,
-             m_reg=False, cs_end=False, decoy=None):
+             m_reg=False, cs_end=False, decoy=None, a_align=64, w_align=64):
         nonlocal flags_or
         eb = 2 if bf16 else 1
         gen = bf16_clean if bf16 else fp8_clean
@@ -344,13 +350,13 @@ def build_top(dim, decode_only=False):
         A = [[g() for _ in range(K)] for _ in range(M)]
         W = [[gen() for _ in range(N)] for _ in range(K)]               # logical K x N
         a_pitch = (K * eb + 63) // 64 * 64 + pad_a
-        a_base = alloc(M * a_pitch)
+        a_base = alloc(M * a_pitch, align=a_align)
         for m in range(M):
             for k in range(K):
                 spm[a_base + m * a_pitch + k * eb: a_base + m * a_pitch + (k + 1) * eb] = A[m][k].to_bytes(eb, "little")
         if trans:
             w_pitch = (K * eb + 63) // 64 * 64 + pad_w
-            w_base = alloc(N * w_pitch)
+            w_base = alloc(N * w_pitch, align=w_align)
             for n in range(N):
                 for k in range(K):
                     spm[w_base + n * w_pitch + k * eb: w_base + n * w_pitch + (k + 1) * eb] = W[k][n].to_bytes(eb, "little")
@@ -359,7 +365,7 @@ def build_top(dim, decode_only=False):
             w_pitch = (N * eb + 63) // 64 * 64 + pad_w
             # a guard of one K tile of rows behind W stays NaN-valued garbage: a lane requested for a k-row >= K reads NaN there (and
             # 0 x NaN flags), whatever the next operand is
-            w_base = alloc(K * w_pitch + (2 if bf16 else 4) * dim * w_pitch)
+            w_base = alloc(K * w_pitch + (2 if bf16 else 4) * dim * w_pitch, align=w_align)
             for k in range(K):
                 for n in range(N):
                     spm[w_base + k * w_pitch + n * eb: w_base + k * w_pitch + (n + 1) * eb] = W[k][n].to_bytes(eb, "little")
@@ -423,6 +429,14 @@ def build_top(dim, decode_only=False):
             sem_cnt[ssem] = sem_cnt.get(ssem, 0) + sinc
 
     D = dim
+    if perf:
+        K, N, pitch, trans, bf16 = perf
+        eb = 2 if bf16 else 1
+        pad = pitch - ((K if trans else N) * eb + 63) // 64 * 64
+        assert pad >= 0, "pitch %d is smaller than the row" % pitch
+        case(1, K, N, bf16, trans, 0, False, False, 100, pad_w=pad, ssem=1, sinc=1, a_align=256, w_align=2048)
+        return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
+                    sem=sem_cnt, spm_bytes=SPM, order=(0, 0))
     if decode_only:       # one M = 1 instruction, 4 passes: the tile period measurement on a larger array
         case(1, 8 * D, 2 * D, False, True, 0, False, False, 100, ssem=1, sinc=1)
         return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
@@ -449,11 +463,12 @@ def build_top(dim, decode_only=False):
                 sem=sem_cnt, spm_bytes=SPM, order=(3, 4))
 
 
-def write_top(tc, counts):
+def write_top(tc, counts, outdir=None, pre=None):
     dim = tc["dim"]
-    pre = "mxu_%d_" % dim
+    outdir = outdir or OUT
+    pre = "mxu_%d_" % dim if pre is None else pre
     def wr(name, lines):
-        with open(os.path.join(OUT, pre + name + ".hex"), "w") as fh:
+        with open(os.path.join(outdir, pre + name + ".hex"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
         counts.append(((pre + name).upper(), len(lines)))
     wr("spm", ["%02x" % b for b in tc["spm"]])
@@ -595,7 +610,38 @@ def write_fault(dim, counts):
     counts.append((pre.upper(), len(lines)))
 
 
+# --perf: the M = 1 tile-period cases. (K, N per DIM so that every case has 32..64 passes; FP8, trans W (the group-ordered beat of
+# mxu.md 4.3 with the most collisions) and the same pitches for every DIM; the pitch is the row pitch s1 of W in bytes.)
+PERF_PITCHES = (2560, 4608, 3072)
+PERF_DIMS = (16, 32, 64)
+
+
+def perf_case(dim, pitch):
+    K = {2560: 2048, 4608: 4096, 3072: 3072}[pitch]               # one row = K bytes of FP8 (+ the padding of the pitch rule)
+    kt = K // (4 * dim)
+    nt = max(1, 32 // kt)                                         # N tiles: at least 32 passes
+    return (K, nt * dim, pitch, True, False)
+
+
+def main_perf():
+    for dim in PERF_DIMS:
+        for pitch in PERF_PITCHES:
+            d = os.path.join(OUT, "d%d_p%d" % (dim, pitch))
+            os.makedirs(d, exist_ok=True)
+            counts = []
+            tc = build_top(dim, perf=perf_case(dim, pitch))
+            write_top(tc, counts, outdir=d, pre="")
+            with open(os.path.join(d, "counts.svh"), "w") as fh:
+                for n, c in counts:
+                    fh.write("`define CNT_PERF_%s %d\n" % (n, c))
+            print("perf d%d_p%d: K, N, pitch, trans, bf16 = %s, %d passes" % (dim, pitch, perf_case(dim, pitch),
+                  (perf_case(dim, pitch)[0] // (4 * dim)) * ((perf_case(dim, pitch)[1] + dim - 1) // dim)))
+
+
 def main():
+    if PERF:
+        assert not WRITE_LOCK, "--perf and --lock cannot be combined (the perf vectors are not locked)"
+        return main_perf()
     counts = []
     for dim in (8, 16):
         write_fault(dim, counts)
