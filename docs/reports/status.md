@@ -1099,7 +1099,7 @@ stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv
 
 ### Design decisions (mxu.md §8)
 - One parameter `DIM`; the SPM lane of the MXU ports is `DIM` bytes, so there are always 4 load groups of `DIM/4` PE rows and `DIM/2` beats per tile.
-- N outer, K inner; ACC read-modify-write hazards are excluded by pass spacing (`ACC_LAT`), not by interlocks.
+- N outer, K inner; ACC read-modify-write hazards are excluded by pass spacing (`ACC_LAT`), not by interlocks. The spacing rule was wrong across instructions (review R-1: the next instruction's rows need not match the previous pass's rows in order; M = 9 then M = 1 on its row 5 updated 6 cycles apart at `ACC_LAT` 8); since M-22 the last pass of an instruction is followed by a gap of `ACC_LAT - 2` whatever `M`.
 - Shadow load by group, because the swap reaches PE row `i` `i` cycles after row 0.
 
 ### Results
@@ -1123,11 +1123,13 @@ stream FSM, scale port, exit stage, completion). Tests: `tb/unit/tb_mxu_array.sv
 - `BF16X3` (faults `ILLEGAL_FIELD`), formal properties, `core/acc` (must accept the `acc_*` stream of mxu.md §5), Phase 6 fan-out of A.
 - The third shadow buffer (period 39.5 -> 32, exact-path margin 1.15x -> 1.41x, +131 k flops): the period is now measured, the decision is open (mxu.md §9).
   Not measured: BF16 / non-trans beats, M between 2 and 40, other SPM clients on the banks, the shim as RTL (`mxu_spm_shim` does not exist).
-- `scripts/mxu_mutants` was not re-run after the `tb_mxu` change of 2026-11-09 (bank model, `-DPERF` top; behaviour with `+BANK=0` identical to before, verified by diff of a full run).
+- `scripts/mxu_mutants` was re-run in full on 2026-11-11 (after the bank-model `tb_mxu` change of 2026-11-09 and after M-22 / M-23): 77 mutants (73 + `gap_x_off`, `gap_x_short`, `gap_x_every_pass`, `w_gnt_wait`), `tb` and `formal` modes, all as expected.
+
+- 2026-11-10, review part R (R-1, R-2, R-3; mxu.md M-22, M-23): the ACC spacing rule was wrong across instructions (fixed: `ACC_LAT - 2` cycles after the last pass of an instruction whatever `M`), an empty W beat needed `ready` without `valid` (fixed: the MXU grants it itself), numerics.md N-3 / N-5 say that K-tail slots are `+0` operands and that a `-0` partial sum survives only a full K tile. Results (final RTL): `make lint`, `make unit` (`tb_mxu` now 31 instructions per size, two ready-needs-valid instances), all six `mxu.sby` tasks (new `bmc_d`: `M <= 3`, free `acc_base`, 735 s wall; new `covx`; cross-instruction cover point reached at step 37), the review's suite (`run_review.py --fuzz 60`: 792 runs, 0 failed, including `acc_spacing_x_ins` pipelined), `+RMW=1` on `acc_spacing_x_ins` and the fuzz programs that failed before (DIM 8 fuzz000 / 020 / 053, DIM 16 fuzz001 / 044 / 045: all pass), `probe_rdyv.py` (0 hangs of 78; 71 before), `scripts/mxu_perf.sh 16 32` (tile period at `M = 1` unchanged: all 18 PERF lines identical to before). The vector lock was regenerated (`gen_mxu_vectors.py --lock`) because the generator gained the R-1 instructions; the shared random stream also shifted the `mxu_array` vectors. Mutants (re-run 2026-11-11): 77, all as expected (mxu.md §6).
 
 ### Formal (mxu.sby)
 `ifdef FORMAL` block in `rtl/core/mxu.sv` (decode split into `mxu_dec` so that it can be stubbed: `tb/formal/mxu_dec_stub.sv`, PE stub `mxu_stubs.sv`). P1-P5 proved to depth 56 on DIM 8 for three size mixes (3-6 min each,
 `make formal` runs them and the cover task). 8 mutants of the control logic: caught `no_free_gate` (P1), `no_gap` (P3), `swap_early` and `last_beat_early` (P2), `cs_pop_first`, `rs_pop_end` and
 `cs_cnt_leak` (P5); `dup_beat` is equivalent. Two survivors of the first round led to new assertions (rowscale lane pointer, independent reservation counts).
-Limits: no unbounded proof (induction does not close without joint invariants), no liveness proof, DIM 8 only. A wrong assumption in the stub (`8'(ACC_ROWS)` truncating 2048 to 0) made every
+Since M-22 `bmc_d` / `covx` (stub decoder `M <= 3`) see the ACC spacing across instructions; the stub's `M <= 2` of `bmc_a` .. `bmc_c` could not (review R-1). Limits: no unbounded proof (induction does not close without joint invariants), no liveness proof (so no proof that an SPM that raises `ready` only for a request cannot hang the MXU: simulation, M-23), DIM 8 only. A wrong assumption in the stub (`8'(ACC_ROWS)` truncating 2048 to 0) made every
 property vacuous until the cover points failed to be reached; keep the cover task in the regression.

@@ -137,7 +137,9 @@ with a generate-`if` and a single-string `$error`: all three stop elaboration wh
 latency from the package, or overrides the MXU parameter upwards and keeps its own model at least as slow.
 
 **What the MXU guarantees** (mxu.md §4.4, formal P3): two `acc_valid` cycles with the same `acc_row` are at least `ACC_LAT` cycles
-apart, whatever the SPM grants do, including across instructions.
+apart, whatever the SPM grants do, including across instructions with any `acc_base`, `M` and `N` (M-22: after the last pass of
+an instruction the MXU waits `ACC_LAT - 2` cycles before the next pass issues, review R-1; the earlier gap of `ACC_LAT - M` cycles only
+covered the passes of one instruction).
 **What `core/acc` guarantees:** a row presented at cycle `T2 >= T1 + ACC_LAT` reads the result of the row presented at `T1`. No
 hazard logic, no forwarding.
 Failing configuration of review S-11(iii) (ACC with a 10-cycle loop, MXU with 8) cannot elaborate any more: the loop length is

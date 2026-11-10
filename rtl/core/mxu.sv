@@ -222,7 +222,9 @@ module mxu #(
   logic w_want, w_gnt, w_last_beat;
   assign w_want = (lst == L_RUN) && !l_w_all && (free_g[int'(l_buf) * NG + int'(l_g)] || l_idx != '0);   // only the first beat of a group waits for the swap
   assign w_req_v = w_want ? wl_lane_v : 8'd0;
-  assign w_gnt = w_want && w_req_ready;
+  // M-23 (review R-2): a beat with no valid lane is granted by the MXU itself and never presented as a request (w_req_v = 0 needs
+  // no ready); its response slot is still taken, so the zero window is written into the shadow like any beat.
+  assign w_gnt = w_want && (w_req_ready || wl_lane_v == 8'd0);
   assign w_last_beat = (l_g == 2'(NG - 1)) && (l_idx == IDXW'(BPG - 1));
   for (genvar l = 0; l < 8; l++) begin : g_wa
     assign w_req_addr[22*l +: 22] = wl_lane_addr[l];
@@ -382,6 +384,10 @@ module mxu #(
   logic [10:0] s_accrow;
   logic [15:0] s_lane_cnt;            // rowscale lanes requested in this pass
   logic [7:0]  gap_cnt;
+  // M-22 (review R-1): after the last pass of an instruction the next pass (another instruction, any acc_base / M) may update
+  // any row of this pass's range. Its first row issues 2 + gap cycles after this pass's last row, so the gap is ACC_LAT - 2
+  // whatever M (the K passes of one instruction keep the shorter ACC_LAT - M gap of mxu.md 4.4).
+  localparam int GAP_X = (ACC_LAT > 2) ? ACC_LAT - 2 : 0;
   logic        rs_need;
   logic [3:0]  a_lane_v;
   logic [4*22-1:0] a_lane_addr;
@@ -446,6 +452,8 @@ module mxu #(
             if (a_lastp) begin
               sst <= S_IDLE;
               gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows);
+              // M-22: M >= 2 leaves a gap of at most ACC_LAT - 2 above; M = 1 already has ACC_LAT - 1
+              if (s_last && s_Mrows >= 16'd2) gap_cnt <= 8'(GAP_X);
             end
           end
         end
@@ -554,14 +562,11 @@ module mxu #(
     assume (!(f_hw >= 2'd2 && w_req_v != 8'd0 && !w_req_ready));
     assume (!(f_hs >= 2'd2 && s_req_v && !s_req_ready));
   end
-  // a beat whose lanes are all invalid never requests: w_req_v is 0 and w_want still grants (the grant is w_want && ready),
-  // so the wait bound above applies to w_want, not to w_req_v
-  reg [1:0] f_hww = 2'd0;
-  always @(posedge clk) f_hww <= (w_want && !w_req_ready) ? ((f_hww == 2'd3) ? f_hww : f_hww + 2'd1) : 2'd0;
+  // a beat whose lanes are all invalid never requests (w_req_v is 0) and is granted by the MXU itself (M-23), so the W wait bound
+  // above is enough; the A port has lane 0 valid in every request, but its grant is a_want && ready, bound it the same way
   reg [1:0] f_haw = 2'd0;
   always @(posedge clk) f_haw <= (a_want && !a_req_ready) ? ((f_haw == 2'd3) ? f_haw : f_haw + 2'd1) : 2'd0;
   always @(*) begin
-    assume (!(f_hww >= 2'd2 && w_want && !w_req_ready));
     assume (!(f_haw >= 2'd2 && a_want && !a_req_ready));
   end
 
@@ -607,6 +612,12 @@ module mxu #(
     else if (f_since != 8'hFF)     f_since <= f_since + 8'd1;
   end
   always @(*) if (rst_n && y_valid && x_row == f_row && f_seen) assert (f_since + 8'd1 >= 8'(ACC_LAT));
+  // instruction id of an output row (toggles after the last row of an instruction): P3 across instructions (M-22)
+  reg f_ins = 1'b0, f_row_ins = 1'b0;
+  always @(posedge clk) begin
+    if (y_valid && x_lasti) f_ins <= !f_ins;
+    if (y_valid && x_row == f_row) f_row_ins <= f_ins;
+  end
 
   // ---- P4: rows leave in pass order: a pass starts with `first`, then consecutive rows, ends with `lastp`
   reg f_inpass = 1'b0;
@@ -665,6 +676,9 @@ module mxu #(
     cover (f_swp0 >= 3'd2 && swap_tap[0] && w_gnt);        // a load right after a tap
     cover (sem_inc_valid);
     cover (y_valid && x_resc && x_ucs);
+    // the row of P3 updated by two different instructions, the second one 0 .. 3 cycles after the first allowed instant: the
+    // ACC_LAT - M gap alone cannot cover it, the instruction-boundary gap of M-22 does
+    cover (y_valid && x_row == f_row && f_seen && f_row_ins != f_ins && f_since + 8'd1 >= 8'(ACC_LAT) && f_since + 8'd1 <= 8'(ACC_LAT) + 8'd3);
   end
 `endif
 `endif

@@ -1,7 +1,8 @@
 // Formal-only replacement of mxu_dec (tb/formal/mxu.sby): instead of decoding an instruction it pushes a free, legal
 // context whenever the load FSM can take one. Legal means what mxu_dec's checks guarantee: M, K, N >= 1, K and N
 // consistent with the K / N tile counts, ACC rows in range, acc_mode <= 2. The sizes are bounded by MMAX, KTMAX, NTMAX
-// (-define in the .sby) to keep the state space small. No faults, no queue.
+// (-define in the .sby) to keep the state space small. `acc_base` is free per instruction (0..16), so with M >= 3 the rows of two
+// instructions overlap shifted by up to M - 1 (the review R-1 case of the ACC spacing across instructions). No faults, no queue.
 `ifndef MMAX
 `define MMAX 2
 `endif

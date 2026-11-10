@@ -191,6 +191,11 @@ M = 4, K = 64, N = 8 example). The fold tile does not change with `DIM` (step 4 
 **Order** (bit-reproducible):
 1. Per K tile, the partial sum enters the top PE row as +0.
 2. It passes PE rows `0..DIM-1` in order (`FULL`: 0..63). PE row i holds K elements `4i .. 4i+3` (FP8) or `2i, 2i+1` (BF16) of the tile.
+   Slots past the tile's K (the K tail of a short tile) are `+0` operands: a PE row that holds only tail slots forms the products
+   `+0 x +0`, so its dot is `+0`. An exact-zero dot follows IEEE: it is `-0` only when every product of the dot is `-0`, else `+0`
+   (round-to-nearest). Therefore a `-0` partial sum survives only a full K tile: any all-tail PE row after it adds `-0 + +0 = +0`
+   (review R-3). A `-0` result of a short tile becomes `+0`, and a K tile is `4·DIM` / `2·DIM` elements, so the sign of a zero
+   result depends on where the tile boundary falls, i.e. on `DIM` (like the rounding, above).
 3. The tile's partial P_t (FP32) leaves the bottom of the array.
 4. At the ACC input:
    - `RESCALE`, once before the first tile: `ACC ← RNE(ACC × rowscale[m])`.
@@ -268,7 +273,7 @@ Rows shorter than 256 leave slots at +0. Max and min are exact. The order does n
 |---|---|---|---|---|
 | DMA copy, gather, scatter | bits kept | kept | kept | kept |
 | DMA conversions | canonical in the destination | kept (to BF16/FP32); never produced into E4M3 | kept in every destination (FP8, FP4, BF16, FP16, FP32; N-2) | kept |
-| MXU | propagates | from FP32 overflow of the accumulation; in BF16 mode also an Inf operand and a dot product that overflows (N-3). E4M3 has no Inf | FP8 kept; BF16 inputs DAZ; results FTZ | `+0` from an all-zero tile |
+| MXU | propagates | from FP32 overflow of the accumulation; in BF16 mode also an Inf operand and a dot product that overflows (N-3). E4M3 has no Inf | FP8 kept; BF16 inputs DAZ; results FTZ | `+0` from an all-zero tile; a `-0` partial sum (all products `-0`, or a cancellation flushed to `-0`) leaves the array only from a full K tile, a short tile ends in `+0` (K-tail slots are `+0` operands, N-3 order) |
 | VPU / SFU | propagates (IEEE); produced by invalid operations | IEEE | DAZ / FTZ | IEEE |
 | Conversions to FP8 / FP4 | canonical NaN; FP4 → block NaN scale | saturates to ±max | kept | kept |
 | Write-add (`ADD_F32`, `ADD_BF16`) | propagates | IEEE | operands DAZ, results FTZ (like every arithmetic unit) | IEEE |

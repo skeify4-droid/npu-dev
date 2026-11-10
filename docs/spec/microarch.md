@@ -755,6 +755,11 @@ config. The MXU asks for 4 lanes (A), 8 lanes (W) or 1 lane (scales) per request
   after exactly `SPM_LAT`. A request therefore never waits for "all its banks free at once", so a bank collision slows the beat by
   one cycle per extra lane and cannot deadlock the MXU. The MXU needs no change: it already tolerates arbitrary grant stalls
   (`tb_mxu` runs 30% random stalls).
+- **Only a request with a valid lane is a request** (M-23, review R-2). The MXU never presents a W beat whose lanes are all invalid (K or N
+  past the tile): it grants such a beat itself and takes its (zero) response slot locally. So `ready` of a port may be low until a
+  valid lane is read, as in the bullet above, and the shim may leave it low while the request has no valid lane; the MXU does not look at it
+  then. The A port always has lane 0 valid and the scale port is only valid when it asks (`s_req_v`). `tb_mxu` runs a mode (`RDYV`)
+  whose `ready` is low for an empty request.
 - Arbitration with the other clients stays per bank, round-robin with the age bound of §2.3.
 - `core/spm` and the shim are the owners of this contract; `tb_mxu`'s behavioural SPM has no bank model, so the first bank-accurate
   test is the one for the shim.

@@ -505,6 +505,15 @@ Then:
 - add a chained-instruction case with shifted `acc_base` to `tb_mxu`;
 - correct acc.md:140.
 
+**Response (author, 2026-11-10; decision M-22, mxu.md §8).** Confirmed and fixed, option (a). After the last pass of an instruction the
+stream FSM waits `ACC_LAT - 2` cycles whatever `M` (`GAP_X` in `rtl/core/mxu.sv`; `M = 1` keeps its `ACC_LAT - 1`). The token path adds
+exactly 2 cycles, as the review says, so any row of the next instruction is issued at least `ACC_LAT` cycles after any row of the previous
+one. mxu.md §4.4 and its proof are restated (the same-instruction case was right; the across-instruction case had no proof),
+acc.md §5 now holds as written, status.md's design-decision line says what was wrong. `tb_mxu` has 18 chained instructions on shifted
+row ranges (DIM 8 and 16; the old rule fails them), the formal stub allows `M <= 3` with a free `acc_base` (tasks `bmc_d`, `covx`), mutants
+`gap_x_off`, `gap_x_short`, `gap_x_every_pass` (equivalent). Tile period at `M = 1`: unchanged (measured, mxu.md §7). Commit: not yet
+(working tree of `review/mxu-part-r`; to be filled in when the change is committed).
+
 ### R-2 (M, confirmed against a stated SPM model; the integration is suspected because the shim does not exist yet) A W beat with no valid lane needs `ready` without `valid`
 
 **Where.**
@@ -532,6 +541,12 @@ regardless of `valid`, which is why the assumption never showed.
 - Or (b): the MXU generates empty beats locally. It must still write the zero window into the shadow buffer, because the buffer
   holds the previous tile; skipping the beat would leave stale weights. This also saves the empty cycles.
 
+**Response (author, 2026-11-10; decision M-23, mxu.md §8).** Confirmed and fixed, option (b): `w_gnt = w_want && (w_req_ready || wl_lane_v == 0)`.
+The MXU grants an empty beat itself and never presents it as a request; the beat keeps its response slot, so the zero window is still
+written into the shadow buffer, and the beat order and the tile period do not change. Spec: mxu.md §4.3 / §5, microarch.md §5 (shim
+contract). `tb_mxu` has a `RDYV` mode (ready low while a request has no valid lane) in two default instances; `probe_rdyv.py` and the
+mutant `w_gnt_wait` are in the acceptance run. Commit: not yet (see R-1).
+
 ### R-3 (L, confirmed) N-3 does not say that the K tail is +0 operands or what sign an exact-zero dot has; both decide signed-zero results
 
 **Where.**
@@ -556,6 +571,11 @@ rows 2-3 and 12-13, and 0-1 and 4-11 respectively). With the mxu.md reading it p
 
 **Proposed fix.** One sentence in N-3: tail slots are +0 operands, an exact-zero dot follows IEEE (−0 only when all products
 are −0), and therefore a −0 partial sum survives only a full K tile. Amend the N-5 "−0" cell.
+
+**Response (author, 2026-11-10; spec wording only).** Accepted as proposed. numerics.md N-3 ("Order", step 2) now says that K-tail slots
+are `+0` operands, that an exact-zero dot follows IEEE (`-0` only when every product is `-0`), and that a `-0` partial sum therefore
+survives only a full K tile (the sign of a zero result depends on `DIM`); the N-5 MXU `-0` cell says the same. No RTL change. Commit: not
+yet (see R-1).
 
 ### Observations (no finding)
 

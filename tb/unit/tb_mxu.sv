@@ -26,6 +26,7 @@ module mxu_tc #(
   parameter int ACC_LAT   = 8,
   parameter int A_BLOCK   = 0,       // cycles the A port refuses requests after each grant (lets the loader run ahead of the swap)
   parameter int MAX_PERIOD = 0,      // > 0: consecutive output rows (M = 1 passes) at most this many cycles apart
+  parameter int RDYV      = 0,       // 1: a port's ready is low while its request has no valid lane (M-23); +RDYV=n overrides
   parameter int PERF      = 0,       // 1: report the distribution of the gaps between consecutive output rows (M = 1: the tile period)
   parameter string PRE    = ""
 ) (
@@ -149,9 +150,13 @@ module mxu_tc #(
   logic [LB*8-1:0]   s_nxt;
   int blk = 0;
   // ready = the random / blocking pattern (registered) and the bank model (combinational, always 1 when it is off)
-  assign a_req_ready = a_rdy_r && a_bk_rdy;
-  assign w_req_ready = w_rdy_r && w_bk_rdy;
-  assign s_req_ready = s_rdy_r && s_bk_rdy;
+  // +RDYV=1 (M-23, review R-2): a port's ready is low whenever its request has no valid lane, so an MXU that waits for the
+  // grant of an empty request hangs (a stricter SPM than the default, which raises ready whatever valid)
+  int rdyv_mode = RDYV;
+  initial void'($value$plusargs("RDYV=%d", rdyv_mode));
+  assign a_req_ready = a_rdy_r && a_bk_rdy && (rdyv_mode == 0 || a_req_v != 4'd0);
+  assign w_req_ready = w_rdy_r && w_bk_rdy && (rdyv_mode == 0 || w_req_v != 8'd0);
+  assign s_req_ready = s_rdy_r && s_bk_rdy && (rdyv_mode == 0 || s_req_v);
   always @(posedge clk) begin
     if (a_req_v != 4'd0 && a_req_ready && A_BLOCK > 0) begin blk <= A_BLOCK; a_rdy_r <= 1'b0; end
     else if (blk > 1) begin blk <= blk - 1; a_rdy_r <= 1'b0; end
@@ -436,16 +441,16 @@ module tb_mxu;
 endmodule
 `else
 module tb_mxu;
-  logic d8, d16, d8s, d16s, d32, d8b;
-  int e8, e16, e8s, e16s, e32, e8b;
+  logic d8, d16, d8s, d16s, d32, d8b, dr8, dr16;
+  int e8, e16, e8s, e16s, e32, e8b, er8, er16;
 `ifdef ONLY32
-  assign d8 = 1, e8 = 0, d16 = 1, e16 = 0, d8s = 1, e8s = 0, d16s = 1, e16s = 0, d8b = 1, e8b = 0;
+  assign d8 = 1, e8 = 0, d16 = 1, e16 = 0, d8s = 1, e8s = 0, d16s = 1, e16s = 0, d8b = 1, e8b = 0, dr8 = 1, er8 = 0, dr16 = 1, er16 = 0;
   mxu_tc #(.DIM(32), .NINS(`CNT_MXU_32_PROG), .NTD(`CNT_MXU_32_DTAB), .SPMB(`CNT_MXU_32_SPM), .ACCR(`CNT_MXU_32_ACC0), .STALL_PCT(0), .MAX_PERIOD(26), .PRE("mxu_32_")) t32 (.done(d32), .errors(e32));
 `elsif ONLY16
-  assign d8 = 1, e8 = 0, d8s = 1, e8s = 0, d16s = 1, e16s = 0, d32 = 1, e32 = 0, d8b = 1, e8b = 0;
+  assign d8 = 1, e8 = 0, d8s = 1, e8s = 0, d16s = 1, e16s = 0, d32 = 1, e32 = 0, d8b = 1, e8b = 0, dr8 = 1, er8 = 0, dr16 = 1, er16 = 0;
   mxu_tc #(.DIM(16), .NINS(`CNT_MXU_16_PROG), .NTD(`CNT_MXU_16_DTAB), .SPMB(`CNT_MXU_16_SPM), .ACCR(`CNT_MXU_16_ACC0), .STALL_PCT(0),  .PRE("mxu_16_")) t16 (.done(d16), .errors(e16));
 `elsif QUICK
-  assign d16 = 1, d8s = 1, d16s = 1, d32 = 1, e16 = 0, e8s = 0, e16s = 0, e32 = 0, d8b = 1, e8b = 0;
+  assign d16 = 1, d8s = 1, d16s = 1, d32 = 1, e16 = 0, e8s = 0, e16s = 0, e32 = 0, d8b = 1, e8b = 0, dr8 = 1, er8 = 0, dr16 = 1, er16 = 0;
   mxu_tc #(.DIM(8),  .NINS(`CNT_MXU_8_PROG),  .NTD(`CNT_MXU_8_DTAB),  .SPMB(`CNT_MXU_8_SPM),  .ACCR(`CNT_MXU_8_ACC0),  .STALL_PCT(0),  .PRE("mxu_8_"))  t8  (.done(d8),  .errors(e8));
 `else
   mxu_tc #(.DIM(8),  .NINS(`CNT_MXU_8_PROG),  .NTD(`CNT_MXU_8_DTAB),  .SPMB(`CNT_MXU_8_SPM),  .ACCR(`CNT_MXU_8_ACC0),  .STALL_PCT(0),  .PRE("mxu_8_"))  t8  (.done(d8),  .errors(e8));
@@ -454,6 +459,9 @@ module tb_mxu;
   mxu_tc #(.DIM(8),  .NINS(`CNT_MXU_8_PROG),  .NTD(`CNT_MXU_8_DTAB),  .SPMB(`CNT_MXU_8_SPM),  .ACCR(`CNT_MXU_8_ACC0),  .STALL_PCT(0), .A_BLOCK(40), .PRE("mxu_8_"))  t8b (.done(d8b), .errors(e8b));
   mxu_tc #(.DIM(16), .NINS(`CNT_MXU_16_PROG), .NTD(`CNT_MXU_16_DTAB), .SPMB(`CNT_MXU_16_SPM), .ACCR(`CNT_MXU_16_ACC0), .STALL_PCT(30), .PRE("mxu_16_")) t16s (.done(d16s), .errors(e16s));
   mxu_tc #(.DIM(32), .NINS(`CNT_MXU_32_PROG), .NTD(`CNT_MXU_32_DTAB), .SPMB(`CNT_MXU_32_SPM), .ACCR(`CNT_MXU_32_ACC0), .STALL_PCT(0), .MAX_PERIOD(26), .PRE("mxu_32_")) t32 (.done(d32), .errors(e32));
+  // M-23: SPM whose ready is low for a request with no valid lane (the MXU must never wait for the grant of an empty beat)
+  mxu_tc #(.DIM(8),  .NINS(`CNT_MXU_8_PROG),  .NTD(`CNT_MXU_8_DTAB),  .SPMB(`CNT_MXU_8_SPM),  .ACCR(`CNT_MXU_8_ACC0),  .STALL_PCT(30), .RDYV(1), .PRE("mxu_8_"))  t8r  (.done(dr8),  .errors(er8));
+  mxu_tc #(.DIM(16), .NINS(`CNT_MXU_16_PROG), .NTD(`CNT_MXU_16_DTAB), .SPMB(`CNT_MXU_16_SPM), .ACCR(`CNT_MXU_16_ACC0), .STALL_PCT(0), .RDYV(1), .PRE("mxu_16_")) t16r (.done(dr16), .errors(er16));
 `endif
   logic df;
   int ef;
@@ -467,9 +475,9 @@ module tb_mxu;
   mxu_fault_tc #(.DIM(8), .N(`CNT_MXU_FAULT_8), .SPMB(`CNT_MXU_8_SPM), .ACCR(`CNT_MXU_8_ACC0), .FILE("mxu_fault_8.hex")) tf (.done(df), .errors(ef));
 `endif
   initial begin
-    wait (d8 && d16 && d8s && d16s && d32 && d8b && df);
-    if (e8 + e16 + e8s + e16s + e32 + e8b + ef == 0) $display("PASS mxu");
-    else $display("FAIL mxu: %0d errors (8: %0d, 8 stalls: %0d, 8 long A stalls: %0d, 16: %0d, 16 stalls: %0d, 32: %0d, faults: %0d)", e8 + e16 + e8s + e16s + e32 + e8b + ef, e8, e8s, e8b, e16, e16s, e32, ef);
+    wait (d8 && d16 && d8s && d16s && d32 && d8b && dr8 && dr16 && df);
+    if (e8 + e16 + e8s + e16s + e32 + e8b + er8 + er16 + ef == 0) $display("PASS mxu");
+    else $display("FAIL mxu: %0d errors (8: %0d, 8 stalls: %0d, 8 long A stalls: %0d, 16: %0d, 16 stalls: %0d, 32: %0d, 8 / 16 ready-needs-valid: %0d / %0d, faults: %0d)", e8 + e16 + e8s + e16s + e32 + e8b + er8 + er16 + ef, e8, e8s, e8b, e16, e16s, e32, er8, er16, ef);
     $finish;
   end
 endmodule

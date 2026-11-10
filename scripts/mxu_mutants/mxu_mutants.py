@@ -12,6 +12,7 @@ Every mutant is a copy of rtl/core with exactly one textual change (`old` must o
   formal_blind  the proofs cannot see it (M <= 2): tb_mxu must kill it, and sby bmc_a is expected to PASS (a recorded limit of the proofs)
   equiv  an equivalent change (not visible at the ACC / the fault port): tb_mxu must still PASS
   formal the control mutants of the proofs: sby task bmc_a (depth 56) must fail (or, for `equiv_f`, pass)
+  formal_x  control mutants that need M >= 3 (ACC spacing across instructions, M-22): sby task bmc_d must fail, and tb_mxu must kill them
   formal_dec  mutants of the decoder's M = 0 path and checks: tb/formal/mxu_dec.sby task bmc (depth 40, the real mxu_dec) must fail
   equiv_dec  an equivalent change of the decoder: the same proof must still pass
 Exit status 0 when every mutant behaved as its expectation says.
@@ -114,7 +115,16 @@ mut("rs_lane", X, "assign rs_addr = s_rs_base + 22'(s_lane_cnt) * 22'(LB);", "as
 mut("acc_row_nt", X, "s_accrow <= tk_acc_base + 11'(64'(tk_j) * 64'(tk_M));", "s_accrow <= tk_acc_base + 11'(tk_j);")
 mut("overwrite_t0", X, "assign a_ovw   = (s_accm == 2'd0) && (s_t == 16'd0);", "assign a_ovw   = (s_accm == 2'd0);")
 mut("rescale_t0", X, "assign rs_need = (s_accm == 2'd2) && (s_t == 16'd0);", "assign rs_need = (s_accm == 2'd2);")
-mut("gap_cnt", X, "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows);", "gap_cnt <= 8'd0;", exp="kill_full", note="killed by the ACC_LAT = 24 run only")
+mut("gap_cnt", X, "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows);", "gap_cnt <= 8'd0;", exp="kill_full", note="no gap at all: killed by the ACC_LAT = 24 run and by the R-1 chained cases")
+# M-22 (review R-1): the gap at an instruction boundary. gap_x_off is the rule before the change; proofs: bmc_d (M <= 3, free acc_base)
+mut("gap_x_off", X, "if (s_last && s_Mrows >= 16'd2) gap_cnt", "if (1'b0 && s_Mrows >= 16'd2) gap_cnt", exp="formal_x", note="R-1: no boundary gap (the old rule)")
+mut("gap_x_short", X, "localparam int GAP_X = (ACC_LAT > 2) ? ACC_LAT - 2 : 0;", "localparam int GAP_X = (ACC_LAT > 3) ? ACC_LAT - 3 : 0;", exp="formal_x",
+    note="R-1: the boundary gap one cycle short (ACC_LAT - 1 cycles between the worst pair of rows)")
+mut("gap_x_every_pass", X, "if (s_last && s_Mrows >= 16'd2) gap_cnt", "if (1'b1 && s_Mrows >= 16'd2) gap_cnt", exp="equiv",
+    note="the boundary gap after every pass: safe and only slower (the pass period at M = 1 is longer than ACC_LAT - 2 anyway)")
+# M-23 (review R-2): an empty W beat is granted by the MXU. tb_mxu runs two instances with an SPM whose ready needs a valid lane
+mut("w_gnt_wait", X, "assign w_gnt = w_want && (w_req_ready || wl_lane_v == 8'd0);", "assign w_gnt = w_want && w_req_ready;", exp="kill",
+    note="R-2: the MXU waits for the grant of an empty beat (hangs on the ready-needs-valid SPM of tb_mxu)")
 mut("sem_head", X, "assign sem_inc_idx   = sem_inc_w[9:4];", "assign sem_inc_idx   = sem_inc_w[3:0] + 6'd0;")
 
 # ----------------------------------------------------------------------------------------------- control mutants of the proofs
@@ -187,16 +197,16 @@ def run_tb(m, quick):
     return "fails", first[0] if first else out[-200:]
 
 
-def run_formal(m):
+def run_formal(m, task="bmc_a"):
     d = build(m)
     sby = open(os.path.join(ROOT, "tb/formal/mxu.sby")).read()
     sby = sby.replace("../../rtl/core/", d + "/")
     sby = sby.replace("mxu_stubs.sv", os.path.join(ROOT, "tb/formal/mxu_stubs.sv")).replace("mxu_dec_stub.sv", os.path.join(ROOT, "tb/formal/mxu_dec_stub.sv"))
     sby = re.sub(r"\[files\]\n", "[files]\n", sby)
-    # one task: bmc_a (M <= 2, 2 K tiles, 1 N tile) at the full depth
+    # one task: bmc_a (M <= 2, 2 K tiles, 1 N tile) at the full depth, or bmc_d (M <= 3, 1 K tile, 1 N tile) for formal_x
     p = os.path.join(d, "mxu.sby")
     open(p, "w").write(sby)
-    r = subprocess.run([SBY, "-f", "--prefix", os.path.join(d, "run"), p, "bmc_a"], cwd=d, capture_output=True, text=True, timeout=3600)
+    r = subprocess.run([SBY, "-f", "--prefix", os.path.join(d, "run"), p, task], cwd=d, capture_output=True, text=True, timeout=3600)
     out = r.stdout + r.stderr
     if "DONE (FAIL" in out:
         line = [l for l in out.splitlines() if "Assert failed" in l]
@@ -244,13 +254,13 @@ def main():
             verdict = "tb " + res
         elif mode == "tb":
             res, info = run_tb(m, quick)
-            ok = (res == "fails") if exp in ("kill", "formal_blind") else (res == "passes") if exp == "equiv" else (res == "fails" or quick)
+            ok = (res == "fails") if exp in ("kill", "formal_blind", "formal_x") else (res == "passes") if exp == "equiv" else (res == "fails" or quick)
             verdict = ("KILLED" if res == "fails" else "SURVIVED" if res == "passes" else res) + ("" if ok else "   <-- UNEXPECTED")
         else:
-            if exp not in ("formal", "formal_blind", "formal_dec", "equiv_dec"):
+            if exp not in ("formal", "formal_x", "formal_blind", "formal_dec", "equiv_dec"):
                 continue
-            res, info = run_formal_dec(m) if exp in ("formal_dec", "equiv_dec") else run_formal(m)
-            ok = (res == "fails") if exp in ("formal", "formal_dec") else (res == "passes")
+            res, info = run_formal_dec(m) if exp in ("formal_dec", "equiv_dec") else run_formal(m, "bmc_d" if exp == "formal_x" else "bmc_a")
+            ok = (res == "fails") if exp in ("formal", "formal_x", "formal_dec") else (res == "passes")
             verdict = ("CAUGHT" if res == "fails" else "SURVIVED" if res == "passes" else res) + ("" if ok else "   <-- UNEXPECTED")
         bad += 0 if ok else 1
         print("%-26s %-8s %s   %s" % (name, exp, verdict, info if res in ("fails", "COMPILE-ERROR", "ERROR") else ""), flush=True)

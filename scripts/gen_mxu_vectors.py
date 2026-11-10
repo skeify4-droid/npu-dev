@@ -457,6 +457,20 @@ def build_top(dim, decode_only=False, perf=None):
     case(0, 4 * D, D, False, True, 1, False, False, 120, m_reg=True, decoy=5, ssem=4, sinc=2)                # S-7: R[m_reg] = 0 (TD n1 is a decoy): a no-op that completes after the case above
     case(3, 200, 16, False, True, 0, True, False, 200, wsem=4, wval=2, cs_end=True, ssem=5, sinc=1)          # S-10: K = 200 is one fold tile (one 64 B scale row, at the very end of the SPM) and 7 / 4 MXU passes; waits for the M = 0 above
     case(0, 2 * D, 2 * D + 1, True, False, 1, True, False, 120, ssem=4, sinc=1)                              # S-7: M = 0 from the TD again, with cs: its checks run, nothing is read
+    # ---- R-1 (review part R, M-22): ACCUM instructions back to back (no semaphore wait) on shifted ACC row ranges. The next instruction's
+    # row m' lands on the previous pass's row m, with m - m' up to M - 1, and its tile is already loaded when the pass ends: the old
+    # gap (ACC_LAT - M, 0 for M >= ACC_LAT) let that row be updated 2 + gap < ACC_LAT cycles after the previous update (tb_mxu's
+    # "ACC hazard" check). K = 10 FP8 trans: one short pass per N tile, so the passes are as short as the load allows.
+    for Mb, B in ((D + 1, 150), (2 * D + 1, 150), (3 * D, 150)):            # 9 / 17 / 24 rows at DIM 8, 17 / 33 / 48 at DIM 16
+        case(Mb, 10, D, False, True, 1, False, False, B)                       # long pass
+        case(1, 10, D, False, True, 1, False, False, B + Mb - 1)               # row 0 on the previous last row (m - m' = M - 1)
+        case(Mb, 10, D, False, True, 1, False, False, B + Mb - 1)              # again a long pass, row 0 on the previous (M = 1) row
+        case(2, 10, D, False, True, 1, False, False, B + Mb - 2)               # M = 2 on rows Mb-2, Mb-1 of the long pass
+        case(3, 10, D, False, True, 1, False, False, B + Mb - 4)               # M = 3 starting 2 rows before the previous start
+    # several N tiles and K passes: the last pass of the instruction (j = 1, t = 1) is followed by M = 1 on its last row
+    case(D + 1, 4 * D + 5, D + 3, False, True, 1, False, False, 150)           # NT = 2, KT = 2
+    case(1, 4 * D + 5, D + 3, False, True, 1, False, False, 150 + 2 * (D + 1) - 1)
+    case(1, 4 * D + 5, D + 3, False, True, 1, False, False, 150 + 2 * (D + 1) - 1, ssem=5, sinc=1)    # the testbench waits for the last one (semaphore 5)
     flags_or &= 0xF
     # the first increment of semaphore 3 (the case before the M = 0) must come before the first one of semaphore 4
     return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or,
