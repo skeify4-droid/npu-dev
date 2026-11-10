@@ -1,5 +1,8 @@
 # Independent review of the MXU (commit 241c816)
 
+Part **S** (below) reviews the spec. Part **R** ([at the end](#part-r-bit-exact-semantics-against-an-independent-oracle-commit-2cc2d4b))
+reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle.
+
 Scope of this part (**S**): `docs/spec/mxu.md` against the frozen architecture: microarch.md §2.2 and §5, numerics.md N-3 / N-5 /
 N-8, arith.md "Integration contract" items 1-5, isa.md §3-5 (and §8, which (a) needs), isa_ref.md `MXU_MM`, memmap.md §4. No RTL was
 read for this part. `docs/reports/status.md` was read only after the findings below were written (comparison at the end).
@@ -365,3 +368,211 @@ Not in status.md or the brief:
 - S-3: the SPM of every client changes in TINY/MID, legality depends on the config, the gang grant can deadlock.
 - S-7 (`M = 0`), S-8 (`WRAP`), S-9 (`FAULT_ADDR`, priority, `core/seq` port), S-10 (`RANGE` over-reads), S-11 (iii) (`ACC_LAT`
   binding) and S-11 (iv) (flags before `acc_done`).
+
+---
+
+## Part R: bit-exact semantics against an independent oracle (commit 2cc2d4b)
+
+Scope: `MXU_MM` as executed by `rtl/core/mxu*.sv` (with the PE of `rtl/arith`) at `DIM` 8 and 16, against a reference written
+only from numerics.md N-1 / N-3 / N-5 and isa_ref.md `MXU_MM`. I wrote the findings before reading `docs/reports/status.md`;
+the comparison is at the end. No file of the author was changed. Labels and severities are as in part S.
+
+### Method
+
+- **Oracle** `scripts/mxu_review/oracle.py`, plain Python integers. A finite value is `m · 2^e`. The rounding is RNE onto the FP32
+  grid, then a flush of what is still subnormal ("round, then flush"). DAZ applies to FP32 / BF16 inputs; E4M3 subnormals are kept.
+  It models:
+  - the PE dot as one fused operation, rounded once. A NaN operand gives `NAN_IN` only; Inf x 0 or +Inf + -Inf gives `INVALID`;
+  - the FP32 add of the PE;
+  - the PE flags: the dot's `NAN_IN` / `OVERFLOW` / `INVALID` plus the add's `OVERFLOW` / `INVALID`;
+  - the ACC lane of N-3 step 4 with the N-5 flag rules;
+  - the K-tile order, `R = 64 / DIM` scale rows per fold tile, and the `CSP` layout;
+  - OVERWRITE / ACCUM / RESCALE (once, before the first tile of each N tile);
+  - +0 operands in the K and N tails (mxu.md §3);
+  - canonical NaNs.
+
+  It imports neither `arith_ref.py`, `numerics.py` nor NumPy.
+- **Self-test of the oracle** `scripts/mxu_review/oracle_selftest.py` checks the decoding of all E4M3 and BF16 codes against
+  `ml_dtypes`, `round32` against a bisection over FP32 bit patterns (4,000 cases), and add / mul against the host's double
+  arithmetic rounded to float32 (20,000 pairs), plus hand cases for DAZ, FTZ and the specials. It passes.
+- **Testbench** `scripts/mxu_review/tb_mxu_rev.sv` is my own, not `tb_mxu`:
+  - an MQ head, a DTAB with random grant stalls, and semaphores;
+  - three SPM ports with fixed latency, a % of random stalls, and random garbage on lanes that are not requested;
+  - an ACC built from `acc_update` lanes with word-masked writes;
+  - a log of each `acc_valid` row's raw fields, of `fp_flags` and `sem_inc` per cycle, of out-of-SPM lanes, and of any ACC row
+    updated twice within `ACC_LAT` cycles;
+  - `+RMW=1`: an ACC write is visible only `ACC_LAT` cycles after its row (acc.md §5);
+  - `+RDYV=1`: a port's `ready` is low while its request has no valid lane.
+- **Programs** come from `scripts/mxu_review/run_review.py`, my own generator, not `gen_mxu_vectors.py`:
+  - 46 directed programs and 60 fuzz programs per `DIM`, 1-6 chained instructions each.
+  - The SPM background is NaN-heavy garbage (`0x7F` / `0xFF` / `0x80` and random bytes), so any byte used outside an operand
+    shows.
+  - The TD fields the MXU must ignore (bits 255:112: s2, s3, aux0, row_bytes, ...) are random.
+  - The initial ACC holds NaNs with payloads, ±Inf, ±0 and subnormals.
+  - Shapes the author did not use: K = 1; N = 1; M = DIM+1, 37, 70; K exactly 1, 2 and 4 K tiles; BF16 `trans_w = 0` with
+    N = DIM+3, 2·DIM-1, DIM/2+1; padded row pitches; pitch 0 (repeated rows / columns); overlapping rows (pitch 64 with K = 200);
+    `m_reg` with a decoy `n1`, including `R[m_reg] = 0` in a chain; up to 6 instructions on overlapping ACC rows with different
+    `acc_base`, M, N, modes and dtypes; `acc_base + NT·M = ACC_ROWS` with `acc_reg = 0`; operands that end at the last SPM byte.
+  - Specials: E4M3 NaN in A / W, BF16 Inf x 0, Inf - Inf in a dot and in the add, dot and add overflow, NaN payloads, subnormal
+    x Inf (DAZ), BF16 products below 2^-126 (FTZ), constructed signed zeros, and column scales / rowscales that are NaN, Inf,
+    0, -0, subnormal or 2^-120 (FTZ to -0 after the multiply).
+- **Comparison**, per run:
+  - every row of the `acc_*` stream, bit for bit (row, `ncols`, `rescale` / `overwrite` / `use_cs`, `last`; `rowscale` when
+    rescaling; `cs` and `part` of the columns `< ncols`);
+  - the whole ACC image (every word, untouched ones too) twice: once from my ACC lane applied to the RTL's stream, once from the
+    testbench's `acc_update` lanes;
+  - `fp_flags` against the OR of the PE flags my model predicts for rows `m < M` and columns `n < N` only. In serial runs (each
+    instruction waits on the previous one's semaphore) this is checked per instruction, between its MQ pop and its `sem_inc`;
+    in pipelined runs, as the OR over the run;
+  - the ACC-lane flags;
+  - one `sem_inc` per instruction; no fault, no timeout, no lane outside the SPM, no ACC row updated within `ACC_LAT`.
+- **Runs**: each program in serial and pipelined mode, with 0% and 30% stalls: 784 runs
+  (`scripts/memrun mxu_review_r2 python scripts/mxu_review/run_review.py --fuzz 60`, 690 s, 0.20 GB).
+  The directed program `acc_spacing_x_ins` (R-1) was added after this run. The suite now fails its pipelined runs on purpose
+  until R-1 is fixed.
+- **Sensitivity**: `scripts/mxu_review/mut_review.py` builds 14 one-change copies of `rtl/core` / `rtl/arith` in
+  `build/mxu_review/mut/`, chosen by me: scale row per pass, scale column offset, OVERWRITE on every pass, RESCALE on every pass,
+  one A / W byte past K, no column mask on the flags, the add's `NAN_IN` in the PE flags, ACC row stride `DIM`, rowscale lane
+  address, `last` on every pass, `ncols + 1`, BF16 non-trans lane halves swapped, `gap_cnt` off. **All 14 are killed** by the
+  directed programs (60 s), each by the check aimed at it. Switching the oracle to its two documented alternatives (no K-tail
+  padding; an exact zero dot always +0) makes the signed-zero programs fail, so the passes are not vacuous.
+
+### Result
+
+Apart from R-1, **no bit differs**: partial sums, column scales, rowscales, controls, ACC images, NaN payloads (non-canonical NaNs
+in the ACC survive where untouched and become `0x7FC00000` where computed), signed zeros, per-instruction `fp_flags` and ACC-lane
+flags. This holds at `DIM` 8 and 16, serial and pipelined, with and without stalls: 773 of 784 runs pass. The 11 failures are all
+pipelined runs (DIM 8: fuzz000, fuzz020, fuzz053; DIM 16: fuzz001, fuzz044, fuzz045). Each fails only on the ACC spacing check,
+which is R-1.
+
+`fp_flags` equals the OR of the PE flags of in-range rows and columns in every serial run, per instruction. The column mask
+matters: in `bf16_colmask` the pad columns of a tile compute +Inf x +0 (`INVALID`) while every in-range column is +Inf with no
+flag, and the RTL reports 0 as predicted. With the mask removed (mutant `no_col_mask_flags`) it reports `INVALID`. `acc_update`
+agreed with my ACC-lane model on every row of every run.
+
+### R-1 (H, confirmed) The ACC spacing rule does not hold across instructions: a following `ACCUM` reads a stale row
+
+**Where.**
+- RTL: `rtl/core/mxu.sv:448` sets the gap from the previous pass's `M` only (`gap_cnt = ACC_LAT - s_Mrows`, 0 when
+  `M >= ACC_LAT`). `:407` starts the next pass when `gap_cnt == 0`.
+- Spec: mxu.md §4.4 (lines 159-164) gives the rule and its proof. acc.md:139-140 states the guarantee "including across
+  instructions", and acc.md:141-142 says `core/acc` has no hazard logic and no forwarding.
+
+**Failing input** (`acc_spacing_x_ins`, DIM 8, pipelined, no stalls): FP8, `trans_w = 1`, K = 10, N = 8.
+
+| # | M | `acc_mode` | `acc_base` |
+|---|---|---|---|
+| 0 | 3 | ACCUM | 0 |
+| 1 | 1 | ACCUM | 2 |
+| 2 | 9 | ACCUM | 20 |
+| 3 | 1 | ACCUM | 25 |
+
+All four are legal and queued back to back with no semaphore wait. Instruction 2 issues ACC row 25 (its row m = 5) in cycle 60;
+instruction 3 issues the same row (its row m' = 0) in cycle 66, **6 cycles apart, `ACC_LAT` = 8**.
+
+**What goes wrong.**
+- With the acc.md §5 timing (`+RMW=1`), instruction 3's read of row 25 returns the value from before instruction 2's update.
+- All 8 words of ACC row 25 come out wrong: col 0 `c40c8d08`, want `c7c3b1f3`; col 4 `c30e9569`, want `c56b64bf`.
+  Instruction 2's contribution is lost.
+- The stream itself is bit-exact: my ACC lane applied to it gives the right image. The data is lost only by the spacing.
+- fuzz000 (DIM 8: M = 9 at `acc_base` 1, then M = 1 at `acc_base` 6) shows 5 cycles. DIM 16 fuzz001 shows rows 17-19 at 5 cycles.
+
+**Why.** The proof of §4.4 ("row m of the next pass issues at least (M-1-m) cycles after row m of the previous one") assumes that
+the next pass updates the same ACC rows in the same order. That holds for the K passes of one N tile, and different N tiles of one
+instruction use disjoint rows. It does not hold when the next pass belongs to another instruction whose `acc_base` or `M` places
+its row m' on the previous pass's row m.
+
+From the RTL, the token path adds 2 cycles. A hazard occurs when m - m' >= max(2, M_prev + 2 - ACC_LAT) and the next tile is
+already loaded when the previous pass ends. So the previous pass has to be long enough to hide the next load: here M = 9 at
+DIM 8. M = 3 followed by M = 1 at the right base did not trigger, because the load was the longer of the two.
+
+**How I know.** Reproduced in the 784-run suite (11 runs) and with `+RMW=1` (the wrong words above;
+`scripts/memrun mxu_review_rmw ...`, log `logs/mxu_review_rmw.log`). The serial runs of the same programs pass.
+
+**Why the checks did not see it.**
+- The formal environment caps M at 2 (mxu.md §6). Then m - m' <= 1, so P3 cannot reach the case.
+- `tb_mxu`'s "ACCUM onto the previous instruction's rows" uses the same rows in the same order.
+
+**Proposed fix (for the author).** Any one of:
+- (a) at an instruction boundary, wait `ACC_LAT - 2` cycles whatever the previous `M` (at most 6 cycles per instruction, and only
+  when the next instruction is ready early);
+- (b) a small scoreboard of the last `ACC_LAT` issued `acc_row`s, stalling a row that matches one of them;
+- (c) a legality / compiler rule, which is weaker because nothing checks it.
+
+Then:
+- extend the formal environment to M >= 3 with a free `acc_base` per instruction, or add a P3 run with a decoder stub that makes
+  overlapping row ranges;
+- add a chained-instruction case with shifted `acc_base` to `tb_mxu`;
+- correct acc.md:140.
+
+### R-2 (M, confirmed against a stated SPM model; the integration is suspected because the shim does not exist yet) A W beat with no valid lane needs `ready` without `valid`
+
+**Where.**
+- RTL: `rtl/core/mxu.sv:223-225`. `w_gnt = w_want && w_req_ready` while `w_req_v` may be all zero: a beat whose lanes all lie
+  past K (trans: a group past the tile's K bytes) or past N (trans: 8 columns >= N), or whose k-rows are all >= K (non-trans).
+  The formal environment knows this (`mxu.sv:557-565`: "w_want still grants").
+- Spec: mxu.md §5 and microarch.md:744-756 call the ports "valid/ready" and "one grant takes all valid lanes". They do not say
+  that a request with no valid lane is granted, or that `ready` must not depend on `valid`.
+
+**Failing input.** DIM 8, FP8, `trans_w = 1`, K = 1, N = 5, M = 3 (`k1_fp8_trans`). Groups 1-3 of the only pass have no bytes,
+which makes 3 empty beats. With an SPM whose `ready` needs a valid lane (`+RDYV=1`), the MQ pops the instruction and nothing
+completes in 30,000 cycles.
+
+**Scale.** 71 of the 78 directed programs (DIM 8 and 16) hang. The 7 that complete are exactly those with no empty beat. An
+independent count of empty beats, from the beat order of mxu.md §4.3 and not from the RTL, predicts all 78
+(`scripts/mxu_review/probe_rdyv.py`, `logs/mxu_review_rdyv.log`). Empty beats are the norm: any K tail shorter than 3/4 of a tile,
+or any N that does not fill 8 columns of a beat. The A port (lane 0 always valid) and the scale port never make an empty request.
+
+**How I know.** Simulation under the stated model. Both testbenches (`tb_mxu.sv:152-154` and mine by default) raise `ready`
+regardless of `valid`, which is why the assumption never showed.
+
+**Proposed fix.**
+- (a) State in microarch.md §5 / the `mxu_spm_shim` contract that a request with no valid lane is granted (`ready` independent
+  of `valid`), and test the shim with such requests.
+- Or (b): the MXU generates empty beats locally. It must still write the zero window into the shadow buffer, because the buffer
+  holds the previous tile; skipping the beat would leave stale weights. This also saves the empty cycles.
+
+### R-3 (L, confirmed) N-3 does not say that the K tail is +0 operands or what sign an exact-zero dot has; both decide signed-zero results
+
+**Where.**
+- numerics.md N-3, "Order" (PE row i holds K elements 4i..4i+3) and the N-5 MXU row ("−0: `+0` from an all-zero tile").
+- mxu.md:90-91 (§3, "Unused operands": +0) is where the tail is defined.
+- RTL: `rtl/core/mxu_wpack.sv`, `mxu.sv:480` (zeroing). BF16 dot: `rtl/arith/bf16_dot2.sv`.
+
+**Input** (`bf16_signed_zero`, DIM 8 and 16). BF16, M = 2, N = 3. The values make the partial sum −0 after PE row `DIM-2`: a
+cancellation below 2^-126 flushes to −0. Every remaining real product is −0 (−0 x 1.0).
+
+| K | RTL `part` | why |
+|---|---|---|
+| `2·DIM` | `80000000` | the last PE row adds a −0 dot |
+| `2·DIM - 1` | `00000000` | the last PE row's tail slot is +0 x +0, so its dot is +0 and −0 + +0 = +0 |
+
+The RTL follows mxu.md §3 and IEEE: an exact-zero dot is −0 only when every product is −0. Because every all-padding PE row turns
+−0 into +0, a −0 partial sum can leave the array only when the K tile is full. So the sign of a zero result depends on where the
+tile boundary falls, i.e. on `DIM`. This adds to the rounding dependence that N-3 documents.
+
+**How I know.** My oracle with the alternatives "no padding" or "exact zero dot is always +0" fails exactly these rows (stream
+rows 2-3 and 12-13, and 0-1 and 4-11 respectively). With the mxu.md reading it passes.
+
+**Proposed fix.** One sentence in N-3: tail slots are +0 operands, an exact-zero dot follows IEEE (−0 only when all products
+are −0), and therefore a −0 partial sum survives only a full K tile. Amend the N-5 "−0" cell.
+
+### Observations (no finding)
+
+- Legal TD fields that `MXU_MM` does not use (s2, s3, aux0, row_bytes, sc_off, page_shift, rsv) had random contents in every run;
+  the MXU ignores them.
+- Pitch 0 and overlapping rows (legal: isa_ref sets no lower bound beyond 0 and 64 B alignment) give the logical result of the
+  addresses.
+- `R[m_reg] = 0` inside a chain gives one `sem_inc` and touches no ACC row in pipelined mode as well (I checked the count of
+  increments, not their order; `tb_mxu` checks the order).
+
+### Comparison with status.md (read after the above)
+
+- **R-1.** status.md:1102 ("ACC read-modify-write hazards are excluded by pass spacing (`ACC_LAT`), not by interlocks") and
+  acc.md:139-140 ("including across instructions") state the opposite. status.md:1128-1133 lists the formal limits (bounded, DIM 8
+  only) but not that the stub's M <= 2 rules out the across-instruction case. The `gap_cnt` mutant is killed only by the
+  `ACC_LAT = 24` run, i.e. within one instruction. **Not known to status.md.**
+- **R-2.** Not mentioned. status.md:1120 and mxu.md §6 report the bank model's gang splits (S-3) but not the empty request. Only
+  the formal comment in `mxu.sv:557` records the behaviour.
+- **R-3.** Not mentioned. The bit-exactness claims of status.md:1106-1109 hold in my runs, including NaN payloads and signed zeros,
+  so they are confirmed independently of `arith_ref` / `numerics.mxu_mm`.
