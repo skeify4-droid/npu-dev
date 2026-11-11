@@ -33,12 +33,12 @@ OP_MXU_MM = 0x60
 DT_BF16, DT_E4M3, SP_SPM = 1, 3, 1
 
 
-def build(dim, rtl_root=ROOT, tag=''):
+def build(dim, rtl_root=ROOT, tag='', defines=()):
     out = os.path.join(BUILD, 'tb_mxu_rev_%d%s.vvp' % (dim, ('_' + tag) if tag else ''))
     srcs = [os.path.join(HERE, 'tb_mxu_rev.sv'), os.path.join(ROOT, 'isa/gen/isa_pkg.sv')]
     for d in ('rtl/core', 'rtl/arith'):
         srcs += sorted(os.path.join(rtl_root, d, f) for f in os.listdir(os.path.join(rtl_root, d)) if f.endswith('.sv'))
-    cmd = ['iverilog', '-g2012', '-P', 'tb_mxu_rev.DIM=%d' % dim, '-P', 'tb_mxu_rev.ACC_ROWS=%d' % ACC_ROWS[dim],
+    cmd = ['iverilog', '-g2012'] + ['-D' + d for d in defines] + ['-P', 'tb_mxu_rev.DIM=%d' % dim, '-P', 'tb_mxu_rev.ACC_ROWS=%d' % ACC_ROWS[dim],
            '-P', 'tb_mxu_rev.SPM_BYTES=%d' % SPM_BYTES, '-o', out] + srcs
     r = subprocess.run(cmd, capture_output=True, text=True)
     err = '\n'.join(l for l in r.stderr.splitlines() if 'constant selects' not in l)
@@ -337,7 +337,7 @@ def compare(p, d, acc_exp, per_ins, mode):
     return errs
 
 
-def run_case(vvp, p, mode, stall, seed, rdyv=0, keep=False, maxcyc=200000, sub='cases', rmw=0):
+def run_case(vvp, p, mode, stall, seed, rdyv=0, keep=False, maxcyc=200000, sub='cases', rmw=0, xfill=0):
     d = os.path.join(BUILD, sub, str(p.dim), '%s_%s_s%d%s' % (p.name, mode, stall, '_rdyv' if rdyv else ''))
     if os.path.isdir(d):
         shutil.rmtree(d)
@@ -345,11 +345,13 @@ def run_case(vvp, p, mode, stall, seed, rdyv=0, keep=False, maxcyc=200000, sub='
     p.write(d)
     acc_exp, per_ins = predict(p)
     cmd = ['vvp', '-n', vvp, '+DIR=' + d, '+NI=%d' % len(p.ins), '+STALL=%d' % stall, '+SEED=%d' % seed,
-           '+RDYV=%d' % rdyv, '+MAXCYC=%d' % maxcyc, '+RMW=%d' % rmw]
+           '+RDYV=%d' % rdyv, '+MAXCYC=%d' % maxcyc, '+RMW=%d' % rmw, '+XFILL=%d' % xfill]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode or 'Unable to open' in r.stdout or 'Not enough words' in r.stdout:
         return ['vvp: ' + r.stdout[-400:] + r.stderr[-400:]], d
     errs = compare(p, d, acc_exp, per_ins, mode)
+    with open(os.path.join(d, 'rtl_log.txt')) as f:            # X monitor of the testbench (implementability review)
+        errs += [l.strip() for l in f if l.startswith('XPROP')][:10]
     if not errs and not keep:
         shutil.rmtree(d)
     return errs, d
@@ -543,6 +545,7 @@ def main():
     ap.add_argument('--stalls', type=int, nargs='+', default=[0, 30])
     ap.add_argument('--oracle-pad', default='zero', choices=['zero', 'absent'])
     ap.add_argument('--oracle-zero', default='ieee', choices=['ieee', 'plus'])
+    ap.add_argument('--xfill', action='store_true', help='ungranted lanes and idle DTAB data are X (implementability review)')
     args = ap.parse_args()
     O.PAD_MODE, O.ZERO_SIGN = args.oracle_pad, args.oracle_zero
     nfail = nrun = 0
@@ -554,7 +557,7 @@ def main():
             for mode in args.modes:
                 for stall in args.stalls:
                     nrun += 1
-                    errs, d = run_case(vvp, p, mode, stall, seed=nrun, keep=args.keep)
+                    errs, d = run_case(vvp, p, mode, stall, seed=nrun, keep=args.keep, xfill=int(args.xfill))
                     tag = 'DIM %2d %-22s %-6s stall %2d (%d ins)' % (dim, p.name, mode, stall, len(p.ins))
                     if errs:
                         nfail += 1

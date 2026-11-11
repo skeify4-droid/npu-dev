@@ -3,6 +3,8 @@
 // {wval[31:0], regs[6*64-1:0], instr[127:0]}), acc.hex (ACC_ROWS*DIM FP32 words, row-major). +NI=<instructions>.
 // +STALL=<percent of cycles a port / the DTAB refuses>, +SEED=<n>, +RMW=1: ACC writes visible ACC_LAT after the row (acc.md 5), +RDYV=1: a port's ready is low while it has no valid lane
 // (a valid/ready SPM that only grants requests), +MAXCYC=<n>.
+// +XFILL=1 (implementability review): a lane that is not granted, and the DTAB data outside the cycle after a grant, are all X; an X
+// monitor logs XPROP for an X on a control output, or on a payload in a cycle in which its valid says it is meaningful.
 // Outputs in the same directory: rtl_stream.txt (every acc_valid row, raw), rtl_log.txt (POP / SEM / FLAGS / ACCFL / HAZARD /
 // OOB / DONEDLY / FAULT / DONE / TIMEOUT events), rtl_acc.hex (ACC image after the acc_update lanes of the rows).
 `timescale 1ns/1ps
@@ -60,7 +62,7 @@ module tb_mxu_rev;
   reg [31:0]  accm [0:ACC_ROWS*DIM-1];
   reg [31:0]  sem  [0:63];
   integer     last_upd [0:ACC_ROWS-1];
-  integer NI, STALL, SEED, RDYV, MAXCYC, RMW;
+  integer NI, STALL, SEED, RDYV, MAXCYC, RMW, XFILL;
   reg [8*512-1:0] dir;
   integer flog, fstr;
 
@@ -83,6 +85,7 @@ module tb_mxu_rev;
   always @(posedge clk) begin
     dtab_rvalid <= rst_n && dtab_gnt;
     if (dtab_gnt) dtab_data <= dtab[dtab_idx];
+    else if (XFILL != 0) dtab_data <= 'x;
   end
 
   // ---------------------------------------------------------------- SPM: three ports, fixed latency, random stalls
@@ -99,7 +102,7 @@ module tb_mxu_rev;
   function automatic [LB*8-1:0] lane_rd(input [21:0] addr, input v, input string port);
     lane_rd = '0;
     for (int b = 0; b < LB; b++) begin
-      if (!v) lane_rd[8*b +: 8] = 8'($urandom);
+      if (!v) lane_rd[8*b +: 8] = (XFILL != 0) ? 8'bx : 8'($urandom);
       else if (int'(addr) + b >= SPM_BYTES) lane_rd[8*b +: 8] = 8'hFF;
       else lane_rd[8*b +: 8] = spm[int'(addr) + b];
     end
@@ -169,9 +172,9 @@ module tb_mxu_rev;
     accfl_or <= accfl_or | f;
     if (f != 0) $fdisplay(flog, "ACCFL %0d %0h", cyc, f);
     $fwrite(fstr, "R %0d %0d %0d %0d %0d %0d %0d %08h", cyc, acc_row, acc_ncols, acc_rescale, acc_overwrite, acc_use_cs,
-            acc_last, acc_rowscale);
-    for (int c = 0; c < DIM; c++) $fwrite(fstr, " %08h", acc_cs[32*c +: 32]);
-    for (int c = 0; c < DIM; c++) $fwrite(fstr, " %08h", acc_part[32*c +: 32]);
+            acc_last, (XFILL != 0 && !acc_rescale) ? 32'd0 : acc_rowscale);
+    for (int c = 0; c < DIM; c++) $fwrite(fstr, " %08h", (XFILL != 0 && (c >= int'(acc_ncols) || !acc_use_cs)) ? 32'd0 : acc_cs[32*c +: 32]);
+    for (int c = 0; c < DIM; c++) $fwrite(fstr, " %08h", (XFILL != 0 && c >= int'(acc_ncols)) ? 32'd0 : acc_part[32*c +: 32]);
     $fwrite(fstr, "\n");
   end
 
@@ -192,6 +195,40 @@ module tb_mxu_rev;
     end
   end
 
+
+  // ---------------------------------------------------------------- X monitor (+XFILL, but always on): control outputs are never X
+  // after reset; a payload is never X while its valid says it is used (lanes: per lane valid; ACC: columns < acc_ncols)
+  integer nx = 0;
+  // (^v) === 1'bx rather than $isunknown: in this block Icarus 13 took `if ($isunknown({...}))` with every bit 0 / 1 (review I-13)
+  task automatic xp(input string what);
+    if (nx < 200) $fdisplay(flog, "XPROP %0d %s", cyc, what);
+    nx = nx + 1;
+  endtask
+  always @(negedge clk) if (rst_n && cyc > 4) begin
+    if (((^({q_ready, dtab_req, a_req_v, w_req_v, s_req_v, acc_valid, sem_inc_valid, fault_valid, fp_flags})) === 1'bx))
+      xp($sformatf("control q_ready %b dtab_req %b a_req_v %b w_req_v %b s_req_v %b acc_valid %b sem_inc_valid %b fault_valid %b fp_flags %b",
+                   q_ready, dtab_req, a_req_v, w_req_v, s_req_v, acc_valid, sem_inc_valid, fault_valid, fp_flags));
+`ifndef GATE          // the gate-level run (gl_sim.py) has no internal names
+    if (((^({dut.lst, dut.sst, dut.u_dec.dst, dut.ctx_v, dut.tok_v, dut.inf_cnt, dut.cs_cnt, dut.rs_res, dut.rs_idx, dut.free_g, dut.gap_cnt})) === 1'bx))
+      xp($sformatf("state lst %b sst %b dst %b ctx_v %b tok_v %b inf_cnt %b cs_cnt %b rs_res %b rs_idx %b free_g %b gap_cnt %b",
+                   dut.lst, dut.sst, dut.u_dec.dst, dut.ctx_v, dut.tok_v, dut.inf_cnt, dut.cs_cnt, dut.rs_res, dut.rs_idx, dut.free_g, dut.gap_cnt));
+`endif
+    if (dtab_req && ((^(dtab_idx)) === 1'bx)) xp("dtab_idx");
+    for (int l = 0; l < 4; l++) if (a_req_v[l] && ((^(a_req_addr[22*l +: 22])) === 1'bx)) xp("a_req_addr");
+    for (int l = 0; l < 8; l++) if (w_req_v[l] && ((^(w_req_addr[22*l +: 22])) === 1'bx)) xp("w_req_addr");
+    if (s_req_v && ((^(s_req_addr)) === 1'bx)) xp("s_req_addr");
+    if (acc_valid) begin
+      if (((^({acc_row, acc_ncols, acc_rescale, acc_overwrite, acc_use_cs, acc_last})) === 1'bx)) xp("acc_ctl");
+      for (int c = 0; c < DIM; c++) if (c < int'(acc_ncols)) begin
+        if (((^(acc_part[32*c +: 32])) === 1'bx)) xp($sformatf("acc_part[%0d]", c));
+        if (acc_use_cs && ((^(acc_cs[32*c +: 32])) === 1'bx)) xp($sformatf("acc_cs[%0d]", c));
+      end
+      if (acc_rescale && ((^(acc_rowscale)) === 1'bx)) xp("acc_rowscale");
+    end
+    if (sem_inc_valid && ((^({sem_inc_idx, sem_inc_amt})) === 1'bx)) xp("sem_inc");
+    if (fault_valid && ((^({fault_cause, fault_addr})) === 1'bx)) xp("fault");
+  end
+
   // ---------------------------------------------------------------- run
   initial begin
     string s;
@@ -202,6 +239,7 @@ module tb_mxu_rev;
     if (!$value$plusargs("RDYV=%d", RDYV)) RDYV = 0;
     if (!$value$plusargs("MAXCYC=%d", MAXCYC)) MAXCYC = 200000;
     if (!$value$plusargs("RMW=%d", RMW)) RMW = 0;
+    if (!$value$plusargs("XFILL=%d", XFILL)) XFILL = 0;
     void'($urandom(SEED));
     s = string'(dir);
     $readmemh({s, "/spm.hex"}, spm);

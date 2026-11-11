@@ -1,7 +1,8 @@
 # Independent review of the MXU (commit 241c816)
 
-Part **S** (below) reviews the spec. Part **R** ([at the end](#part-r-bit-exact-semantics-against-an-independent-oracle-commit-2cc2d4b))
-reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle.
+Part **S** (below) reviews the spec. Part **R** ([further down](#part-r-bit-exact-semantics-against-an-independent-oracle-commit-2cc2d4b))
+reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle. Part **I**
+([at the end](#part-i-implementability-of-the-rtl-commit-db5464f)) reviews the RTL of commit db5464f for synthesis and structure.
 
 Scope of this part (**S**): `docs/spec/mxu.md` against the frozen architecture: microarch.md §2.2 and §5, numerics.md N-3 / N-5 /
 N-8, arith.md "Integration contract" items 1-5, isa.md §3-5 (and §8, which (a) needs), isa_ref.md `MXU_MM`, memmap.md §4. No RTL was
@@ -596,3 +597,370 @@ yet (see R-1).
   the formal comment in `mxu.sv:557` records the behaviour.
 - **R-3.** Not mentioned. The bit-exactness claims of status.md:1106-1109 hold in my runs, including NaN payloads and signed zeros,
   so they are confirmed independently of `arith_ref` / `numerics.mxu_mm`.
+
+---
+
+## Part I: implementability of the RTL (commit db5464f)
+
+Scope: `rtl/core/mxu.sv`, `mxu_dec.sv`, `mxu_array.sv`, `mxu_wpack.sv` for synthesis and structure, not function: latches,
+combinational loops, X after reset, reset coverage, async-reset use, the wide arithmetic, mixed drivers, unpacked arrays, and
+where Yosys / Verilator / Icarus disagree. Also: cell counts against the 0.9 M-cell flat budget (capacity.md). I wrote the findings
+before reading `docs/reports/status.md`; the comparison is at the end. No file of the author was changed. Labels and severities are
+as in part S. Severity here is about the implementation: **M** blocks or misleads a planned flow or costs a lot of area or timing;
+**L** is local and cheap to fix.
+
+### Summary
+
+| # | Sev | Topic | Status |
+|---|---|---|---|
+| I-1 | M | The array is over the flat budget from `DIM` 16 on, and its own logic (weights, skew, muxes) lives in one module: about 0.67 M cells at `DIM` 64 that hierarchy cannot split | confirmed (8, 16, 32); 64 extrapolated |
+| I-2 | M | With `mxu_pe` as a blackbox (separate or hard-macro PE), Yosys deletes every PE instance: unpacked `ps` / `fl` on the PE output ports | confirmed; fix proven equivalent |
+| I-3 | M | `mxu_dec`: two 64-bit dividers by a mux of two powers of two and 7 multipliers up to 65 x 33 and 61 x 64, in one cone: 42 k cells, depth 846 | confirmed (counts, depth); timing suspected; narrowed copy measured |
+| I-4 | M | `mxu.sv`: 25 multipliers, 20 of them in the W lane addresses; the address leaves the module unregistered | confirmed (counts, cone); timing suspected |
+| I-5 | M | Shadow load: the SPM response goes through the packer into all `DIM²` shadow registers in one cycle; not in the open items | suspected (no placement) |
+| I-6 | L | `make syn` cannot build an `rtl/core` block and always flattens | confirmed |
+| I-7 | L | 139 flops without reset inside async-reset processes: `rst_n` ends up in their D logic | confirmed |
+| I-8 | L | `swp0` / `swp1`: bit 0 driven by `assign`, the rest by `always_ff` | confirmed (tool behaviour); portability suspected |
+| I-9 | L | An `acc_done` with nothing in flight wraps `inf_cnt` to 7 and stops the MXU; the comment says it is ignored | confirmed |
+| I-10 | L | Unchecked parameters: `ACC_LAT` > 255 truncates the gap counter, `CS_DEPTH` = 1 gives a `[-1:0]` vector | confirmed (lint) |
+| I-11 | L | The 1.5 % area figures of M-2 / M-9 against an ASAP7 estimate | suspected (no P&R) |
+
+Clean (no finding):
+- no latch, no combinational loop, no `*_ready` to `*_req_v` path;
+- no X on any control output, FSM state or valid payload after reset, in RTL and in the Yosys netlist, with X on every lane that is
+  not granted;
+- the Yosys netlist of `mxu` matches the oracle bit for bit on the part R suite at `DIM` 8 and 16;
+- every control register is reset;
+- `make lint` passes, and `sv2v` output compiles as Verilog-2005.
+
+### Method
+
+All scripts are in `scripts/mxu_review/`, outputs in `build/mxu_review/`, logs in `logs/rev_*`. One job at a time under
+`scripts/memrun`; the largest was 1.9 GB.
+
+- `syn_core.sh <top> <tag> [-set P V ...]`: Yosys 0.70+post `synth`, hierarchical (no `-flatten`), generic cells, `stat` and
+  `check`. `mxu_bb` keeps `mxu_array` as a blackbox; `mxu_array_bbpe` keeps `mxu_pe` as one.
+- `arith_census.sh`: every `$mul` / `$div` / `$mod` with its operand widths after `wreduce` / `peepopt`, before `alumacc` folds
+  them into `$macc`.
+- `depth.sh`: `ltp -noff`, the longest combinational path in generic gates.
+- `asap7.sh`: flat `synth`, `dfflibmap`, then `abc -D 667` onto the ASAP7 RVT TT libraries of the pinned ORFS checkout, run
+  natively. It reports ASAP7 area and the ABC delay (`stime`). `KEEP_OUT=<port>` keeps only the cone of one output.
+  - These are estimates for comparing blocks, not sign-off: no wires, no placement, and Yosys' adder mapping is slow. As
+    calibration, a 23-gate NAND/NOR chain is 94 ps, but a 32-bit `a + b` is 561 ps.
+- `port_paths.py`: the flat netlist of `mxu` (array as blackbox) as JSON, walked bit by bit up to the flip-flops.
+- `tb_mxu_rev.sv +XFILL=1` / `run_review.py --xfill`: every lane that is not granted, and the DTAB data outside the cycle after a
+  grant, are X.
+  - A monitor logs X on a control output or on FSM state, and X on an address, `acc_*` field, partial sum, `cs` or rowscale while
+    its valid says it is used.
+  - `xfill_controls.py`: three one-change copies of the RTL that must make an X visible: `lst` without reset, the packer passing
+    an unrequested k-row lane, A bytes past K unmasked. All three are flagged.
+- `gl_sim.py`: Yosys synthesizes `mxu` flat to generic gates at the testbench's parameters, with `mxu_pe` as a blackbox; the PEs
+  stay RTL in the simulation. The part R suite then runs against the netlist through a wrapper with the RTL interface.
+  - The netlist is built from the packed array copy of I-2, which is proven equivalent: with the original, the PEs would vanish.
+- `fix_array_packed.sh`, `fix_dec_narrow.py` + `tb_dec_miter.sv` / `run_dec_miter.sh`: the two proposed fixes as copies in
+  `build/mxu_review/fix/`, with their checks.
+- `tb_spur_done.sv` (I-9), and Verilator `--lint-only` with parameters out of range (I-10).
+
+### Cell counts (Yosys generic cells, hierarchical, `stat`)
+
+`mxu_pe`: 6,580 cells flat (`make syn BLOCK=mxu_pe`, as in arith_review.md and status.md), about 6,750 when kept as a module.
+
+| Block | `DIM` 8 | 16 | 32 | 64 | flat budget 0.9 M |
+|---|---|---|---|---|---|
+| `mxu_array`, whole (PEs included) | 443,026 | **1,769,925** | **7,066,628** | **≈ 28.3 M** (extrap.) | over from 16 on |
+| `mxu_array`, own logic (PEs excluded) | 10,642 | 42,181 | 167,940 | ≈ 0.67 M (extrap.) | fits, 75 % of it at 64 (I-1) |
+| of which weight storage flops (3 x 32 per PE) | 6,144 | 24,576 | 98,304 | 393,216 | |
+| of which A skew flops (`32·DIM(DIM+1)/2`) | 1,152 | 4,352 | 16,896 | 66,560 | |
+| of which `$_MUX_` (weight write select, active copy) | 2,528 | 10,178 | 40,908 | ≈ 163 k | |
+| `mxu_wpack` | 2,899 | 5,993 | 12,636 | 26,052 | fits |
+| `mxu_dec` | 42,162 | | | 44,595 | fits (I-3) |
+| `mxu` own logic (FSMs, address generation, cs / rowscale FIFOs, tags) | 20,767 | | | 44,744 | fits |
+| `mxu` whole | **508,690** | ≈ 1.84 M | | ≈ 28.4 M | fits at 8 only |
+
+The `DIM` 64 array is extrapolated, not run: the run would need about 5.5 GB, and only 6.6 GB was free. The array's own logic
+grows by 3.96x and 3.98x per doubling, which is the structure: weights and skew are quadratic in `DIM`. A quadratic fit through
+8 / 16 / 32 gives 670 k, and the flop count is exact. The `DIM` 16 control (≈ 73 k) is the 115,622-cell PE-less netlist of
+`gl_sim.py` minus the array's own 42,181.
+
+Fractions of `mxu` at `DIM` 8 (cells):
+
+| Part | Cells | Share |
+|---|---|---|
+| PEs (64 x 6,750) | 432,000 | 84.9 % |
+| control: `mxu_dec` 8.3 %, `mxu` own 4.1 %, packer 0.6 % | 65,823 | 12.9 % |
+| weight storage: 6,144 flops plus about 2.5 k mux / decode | ≈ 8.7 k | 1.7 % |
+| A skew: 1,152 flops | 1,152 | 0.23 % |
+| sideband, swap chain, flag masks | ≈ 1 k | 0.2 % |
+
+At `DIM` 16 and above, the PEs are 97.6 % of the array's cells, weights 1.4 % plus 0.6 % for their muxes, and skew 0.25 %. Control
+falls to about 4 % of `mxu` at 16 and 0.4 % at 64. So status.md's 6.6 k per PE (64 x 6,580) covers 83 % of the `DIM` 8 MXU and
+95 % of the `DIM` 16 array (97.6 % with the 6,750 of a PE kept as a module).
+
+**In area the picture differs**, because flops are large. ASAP7 estimate from `asap7.sh`:
+- `mxu_pe`: 483 µm².
+- The array's own logic: 3,847 µm² at `DIM` 8 and 14,992 µm² at 16, about 70 % of it flops. That is **10.8-11.1 % of the
+  array's area**; of this, the weight flops are 5.3-6.5 % (`DFFHQNx1` or the `DFFHQx4` that `dfflibmap` picked) and the skew
+  about 1.2 %.
+- Control at `DIM` 8: `mxu_dec` 2,711 µm², `mxu` own logic 2,621 µm², packer 152 µm², together 13.6 % of an MXU of about
+  40,200 µm².
+
+### I-1 (M, confirmed at DIM 8 / 16 / 32; DIM 64 extrapolated) The array is over the flat budget from DIM 16 on, and its own logic cannot be split by hierarchy
+
+- `mxu_array` with its PEs is 443 k cells at `DIM` 8 (fits), 1.77 M at 16 (2x the budget), 7.07 M at 32, and about 28 M at 64. So
+  only `DIM` 8 can be synthesized flat. status.md:1030 already says the `FULL` array is synthesized hierarchically.
+- Hierarchy splits only at module boundaries, and the only module below `mxu_array` is `mxu_pe`. Everything else is local to
+  `mxu_array` (`mxu_array.sv:79-170`): the three 32-bit weight registers of every PE (`w_sh0`, `w_sh1`, `w_ac`), their write
+  decode and selects, the A skew, the sideband chain, the swap chain and the flag masks.
+- That local logic is one module of about 0.67 M cells at `DIM` 64: 393 k weight flops, 67 k skew flops, about 163 k muxes.
+  That is three quarters of the flat budget (about 3.6 GB at capacity.md's 5.4 KB per cell), and well beyond what one P&R block
+  takes (status.md: about 230 k cells for a 16 x 16 block).
+- Measured: 10.6 k / 42.2 k / 168 k cells at 8 / 16 / 32 (`syn_core.sh mxu_array`); `mxu_array` local, 1.45 GB at 32.
+
+**Proposed fix.** Move the weight registers into a per-PE wrapper, say `mxu_cell`: `w_sh0` / `w_sh1` / `w_ac`, the write select
+and `mxu_pe`. The array then keeps only the skew, the chains and the decode, and a P&R tile of a few rows or columns becomes
+possible (e.g. a `mxu_row` module). The per-PE window decode (`we`, `mxu_array.sv:144`) can stay outside as one enable per
+(group, column-octet) or (group, row pair). Only `ROWS·COLS/8` of these enables are distinct, so they are cheap.
+
+### I-2 (M, confirmed; fix proven equivalent) A blackbox PE makes Yosys delete every PE instance
+
+- `mxu_array.sv:129-130` declares the PE outputs as unpacked 2-D arrays, `logic [31:0] ps [ROWS][COLS]` and
+  `logic [3:0] fl [ROWS][COLS]`, and connects `.psum_out(ps[i][j])` and `.flags(fl[i][j])`.
+- When Yosys reads the whole RTL, its front end turns both into registers (mem2reg) and the netlist is right; every run above did
+  that.
+- When `mxu_pe` is a blackbox, it does not. This is the flow I-1 leads to: a PE synthesized on its own, or a hard macro, read with
+  `read_verilog -lib` or a stub. Then:
+  - `ps` and `fl` stay memories with 256 `$memrd` cells (8 x 8), and the PE output ports drive their data nets;
+  - `proc; opt_clean` removes **all 64 PE instances** without a warning;
+  - `synth` warns only afterwards, with 2,304 "multiple conflicting drivers";
+  - the result is an array with no PEs, `y` undriven.
+- Reproduction: `scripts/memrun rev_fix_array scripts/mxu_review/fix_array_packed.sh` prints "0 objects" left for the original
+  and 64 for the fix. My first ASAP7 run of the array with a blackbox PE gave 14 µm² for 8 x 8 for this reason.
+- The other unpacked arrays (`sm`, `sn`, `sx`, `a_row`, `masked`, `rq`, `byt`, the tag pipelines, `wl_lane_addr`, `inf_mem`) are
+  mem2reg'd (Yosys warns "Replacing memory ... with list of registers"). `cs_mem` / `rs_mem` become `$mem` and are mapped to flops.
+  Only `ps` / `fl` feed instance output ports. All module ports are packed, as CLAUDE.md asks.
+
+**Fix.** Declare the two as packed: `logic [ROWS-1:0][COLS-1:0][31:0] ps;` and the same for `fl`. No other line changes.
+`fix_array_packed.sh` checks the result:
+- the copy keeps its 64 PEs with a blackbox PE;
+- Yosys `equiv_make` / `equiv_simple -seq 2` / `equiv_induct` prove it equivalent to the original at 8 x 8 (27,395 `$equiv` cells)
+  and 16 x 16 (107,517), all proven. The PE stand-in for that proof is a small non-blackbox module with the same ports.
+
+### I-3 (M; counts and depth confirmed, timing suspected) mxu_dec: dividers and wide multipliers in one cone
+
+`arith_census.sh mxu_dec` after width reduction, `DIM` 8:
+
+| Line | Expression | Cell |
+|---|---|---|
+| `mxu_dec.sv:119` | `vKT = (vK + vKTE - 1) / vKTE`, `vKTE = bf16 ? 2·DIM : 4·DIM` | **`$div` 64 / 6 bits** |
+| `:121` | `vKTF = (vK + vKF - 1) / vKF`, `vKF = bf16 ? 128 : 256` | **`$div` 64 / 9 bits** (at `DIM` 64 the two are the same expression and merge) |
+| `:123` | `(vM - 1) · a_s1` | `$mul` 65 x 33 -> 96 |
+| `:123`, `:124` | `vK · eb`, `vN · eb` | `$mul` 16 x 2, twice |
+| `:124` | `(vN - 1) · w_s1`, `(vK - 1) · w_s1` | `$mul` 17 x 33 -> 50, twice (one per `trans_w`) |
+| `:125` | `(vKTF - 1) · vCSP` | `$mul` 96 x 13 -> 90 |
+| `:146` | `vNT · vM` (in `f_r_acc`) | `$mul` 61 x 64 -> 64 |
+
+All of them feed one combinational cone, evaluated in `D_CHECK`. The cone runs from the latched instruction, registers and TDs
+through `bad_any` / `bad_cause` / `bad_addr` and their priority chain to `dst` and `fault_*`. `vKT` also goes to `c_KT`.
+
+- **Size:** 42,162 cells, 8.3 % of the `DIM` 8 MXU and as much as 6.2 PEs; 2,711 µm² in ASAP7.
+- **Depth:** 846 generic gates on the longest path (`depth.sh`), against 217 for the whole PE.
+- **ABC delay with a 667 ps target:** 2.17 ns. Under the same mapping the PE dot stage is 3.09 ns and the add stage 2.04 ns.
+- So, measured this way, the decoder is not the first critical path of the MXU; the PE stages are. That is already an open Phase
+  6 item (status.md:1092). But the decoder is by far its deepest control logic.
+- Both divisors are a mux of two powers of two, and the operand widths are far larger than the checks need. The M-18 priority puts
+  the alignment checks and the ACC `RANGE` check before the operand extents. So an extent matters only with `s1 >= 0` and
+  `M <= ACC_ROWS`, and `NT·M` matters only with `M <= ACC_ROWS`.
+
+**Proposed fix**, measured (`fix_dec_narrow.py`, a copy in `build/mxu_review/fix/mxu_dec.sv`):
+- shifts instead of the two dividers (and of `vNT`'s);
+- `(M - 1)` on `clog2(ACC_ROWS + 1)` bits times `s1[30:0]`;
+- one 16 x 31 product for W, its operand muxed by `trans_w`;
+- `(KTF - 1)` on 10 bits times `CSP[18:0]`;
+- `r_acc + NT·M` on `clog2(ACC_ROWS + 1) + 16` bits under the two terms that already cover `r_acc` and `M`.
+
+Result:
+- 6 multipliers of at most 16 x 31; no divider;
+- **13,526 cells (-68 %)**, 1,339 µm² (-51 %), depth **114** (-87 %), ABC delay 1.71 ns (-21 %).
+
+Check (`scripts/memrun rev_dec_miter scripts/mxu_review/run_dec_miter.sh`, 152 s):
+- `tb_dec_miter.sv` drives the original and the copy with the same inputs and compares every output every cycle with `!==`.
+  Inputs are random instructions: 70 % fully legal, with register / TD values at 0, small, around the SPM and ACC bounds, huge, or
+  with negative strides. Each instruction also aims one extent (A, W, cs, rowscale, ACC) at its bound -1 / 0 / +1.
+- Result: 800,000 instructions (`DIM` 8 and 64, two seeds), 101,015 contexts, 15,541 `M = 0` completions, 486,934 `RANGE` faults:
+  no mismatch. Not a proof.
+- Controls: the miter catches `M` instead of `M - 1` in `a_ext`, a wrong BF16 `KT` shift, and dropping bit 18 of `CSP`. The last
+  needs `N` near 2^16, reachable at `DIM` 8 only through an `M = 0` instruction, which skips the ACC check but still checks the cs
+  extent.
+- Two other candidate controls, `KTF - 1` on 9 bits and `s1` without bit 30, turned out to be equivalent. That says the copy
+  could be narrower still.
+
+Independently of the widths: `D_CHECK` runs once per instruction, so the check can take two or three cycles (a second state, or a
+multicycle constraint on `dst` / `fault_*` / `c_*`) at the cost of one or two cycles per instruction.
+
+### I-4 (M; counts and cone confirmed, timing suspected) mxu.sv: 25 multipliers, most of them on an unregistered output
+
+`arith_census.sh mxu` (widths at `DIM` 8 / 64):
+
+| Line | Expression | Cells |
+|---|---|---|
+| `mxu.sv:205` | trans lane address `(l_idx·8 + l) · c_w_pitch` | 8 x `$mul` 5 x 22 / 7 x 22 |
+| `:211` | FP8 non-trans `kbeat · c_w_pitch` | 8 x `$mul` 24 x 22 / 27 x 22 |
+| `:217` | BF16 non-trans `kbeat · c_w_pitch` | 4 x `$mul` 24 x 22 / 27 x 22 (lane pairs share `kbeat`) |
+| `:179` | `ctx_Kbytes = c_K · eb` | 16 x 2 |
+| `:183` | `ke0 = l_t · KTE` (mux of two constants) | 16 x 6 / 16 x 9 |
+| `:354` | `t_w_base`: `l_j · DIM · c_w_pitch` | 16 x 22 |
+| `:356` | `t_cs_addr`: `c_csp · (l_t >> CS_SHIFT)` | 22 x 13 / 22 x 16 |
+| `:444` | `s_accrow`: `tk_j · tk_M` | 16 x 16 -> 11 (registered) |
+
+All but `:444` sit between the loop counters and the ports, with no register: `w_req_addr`, `s_req_addr`, and through
+`t_kb` / `nb_calc` also `w_req_v`.
+- `port_paths.py` confirms `w_req_addr` depends on registers only, but combinationally, through two multipliers in series (`ke0`,
+  then `kbeat · pitch`).
+- ASAP7 cone of `w_req_addr` alone (`KEEP_OUT=w_req_addr asap7.sh mxu_local`): **1.01 ns** at `DIM` 8 and 0.97 ns at 64. For
+  comparison, the cone of `a_req_addr`, a plain 22-bit add, is 0.62 / 0.60 ns.
+- The SPM then has to hash the bank (memmap.md §4), split gangs and arbitrate in the same cycle.
+- This is the control path most likely to show up in top-level timing, because it crosses a block boundary.
+
+**Proposed fix.**
+- Strength-reduce the lane addresses. Lane `l` = lane 0 + `l·pitch`, with `l·pitch` (or `l·LB`) a set of shifted adds, or
+  precomputed once per instruction.
+- Advance lane 0 by a per-beat increment, as `s_addr` already does for A (`mxu.sv:450`).
+- Register `w_req_*` / `s_req_*` one cycle earlier, which costs latency and not throughput, since the tile period is set by the
+  skew (M-21).
+
+### I-5 (M, suspected) The shadow-load path reaches the whole array in one cycle
+
+- `w_rsp_data` arrives from the SPM `SPM_LAT` after the grant. In the same cycle it goes through `mxu_wpack`, which is
+  combinational (ABC 270 ps), and becomes `wl_data`. That cycle, `wl_data` is written into the shadow registers of every PE of the
+  group, selected per PE by `wl_trans`, and enabled by `wl_en` / `wl_buf` / `wl_grp` / `wl_idx` (`mxu_array.sv:141-148`).
+- Fan-out at `DIM` 64:
+  - `wl_trans` selects 4096 x 32 = 131 k muxes;
+  - `wl_en` / `wl_buf` gate 262 k shadow flops;
+  - each window word goes to 32 PEs in each mode.
+- The span: an ASAP7 PE is 483 µm², plus about 59 µm² of its share of array logic (I-1). That is a 23 µm pitch, so about 1.5 mm
+  across 64 PEs before utilization.
+- mxu.md §9 and status.md list the fan-out of A and of swap / mode along a row (M-1), not this path.
+- **Proposed fix:** register `win` and the W tag in the MXU (one more cycle on the load, which the period hides; M-21 says the skew
+  sets the period). Or keep the packer next to the SPM port and register its output before the broadcast.
+
+### I-6 (L, confirmed) make syn cannot build a core block and always flattens
+
+- `Makefile:162-164` reads `rtl/common/$(BLOCK).sv`, or all of `rtl/arith` for an arith block, and runs `synth -flatten`.
+- `make syn BLOCK=mxu_wpack PARAMS="DIM=8"` fails (`rc=2`, the file does not exist), so the task's "`make syn BLOCK=mxu_wpack`"
+  cannot be run as written. The numbers above come from `syn_core.sh`, which reads what `make lint` gives Verilator for a core top.
+- CLAUDE.md asks for hierarchical synthesis, but the target cannot do it.
+- Two Yosys pitfalls I hit while writing `syn_core.sh`:
+  - `hierarchy -chparam ROWS 8 ...` on `mxu_array` trips an internal assertion of Yosys 0.70+post
+    (`kernel/rtlil_bufnorm.cc:679`), even at the default values;
+  - `chparam -set` before `hierarchy` renames the top to `$paramod...`, so `hierarchy -top <name>` no longer finds it:
+    `-auto-top` with only the needed files works.
+- **Proposed fix:** a core branch in the `syn` rule (`$(ISA_PKG) $(CORE_SV) $(ARITH_SV)`), and a `HIER=1` that drops `-flatten`.
+
+### I-7 (L, confirmed) Flops without reset inside async-reset processes
+
+- The stream FSM's `always_ff @(posedge clk or negedge rst_n)` (`mxu.sv:426-463`) assigns, in its non-reset branch, registers that
+  its reset branch does not:
+  - `s_t`, `s_Mrows`, `s_kb`, `s_ncols`, `s_last`, `s_bf16`, `s_cs_en`, `s_buf`, `s_accm`, `s_a_pitch`, `s_rs_base` (99 bits);
+  - likewise `inf_mem` in the FIFO process (`mxu.sv:117-125`, 40 bits).
+- Yosys builds them as plain `$dff` ("created $dff cell" in `proc`) that hold while `rst_n` is low. So `rst_n` becomes a data
+  input of 139 flops' enable logic: a reset-to-D path, extra reset-tree load, and a lint / DFT rule violation in most flows.
+- Functionally harmless: each is qualified by `sst` / `inf_cnt`, and the X-fill runs are clean.
+- **Proposed fix:** move them to a separate `always_ff @(posedge clk)`, as `mxu_dec` and the token registers already do.
+
+### I-8 (L; tool behaviour confirmed, portability suspected) swp0 / swp1 have a continuous and a procedural driver
+
+- `mxu_array.sv:102-108`: `swp0[0]` / `swp1[0]` are driven by `assign`, and bits `[ROWS-1:1]` by an `always_ff`.
+- Yosys warns "reg '\swp0' is assigned in a continuous assignment" but builds the right logic (24 async-reset flops at 8 x 8).
+- `sv2v` turns it into two processes on one `reg` (`always @(*) swp0[0] = ...` next to the clocked one). That compiles with
+  `iverilog -g2005`.
+- IEEE 1800 allows procedural and continuous drivers only on disjoint longest static prefixes, and some commercial tools are
+  stricter for packed vectors (not tried).
+- **Proposed fix:** `logic [ROWS-1:1] swp0_q;` plus `wire [ROWS-1:0] swp0 = {swp0_q, swap && !swap_buf};` is free.
+
+### I-9 (L, confirmed) An acc_done with nothing in flight hangs the MXU
+
+- `inf_pop = acc_done` (`mxu.sv:116`), and `inf_cnt <= inf_cnt + push - pop` has no guard.
+- The comment at `mxu.sv:128-129` says "an acc_done with an empty FIFO is ignored", but only `sem_inc_valid` ignores it.
+- `tb_spur_done.sv`: one `acc_done` pulse after reset makes `inf_cnt` 7. `inf_room` (`inf_cnt < 4`) is then false, and `q_ready`
+  stays 0 for good.
+- acc.md promises `acc_done` only after an `acc_last` row, so this needs a contract violation, hence L.
+- **Proposed fix:** `inf_pop = acc_done && inf_cnt != 0`, or an assertion, and a corrected comment.
+
+### I-10 (L, confirmed) Parameters without guards
+
+- `mxu` checks none of its parameters. `DIM` is caught only by `mxu_array`'s `$error`, which Yosys and Icarus both honour.
+  `SPM_LAT = 0` is a hard elaboration error.
+- `CS_DEPTH = 1` gives `logic [-1:0] cs_wr` (Verilator `ASCRANGE` warning only).
+- `ACC_LAT > 255` lints clean, but `gap_cnt` is 8 bits (`mxu.sv:386`, `454-456`), so `8'(ACC_LAT)` and `8'(GAP_X)` truncate and
+  the ACC spacing rule silently breaks.
+- mxu.md §5 says the parameter "defaults to `acc_pkg::ACC_LAT` and fails elaboration below it". There is no `acc_pkg` and no such
+  check; the default is a literal 8.
+- **Proposed fix:** a `g_bad` block as in `mxu_array` (`DIM` in {8, 16, 32, 64}, `SPM_LAT >= 1`, `CS_DEPTH >= 2`,
+  `ACC_LAT <= 255` or a wider `gap_cnt`).
+
+### I-11 (L, suspected) The 1.5 % area figures
+
+- M-2 calls the 64 k skew flops "1.5 % of the PE array's arithmetic", and M-9 calls the 131 k flops of the second shadow buffer
+  "about 1.5 %".
+- With the ASAP7 estimate above (PE 483 µm², flop 0.29-0.36 µm²):
+  - skew: about 1.0-1.2 %, consistent;
+  - one 32-bit buffer per PE: 1.9-2.4 % of the PEs;
+  - all three weight registers plus their muxes and the skew: about 11 % of the array.
+- The cost of a third buffer (mxu.md §9, +131 k flops) is therefore nearer 2-2.5 % of the array than 1.5 %, before wiring.
+
+### Observations
+
+- **No latches, no loops.** `check` reports 0 problems on `mxu` at `DIM` 8 (whole) and 64 (array blackboxed), with no
+  `$dlatch`. Every `always_comb` assigns its outputs first. `port_paths.py` finds no combinational loop.
+- **Combinational port-to-port paths.** The only input-to-output paths are:
+  - `q_instr`, `q_valid`, `q_wval`, `sem_rd_val` -> `q_ready`;
+  - `q_instr` -> `sem_rd_idx`;
+  - `acc_done` -> `sem_inc_valid`.
+
+  All three are as the spec states (mxu.md §5). No `*_req_v` depends on a `*_ready`, so a ready-from-valid SPM arbiter closes no
+  loop. Every other output comes from registers.
+- **Reset coverage.** Every control register is reset asynchronously:
+  - in `mxu`: `lst`, `sst`, `ctx_v`, `tok_v`, all counters and pointers, `free_g`, `l_buf`, the three tag pipelines (all fields),
+    `gap_cnt`, `rs_idx`;
+  - in `mxu_dec`: `dst` and `fault_*`;
+  - in `mxu_array`: `sv`, the swap chain and the PE flag flops.
+
+  The registers without reset are data or per-pass configuration, qualified by a reset valid or state: `ins`, `r_*`, `td_*`,
+  `c_*`, `tk_*`, `s_*` (I-7), `inf_mem`, `cs_mem`, `rs_mem`, `sm` / `sn` / `sx`, the skew, the weights, and the PE datapath.
+  There is no reset synchronizer inside; the core must release `rst_n` synchronously.
+- **X after reset.** No X anywhere it matters. With X on every lane that is not granted, X DTAB data outside the grant cycle, and
+  the unreset registers starting at X, there is no X on any control output, FSM state, granted address or used `acc_*` payload,
+  and every result is still bit-exact:
+  - RTL in Icarus (4-state): 392 runs at `DIM` 8 and 16 (`run_review.py --dim 8 16 --fuzz 10 --xfill`, 418 s);
+  - the Yosys gate-level netlist (X-pessimistic gates): 196 runs at `DIM` 8 (79 k cells, 392 s) and 196 at `DIM` 16 (116 k cells,
+    931 s).
+
+  The X-propagation relies on `&&` / `?:` with a 0 select. Gate level shows this holds for the AND / MUX trees Yosys builds.
+- **Yosys against Icarus.** `gl_sim.py` netlists, at the testbench's parameters, reproduce the oracle bit for bit on all 392 runs.
+  That covers Yosys' reading of `mxu.sv`, `mxu_dec.sv`, `mxu_wpack.sv` and the array control: the procs, FSM recoding, memories,
+  async resets and the mixed drivers of I-8. The packed `ps` / `fl` of I-2 are the only change, proven equivalent.
+- **Verilator and sv2v.** `make lint` (Verilator 5.052 `-Wall`, all core tops and the `DIM` 16 / 64 variants) passes. `sv2v`
+  output of all four files compiles with `iverilog -g2005` for each top. Icarus prints "constant selects in always_* processes are
+  not fully supported" for `mxu_dec` / `fp_round`. It only widens the sensitivity list, so simulation is still correct.
+- **Tool note (my testbench, not the RTL).** In the X monitor of `tb_mxu_rev.sv`, Icarus 13 took
+  `if ($isunknown({...}))` with every bit 0 or 1. I did not reduce it to a small case. The monitor uses `(^v) === 1'bx` instead,
+  and the three controls show that it fires.
+- **Async reset use.** Assertion is asynchronous, active low, with no synchronous resets in the core files. The 256 / 512
+  `$_SDFF_PN0_` in the array are Yosys' mapping of `a_valid ? a_words : 0` into the first skew stage, not a reset.
+
+### Comparison with status.md (read after the above)
+
+- **I-1.** status.md:1030 ("At 6.6k cells a 64 x 64 array is about 27 M generic cells per core, so `FULL` stays a simulator-only
+  configuration and the array is synthesized hierarchically") agrees on the PE share. It does not mention that weights, skew and
+  muxes, about 0.67 M cells at 64, sit in `mxu_array` itself, so the hierarchy has nothing to split them along. **Not known.**
+- **I-2.** Not mentioned. The hierarchical flow status.md plans is exactly the one where it bites. **Not known.**
+- **I-3, I-4.** Not mentioned; status.md:1092 lists "stage cuts of `mxu_pe` against the clock" for Phase 6. mxu_dec.sv:5 says it is a
+  separate module "so that the control of `mxu` can be proved without these 64-bit address computations". The cost was seen, for
+  formal only. **Not known as a synthesis issue.**
+- **I-5.** status.md:1123 and mxu.md M-1 / §9 list the fan-out of A (and swap / mode) as a Phase 6 question, not the shadow-load
+  broadcast. **Partly known.**
+- **I-6.** status.md:648 / :963 describe `make syn` with `PARAMS` and say its numbers are generic cells; it does not say the target
+  cannot build `rtl/core`. **Not known.**
+- **I-7 - I-10.** Not mentioned. status.md:1108 reports "Lint clean at DIM 8, 16, 32, 64", which I confirm.
+- **I-11.** status.md:1124 repeats "+131 k flops" for the third buffer without an area share; the 1.5 % is in mxu.md M-2 / M-9 only.
+- The PE number checks out: `make syn BLOCK=mxu_pe` gives 6,580 cells now, as in status.md:1029 and arith_review.md.
