@@ -99,13 +99,15 @@ module mxu_array #(
   assign y_meta  = sx[ARR_LAT-1];
 
   // ---------------- swap chain: swp[i] is high in cycle T + i
+  // I-8 (review part I): bit 0 is a wire, bits ROWS-1..1 are flops; each vector has one kind of driver
+  logic [ROWS-1:1] swp0_q, swp1_q;
   logic [ROWS-1:0] swp0, swp1;      // swap from buffer 0 / 1
   always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin swp0[ROWS-1:1] <= '0; swp1[ROWS-1:1] <= '0; end
-    else begin swp0[ROWS-1:1] <= swp0[ROWS-2:0]; swp1[ROWS-1:1] <= swp1[ROWS-2:0]; end
+    if (!rst_n) begin swp0_q <= '0; swp1_q <= '0; end
+    else begin swp0_q <= swp0[ROWS-2:0]; swp1_q <= swp1[ROWS-2:0]; end
   end
-  assign swp0[0] = swap && !swap_buf;
-  assign swp1[0] = swap && swap_buf;
+  assign swp0 = {swp0_q, swap && !swap_buf};
+  assign swp1 = {swp1_q, swap && swap_buf};
   for (genvar g = 0; g < NG; g++) begin : g_tap
     assign swap_tap[g]      = swp0[g*GRP + GRP - 1];
     assign swap_tap[NG + g] = swp1[g*GRP + GRP - 1];
@@ -126,8 +128,10 @@ module mxu_array #(
   end
 
   // ---------------- PE grid
-  logic [31:0] ps [ROWS][COLS];
-  logic [3:0]  fl [ROWS][COLS];
+  // I-2 (review part I): packed, not unpacked. The PE output ports drive these; with an unpacked 2-D array and a blackbox
+  // mxu_pe Yosys keeps them as memories and `opt_clean` deletes every PE instance (a separately synthesized or hard-macro PE).
+  logic [ROWS-1:0][COLS-1:0][31:0] ps;
+  logic [ROWS-1:0][COLS-1:0][3:0]  fl;
   logic [3:0]  rq [ROWS];          // flags of PE row i, qualified
 
   for (genvar i = 0; i < ROWS; i++) begin : g_row

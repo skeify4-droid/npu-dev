@@ -15,6 +15,14 @@ Every mutant is a copy of rtl/core with exactly one textual change (`old` must o
   formal_x  control mutants that need M >= 3 (ACC spacing across instructions, M-22): sby task bmc_d must fail, and tb_mxu must kill them
   formal_dec  mutants of the decoder's M = 0 path and checks: tb/formal/mxu_dec.sby task bmc (depth 40, the real mxu_dec) must fail
   equiv_dec  an equivalent change of the decoder: the same proof must still pass
+Review part I (2026-11-12), run by `misc` mode (not by `tb` / `formal`):
+  guard  an elaboration guard (I-10) removed or loosened: scripts/mxu_mutants/guard_check.py on the mutated copy must fail
+  equiv_guard  a guard that another check duplicates: guard_check.py must still pass
+  miter  a narrowed width of the decoder (I-3): tb_dec_miter (mutated mxu_dec against the decoder of the reviewed commit, DIM 8 and 64)
+         must report a mismatch
+  equiv_miter  a change of the narrowed decoder that is equivalent: the miter must still pass
+  (the I-9 and I-7 mutants are ordinary `kill` mutants of `tb` mode: tb_mxu has a spurious acc_done after reset)
+  scripts/memrun mxu_mutants_misc python3 scripts/mxu_mutants/mxu_mutants.py misc [NAME ...]
 Exit status 0 when every mutant behaved as its expectation says.
 """
 import os
@@ -28,6 +36,9 @@ BUILD = os.path.join(ROOT, "build", "mxu_mutants")
 SBY = os.environ.get("SBY", "sby")
 
 M = []  # (name, file, old, new, expectation, note)
+
+
+MISC = ("guard", "equiv_guard", "miter", "equiv_miter")
 
 
 def mut(name, file, old, new, exp="kill", note=""):
@@ -62,28 +73,29 @@ mut("addr_space_zero", D, "begin bad_cause = FAULT_CAUSE_TD_SPACE; bad_addr = r_
 mut("addr_align_zero", D, "    else if (f_al_cs)  bad_addr = r_cs;", "    else if (f_al_cs)  bad_addr = 64'd0;")
 mut("addr_acc_bit63", D, "bad_addr = r_acc | 64'h8000_0000_0000_0000;", "bad_addr = r_acc;")
 mut("addr_32bit", D, "            fault_addr  <= bad_addr;", "            fault_addr  <= {32'd0, bad_addr[31:0]};", note="the first RTL's 32-bit FAULT_ADDR")
-mut("m_zero_faults", D, "(vK == 64'd0) || (vK != vKw)", "(vK == 64'd0) || m_zero || (vK != vKw)", note="M = 0 illegal again (S-7)")
+mut("m_zero_faults", D, "(vK == 16'd0) || (vK != vKw)", "(vK == 16'd0) || m_zero || (vK != vKw)", note="M = 0 illegal again (S-7)")
 mut("m_trunc16", D, "vM   = m_en ? r_m : 64'(a_n1);", "vM   = m_en ? {48'd0, r_m[15:0]} : 64'(a_n1);", note="R[m_reg] truncated to a TD n1")
 mut("m_from_td", D, "vM   = m_en ? r_m : 64'(a_n1);", "vM   = 64'(a_n1);", note="R[m_reg] ignored")
-mut("range_acc_wrap", D, "(r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || ", "(vM > 64'(ACC_ROWS)) || ")
-mut("range_acc_m", D, "(r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || (r_acc + vNT * vM > 64'(ACC_ROWS))",
-    "(r_acc > 64'(ACC_ROWS)) || (r_acc + vNT * vM > 64'(ACC_ROWS))", note="vM beyond 2^64 / NT wraps the product")
-mut("range_acc_nt", D, "(r_acc + vNT * vM > 64'(ACC_ROWS))", "(r_acc + vM > 64'(ACC_ROWS))", note="N tiles not counted")
+mut("range_acc_wrap", D, "(r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || ", "(vM > 64'(ACC_ROWS)) || ", exp="miter",
+    note="since M-24 a miter mutant: the narrowed sum uses the low RW bits of R[acc_reg], so only a value with high bits set and small low bits (2^12, 2^64 - 2^12 ..) is missed; tb_mxu's wrap case has large low bits and does not see it (open item: add an aliasing case)")
+mut("range_acc_m", D, "(r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || (acc_sum > (NTW+RW+1)'(ACC_ROWS))",
+    "(r_acc > 64'(ACC_ROWS)) || (acc_sum > (NTW+RW+1)'(ACC_ROWS))", note="M > ACC_ROWS not compared in full: the narrowed product sees only the low RW bits of M")
+mut("range_acc_nt", D, "(NTW+RW+1)'(vNT * vM[RW-1:0]);", "(NTW+RW+1)'(vM[RW-1:0]);", note="N tiles not counted")
 mut("range_a_zero", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = 1'b0;")
-mut("range_a_m0", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = (a_ext > 96'(SPM_BYTES));",
-    note="A extent of an M = 0 instruction (wraps to 2^64 rows)")
+mut("range_a_m0", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = (a_ext > 96'(SPM_BYTES));", exp="miter",
+    note="A extent of an M = 0 instruction (M - 1 wraps; 2^64 rows before M-24, 2047 rows now): since M-24 a miter mutant (and formal_dec's z_range_a), tb_mxu's M = 0 case has a pitch too small for 2047 rows to leave the SPM (open item)")
 mut("range_w", D, "f_r_w   = (w_ext > 96'(SPM_BYTES));", "f_r_w   = 1'b0;")
-mut("range_cs_old_extent", D, "cs_ext = 96'(r_cs) + 96'(vKTF - 64'd1) * 96'(vCSP) + 96'(64'd4 * vN);",
+mut("range_cs_old_extent", D, "cs_ext = 96'(r_cs) + 96'(cs_prod) + 96'(vN) * 96'd4;",
     "cs_ext = 96'(r_cs) + 96'(64'd4) * 96'(vKT) * 96'(vN);", note="the pre-S-10 extent 4 KT N with KT = MXU passes (false RANGE, S-10 case)")
-mut("range_cs_rows", D, "cs_ext = 96'(r_cs) + 96'(vKTF - 64'd1) * 96'(vCSP) + 96'(64'd4 * vN);",
-    "cs_ext = 96'(r_cs) + 96'(64'd4 * vN);", note="only the first scale row")
-mut("range_cs_bytes_read", D, "cs_ext = 96'(r_cs) + 96'(vKTF - 64'd1) * 96'(vCSP) + 96'(64'd4 * vN);",
+mut("range_cs_rows", D, "cs_ext = 96'(r_cs) + 96'(cs_prod) + 96'(vN) * 96'd4;",
+    "cs_ext = 96'(r_cs) + 96'(vN) * 96'd4;", note="only the first scale row")
+mut("range_cs_bytes_read", D, "cs_ext = 96'(r_cs) + 96'(cs_prod) + 96'(vN) * 96'd4;",
     "cs_ext = 96'(r_cs) + 96'(vKTF) * 96'(vCSP);", exp="equiv",
     note="whole padded rows instead of the exact bytes: with a 64 B aligned base and an SPM that is a multiple of 64 B both end in the same 64 B granule, so the verdict is the same")
 mut("range_rs", D, "f_r_rs  = rs_en && !m_zero && (rs_ext > 96'(SPM_BYTES));", "f_r_rs  = 1'b0;")
-mut("csp_4n", D, "vCSP = ((64'd4 * vN + 64'd63) / 64'd64) * 64'd64;", "vCSP = 64'd4 * vN;", note="scale row pitch 4 N (S-1)")
-mut("csp_32", D, "vCSP = ((64'd4 * vN + 64'd63) / 64'd64) * 64'd64;", "vCSP = ((64'd4 * vN + 64'd31) / 64'd32) * 64'd32;")
-mut("fold_tiles", D, "vKF  = bf16 ? 64'd128 : 64'd256;", "vKF  = bf16 ? 64'd64 : 64'd128;", note="wrong fold tile in the cs extent")
+mut("csp_4n", D, "vCSP = {csp_q, 6'd0};", "vCSP = 19'(vN) * 19'd4;", note="scale row pitch 4 N (S-1)")
+mut("csp_32", D, "vCSP = {csp_q, 6'd0};", "vCSP = (19'(vN) * 19'd4 + 19'd31) & ~19'd31;")
+mut("fold_tiles", D, "vKTF = 10'((17'(vK) + (bf16 ? 17'd127 : 17'd255)) >> (bf16 ? 7 : 8));", "vKTF = 10'((17'(vK) + (bf16 ? 17'd63 : 17'd127)) >> (bf16 ? 6 : 7));", note="wrong fold tile in the cs extent")
 
 # ----------------------------------------------------------------------------------------------- M = 0 and completion
 mut("zero_no_inc", D, "assign z_inc    = (dst == D_PUSH) && m_zero && inf_empty;", "assign z_inc    = 1'b0;", note="M = 0 never completes")
@@ -156,6 +168,53 @@ mut("z_unchecked", D, "if (bad_any) begin\n            fault_valid", "if (bad_an
     note="an M = 0 instruction skips the legality checks")
 mut("z_range_a", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = (a_ext > 96'(SPM_BYTES));", exp="formal_dec",
     note="A with no bytes (M = 0) can fault RANGE")
+
+# ------------------------------------------------------------------------------------------- review part I (2026-11-12)
+# I-9: an acc_done with nothing in flight. tb_mxu pulses one right after reset; the proofs assume it never happens (f_pend), so only the tb sees it
+mut("spur_pop", X, "assign inf_pop = acc_done && (inf_cnt != 3'd0);", "assign inf_pop = acc_done;", exp="kill",
+    note="I-9: the unguarded pop wraps inf_cnt to 7 and the MXU never takes another instruction")
+# I-7: the registers moved out of the async-reset processes must still load only at their enable
+mut("s_cfg_always", X, "    if (tok_take) begin\n      s_t <= tk_t;", "    if (1'b1) begin\n      s_t <= tk_t;", exp="kill",
+    note="I-7: the per-pass configuration follows the token register every cycle instead of loading at the take")
+mut("inf_mem_always", X, "    if (inf_push) inf_mem[inf_wr] <= inf_in;", "    inf_mem[inf_wr] <= inf_in;", exp="kill",
+    note="I-7: the in-flight FIFO entry is overwritten every cycle")
+# I-10: the guards (guard_check.py)
+mut("guard_dim_off", X, "if (DIM != 8 && DIM != 16 && DIM != 32 && DIM != 64) begin : g_bad_dim", "if (1'b0) begin : g_bad_dim", exp="equiv_guard",
+    note="duplicated: mxu_array's own geometry check stops every DIM the guard stops, so the three tools still fail (the guard only moves the error to the top)")
+mut("guard_spm_lat_off", X, "if (SPM_LAT < 1) begin : g_bad_spm_lat", "if (1'b0) begin : g_bad_spm_lat", exp="equiv_guard",
+    note="duplicated: SPM_LAT = 0 gives zero-size tag arrays, a hard elaboration error of every tool")
+mut("guard_cs_depth_off", X, "if (CS_DEPTH < 2) begin : g_bad_cs_depth", "if (CS_DEPTH < 1) begin : g_bad_cs_depth", exp="guard",
+    note="CS_DEPTH = 1 (a [-1:0] vector) must stop")
+mut("guard_acc_lat_max", X, "if (ACC_LAT < 1 || ACC_LAT > 255) begin : g_bad_acc_lat", "if (ACC_LAT < 1 || ACC_LAT > 256) begin : g_bad_acc_lat", exp="guard",
+    note="ACC_LAT = 256 truncates the 8-bit gap counter")
+mut("guard_acc_lat_min", X, "if (ACC_LAT < 1 || ACC_LAT > 255) begin : g_bad_acc_lat", "if (ACC_LAT < 0 || ACC_LAT > 255) begin : g_bad_acc_lat", exp="guard")
+mut("guard_acc_lat_max_off", X, "if (ACC_LAT < 1 || ACC_LAT > 255) begin : g_bad_acc_lat", "if (ACC_LAT < 1) begin : g_bad_acc_lat", exp="guard")
+mut("guard_acc_rows_max", D, "if (ACC_ROWS < 2 || ACC_ROWS > 2048) begin : g_bad_acc_rows", "if (ACC_ROWS < 2 || ACC_ROWS > 4096) begin : g_bad_acc_rows", exp="guard",
+    note="c_acc_base is 11 bits")
+mut("guard_acc_rows_min", D, "if (ACC_ROWS < 2 || ACC_ROWS > 2048) begin : g_bad_acc_rows", "if (ACC_ROWS < 1 || ACC_ROWS > 2048) begin : g_bad_acc_rows", exp="equiv_guard",
+    note="duplicated: ACC_ROWS = 1 gives MW = 0, a zero-width [MW-1:0] that every tool rejects anyway (ACC_ROWS = 0 is still stopped by the mutant)")
+# I-3: the narrowed widths of mxu_dec, against the decoder of the reviewed commit (tb_dec_miter)
+mut("dec_a_m1_narrow", D, "a_m1   = MW'(vM - 64'd1);", "a_m1   = (MW-1)'(vM - 64'd1);", exp="miter", note="M - 1 on one bit too few: M = 1025 .. 2048 passes the A extent")
+mut("dec_a_s1_bit30", D, "a_prod = a_m1 * a_s1[30:0];", "a_prod = a_m1 * a_s1[29:0];", exp="miter", note="the reviewer's candidate 's1 without bit 30': NOT equivalent (s1 = 2^30, M >= 2 is RANGE)")
+mut("dec_a_m1_wide", D, "a_m1   = MW'(vM - 64'd1);", "a_m1   = RW'(vM - 64'd1);", exp="equiv_miter", note="one bit wider (RW = MW + 1 bits, truncated to MW by a_prod's operand): M <= ACC_ROWS never uses it")
+mut("dec_w_rm1", D, "w_rm1  = w_rows - 16'd1;", "w_rm1  = w_rows;", exp="miter", note="W: rows, not rows - 1")
+mut("dec_w_swap", D, "w_rows = i_trans ? vN : vK;", "w_rows = i_trans ? vK : vN;", exp="miter", note="W: K and N not swapped by trans_w")
+mut("dec_w_bytes", D, "wk_b   = bf16 ? {w_elem, 1'b0} : {1'b0, w_elem};", "wk_b   = {1'b0, w_elem};", exp="miter", note="W: BF16 bytes counted as elements")
+mut("dec_a_bytes", D, "ka_b = bf16 ? {vK, 1'b0} : {1'b0, vK};", "ka_b = {1'b0, vK};", exp="miter", note="A: BF16 bytes counted as elements")
+mut("dec_cs_rm1", D, "cs_rm1  = vKTF - 10'd1;", "cs_rm1  = vKTF;", exp="miter", note="cs: rows, not rows - 1")
+mut("dec_cs_narrow", D, "logic [9:0]  vKTF; ", "logic [8:0]  vKTF; ", exp="miter", note="KTF on 9 bits: BF16 K near 65535 gives 513 rows")
+mut("dec_kt_shift", D, "(bf16 ? LD + 1 : LD + 2));   // K tiles", "(bf16 ? LD + 2 : LD + 2));   // K tiles", exp="miter", note="BF16 K tile as FP8 (c_KT)")
+mut("dec_nt_floor", D, "vNT  = NTW'((17'(vN) + 17'(DIM - 1)) >> LD);", "vNT  = NTW'(17'(vN) >> LD);", exp="miter", note="N tiles rounded down")
+mut("dec_csp_round", D, "csp_q = 13'((19'(vN) * 19'd4 + 19'd63) >> 6);", "csp_q = 13'((19'(vN) * 19'd4 + 19'd59) >> 6);", exp="miter",
+    note="CSP rounding 63 -> 59: wrong for 4 N = 64 k + 4, i.e. N = 1 mod 16 (62 and 60 are equivalent: 4 N is a multiple of 4)")
+mut("dec_csp_round62", D, "csp_q = 13'((19'(vN) * 19'd4 + 19'd63) >> 6);", "csp_q = 13'((19'(vN) * 19'd4 + 19'd62) >> 6);", exp="equiv_miter",
+    note="rounding 63 -> 62 is equivalent: 4 N is a multiple of 4, so 4 N + 63 is never a multiple of 64")
+mut("dec_rs_ext", D, "rs_ext = 96'(r_rs) + 96'({vM[RW-1:0], 2'd0});", "rs_ext = 96'(r_rs) + 96'({2'd0, vM[RW-1:0]});", exp="miter", note="rowscale extent M, not 4 M")
+mut("dec_acc_sum_trunc", D, "(NTW+RW+1)'(vNT * vM[RW-1:0]);", "(NTW+RW+1)'(RW'(vNT * vM[RW-1:0]));", exp="miter", note="NT M cut to RW bits")
+mut("dec_acc_sum_narrow", D, "logic [NTW+RW:0] acc_sum;", "logic [NTW+RW-1:0] acc_sum;", exp="equiv_miter",
+    note="the spare top bit of the sum is never used: NT <= 8192 and M <= 2048 give at most 8192 x 2048 + 2048 < 2^26 = 2^(NTW+RW)")
+mut("dec_csp_wide", D, "logic [12:0] csp_q;", "logic [13:0] csp_q;", exp="equiv_miter", note="one bit wider than the 4096 maximum of (4 N + 63) / 64")
+mut("dec_ktf_wide", D, "logic [9:0]  vKTF; ", "logic [10:0] vKTF; ", exp="equiv_miter", note="vKTF one bit wider than its 513 maximum (cs_rm1 stays 10 bits)")
 
 
 def build(m):
@@ -232,9 +291,38 @@ def run_formal_dec(m):
     return "ERROR", out[-400:]
 
 
+def run_guard(m):
+    d = build(m)
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts/mxu_mutants/guard_check.py"), d], capture_output=True, text=True)
+    first = [l for l in r.stdout.splitlines() if "UNEXPECTED" in l][:1]
+    return ("passes" if r.returncode == 0 else "fails"), (first[0] if first else "")
+
+
+def run_miter(m, n=100000):
+    """The mutated decoder (module renamed mxu_dec_fix) against the decoder of the reviewed commit, DIM 8 and 64, one seed each."""
+    d = build(m)
+    old = subprocess.run(["git", "show", os.environ.get("OLD_REF", "0255c28") + ":rtl/core/mxu_dec.sv"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    open(os.path.join(d, "mxu_dec_old.sv"), "w").write(old)
+    txt = open(os.path.join(d, "mxu_dec.sv")).read()
+    assert txt.count("module mxu_dec #(") == 1
+    open(os.path.join(d, "mxu_dec_fix.sv"), "w").write(txt.replace("module mxu_dec #(", "module mxu_dec_fix #(", 1))
+    for dim in (8, 64):
+        exe = os.path.join(d, "miter_%d.vvp" % dim)
+        c = subprocess.run(["iverilog", "-g2012", "-P", "tb_dec_miter.DIM=%d" % dim, "-o", exe, os.path.join(ROOT, "isa/gen/isa_pkg.sv"),
+                            os.path.join(d, "mxu_dec_old.sv"), os.path.join(d, "mxu_dec_fix.sv"), os.path.join(ROOT, "scripts/mxu_mutants/tb_dec_miter_x.sv")],
+                           capture_output=True, text=True)
+        if c.returncode != 0:
+            return "COMPILE-ERROR", c.stderr[-300:]
+        r = subprocess.run(["vvp", "-n", exe, "+N=%d" % n, "+SEED=1"], capture_output=True, text=True, timeout=1800)
+        if "PASS tb_dec_miter" not in r.stdout:
+            first = [l for l in r.stdout.splitlines() if "mismatch" in l.lower() or "MISMATCH" in l][:1]
+            return "fails", "DIM %d: %s" % (dim, first[0].strip() if first else "no PASS")
+    return "passes", ""
+
+
 def main():
     args = sys.argv[1:]
-    if not args or args[0] not in ("tb", "formal", "list"):
+    if not args or args[0] not in ("tb", "formal", "list", "misc"):
         print(__doc__)
         return 2
     mode, rest = args[0], args[1:]
@@ -248,7 +336,13 @@ def main():
     bad = 0
     for m in sel:
         name, _, _, _, exp, note = m
-        if mode == "tb" and exp in ("formal", "formal_dec", "equiv_dec"):
+        if (exp in MISC) != (mode == "misc"):
+            continue                                # the part I mutants run in `misc` mode only
+        if mode == "misc":
+            res, info = run_guard(m) if exp in ("guard", "equiv_guard") else run_miter(m)
+            ok = (res == "fails") if exp in ("guard", "miter") else (res == "passes")
+            verdict = ("KILLED" if res == "fails" else "SURVIVED" if res == "passes" else res) + ("" if ok else "   <-- UNEXPECTED")
+        elif mode == "tb" and exp in ("formal", "formal_dec", "equiv_dec"):
             res, info = run_tb(m, quick)           # a formal mutant is also run against the system test
             ok = True                              # reported, not judged
             verdict = "tb " + res

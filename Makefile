@@ -156,12 +156,22 @@ formal: $(BUILD)
 e2e:
 	@echo "e2e: needs compiler and TINY config (Phase 3+)"
 
-# Synthesis of one block with Yosys (native). Usage: make syn BLOCK=trivial_add [PARAMS="WIDTH=32 DEPTH=8"]
+# Synthesis of one block with Yosys (native). Usage: make syn BLOCK=trivial_add [PARAMS="WIDTH=32 DEPTH=8"] [HIER=1]
 # PARAMS overrides top-level parameters (chparam); the log is logs/syn_<BLOCK>.log (cell counts at the end).
-# An rtl/arith block is read together with every arith file (the blocks instantiate each other).
+# An rtl/arith block is read together with every arith file (the blocks instantiate each other); an rtl/core block (review I-6)
+# with $(ISA_PKG), every core file and every arith file, the way `make lint` reads it. Default: flat (`synth -flatten`).
+# The files are read with -defer and PARAMS is applied (chparam) before `hierarchy`: with `hierarchy` first, a block that instantiates
+# a parametrized module (mxu_array -> mxu_pe) loses it ("Module \\mxu_pe is not part of the design"); `hierarchy -chparam` on mxu_array
+# trips an internal assertion of Yosys 0.70+post (kernel/rtlil_bufnorm.cc:679).
+# HIER=1 keeps the hierarchy (no -flatten) and prints the per-module counts and the totals of the whole design (`stat -top`):
+# the flow of CLAUDE.md for large blocks (mxu_array, mxu). Examples: make syn BLOCK=mxu_wpack PARAMS="DIM=16";
+# make syn BLOCK=mxu_dec HIER=1; make syn BLOCK=mxu_array PARAMS="ROWS=16 COLS=16" HIER=1 (the PEs stay a module).
+SYN_SRC  = $(if $(wildcard $(RTL_DIR)/arith/$(BLOCK).sv),$(ARITH_SV),$(if $(wildcard $(RTL_DIR)/core/$(BLOCK).sv),$(ISA_PKG) $(CORE_SV) $(ARITH_SV),$(RTL_DIR)/common/$(BLOCK).sv))
+SYN_FLAT = $(if $(HIER),,-flatten)
+SYN_STAT = stat$(if $(HIER), -top $(BLOCK))
 syn: $(BUILD)
-	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module> [PARAMS=\"P=v ...\"]"; exit 2; }
-	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -sv $(if $(wildcard $(RTL_DIR)/arith/$(BLOCK).sv),$(ARITH_SV),$(RTL_DIR)/common/$(BLOCK).sv); hierarchy -top $(BLOCK); $(foreach p,$(PARAMS),chparam -set $(word 1,$(subst =, ,$(p))) $(word 2,$(subst =, ,$(p))) $(BLOCK); )synth -top $(BLOCK) -flatten; tee -o $(BUILD)/syn_$(BLOCK).stat stat; stat" 
+	@test -n "$(BLOCK)" || { echo "usage: make syn BLOCK=<module> [PARAMS=\"P=v ...\"] [HIER=1]"; exit 2; }
+	scripts/memrun syn_$(BLOCK) yosys -q -p "read_verilog -defer -sv $(SYN_SRC); $(foreach p,$(PARAMS),chparam -set $(word 1,$(subst =, ,$(p))) $(word 2,$(subst =, ,$(p))) $(BLOCK); )hierarchy -top $(BLOCK); synth -top $(BLOCK) $(SYN_FLAT); tee -o $(BUILD)/syn_$(BLOCK).stat $(SYN_STAT); $(SYN_STAT)" 
 
 # CDC constraint check of the afifo header text (OrbStack VM: ORFS ASAP7 synthesis + OpenSTA, six configurations, and
 # one through floorplan and CTS with three controls).

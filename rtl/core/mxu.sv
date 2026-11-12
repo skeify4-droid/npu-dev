@@ -76,6 +76,21 @@ module mxu #(
   output logic [3:0]          fault_cause,
   output logic [63:0]         fault_addr
 );
+  // ================================================================== elaboration guards (review I-10; mxu.md 5)
+  // One string argument per $error (Icarus takes no format arguments here); a generate-if stops Icarus, Yosys and Verilator.
+  if (DIM != 8 && DIM != 16 && DIM != 32 && DIM != 64) begin : g_bad_dim
+    $error("mxu: DIM must be 8, 16, 32 or 64");
+  end
+  if (SPM_LAT < 1) begin : g_bad_spm_lat
+    $error("mxu: SPM_LAT must be at least 1");                     // the tag pipelines are SPM_LAT deep
+  end
+  if (CS_DEPTH < 2) begin : g_bad_cs_depth
+    $error("mxu: CS_DEPTH must be at least 2");                    // cs_wr / cs_rd are $clog2(CS_DEPTH) bits wide
+  end
+  if (ACC_LAT < 1 || ACC_LAT > 255) begin : g_bad_acc_lat
+    $error("mxu: ACC_LAT must be 1 .. 255");                       // gap_cnt is 8 bits; acc.md 5 adds the check against acc_pkg
+  end
+
   // ================================================================== D: queue head, TDs, checks (mxu_dec)
   typedef enum logic [2:0] {L_IDLE, L_CALC, L_RUN, L_PUSH} lstate_t;
   lstate_t lst;
@@ -113,23 +128,29 @@ module mxu #(
   // in-flight FIFO
   logic [9:0] inf_in;
   assign inf_in = ctx_sync;
-  assign inf_pop = acc_done;
+  // I-9 (review part I): an acc_done with nothing in flight is ignored here, not only at sem_inc. Without the guard it wrapped
+  // inf_cnt to 7, inf_room stayed low and the MXU never took another instruction.
+  assign inf_pop = acc_done && (inf_cnt != 3'd0);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       inf_cnt <= 3'd0; inf_wr <= 2'd0; inf_rd <= 2'd0;
     end else begin
-      if (inf_push) begin inf_mem[inf_wr] <= inf_in; inf_wr <= inf_wr + 2'd1; end
+      if (inf_push) inf_wr <= inf_wr + 2'd1;
       if (inf_pop) inf_rd <= inf_rd + 2'd1;
       inf_cnt <= inf_cnt + 3'(inf_push) - 3'(inf_pop);
     end
   end
+  // I-7: the entries have no reset (qualified by inf_cnt), so they are not in the async-reset process
+  always_ff @(posedge clk) begin
+    if (inf_push) inf_mem[inf_wr] <= inf_in;
+  end
   logic [9:0] inf_head;
   assign inf_head = inf_mem[inf_rd];
-  // completion: acc_done retires the head of the FIFO; an M = 0 instruction retires itself (z_inc) while the FIFO is empty, so
-  // the two never coincide (an acc_done with an empty FIFO is ignored)
+  // completion: acc_done retires the head of the FIFO (inf_pop: only with something in flight); an M = 0 instruction retires itself
+  // (z_inc) while the FIFO is empty, so the two never coincide
   logic [9:0] sem_inc_w;
   assign sem_inc_w     = z_inc ? ctx_sync : inf_head;
-  assign sem_inc_valid = ((acc_done && (inf_cnt != 3'd0)) || z_inc) && (sem_inc_w[9:4] != 6'd0) && (sem_inc_w[3:0] != 4'd0);
+  assign sem_inc_valid = (inf_pop || z_inc) && (sem_inc_w[9:4] != 6'd0) && (sem_inc_w[3:0] != 4'd0);
   assign sem_inc_idx   = sem_inc_w[9:4];
   assign sem_inc_amt   = sem_inc_w[3:0];
 
@@ -438,8 +459,6 @@ module mxu #(
           sst <= S_RUN;
           s_m <= '0;
           s_lane_cnt <= '0;
-          s_t <= tk_t; s_Mrows <= tk_M; s_kb <= tk_kb; s_ncols <= tk_ncols; s_last <= tk_last; s_bf16 <= tk_bf16;
-          s_cs_en <= tk_cs_en; s_buf <= tk_buf; s_accm <= tk_accm; s_a_pitch <= tk_a_pitch; s_rs_base <= tk_rs_base;
           s_addr <= tk_a_base + 22'(64'(tk_t) * 64'(KB));
           s_accrow <= tk_acc_base + 11'(64'(tk_j) * 64'(tk_M));
         end
@@ -459,6 +478,14 @@ module mxu #(
         end
         default: sst <= S_IDLE;
       endcase
+    end
+  end
+
+  // I-7 (review part I): the per-pass configuration has no reset (qualified by sst), so it is not in the async-reset process above
+  always_ff @(posedge clk) begin
+    if (tok_take) begin
+      s_t <= tk_t; s_Mrows <= tk_M; s_kb <= tk_kb; s_ncols <= tk_ncols; s_last <= tk_last; s_bf16 <= tk_bf16;
+      s_cs_en <= tk_cs_en; s_buf <= tk_buf; s_accm <= tk_accm; s_a_pitch <= tk_a_pitch; s_rs_base <= tk_rs_base;
     end
   end
 

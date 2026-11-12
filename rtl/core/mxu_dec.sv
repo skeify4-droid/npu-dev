@@ -44,6 +44,12 @@ module mxu_dec #(
   output logic [3:0]          fault_cause,
   output logic [63:0]         fault_addr
 );
+  if (DIM != 8 && DIM != 16 && DIM != 32 && DIM != 64) begin : g_bad_dim
+    $error("mxu_dec: DIM must be 8, 16, 32 or 64");
+  end
+  if (ACC_ROWS < 2 || ACC_ROWS > 2048) begin : g_bad_acc_rows
+    $error("mxu_dec: ACC_ROWS must be 2 .. 2048");                 // c_acc_base is 11 bits; the narrowed extents use clog2(ACC_ROWS) bits
+  end
   typedef enum logic [3:0] {D_IDLE, D_TDA_REQ, D_TDA_WAIT, D_TDW_REQ, D_TDW_WAIT, D_CHECK, D_PUSH, D_FAULT} dstate_t;
   dstate_t dst;
 
@@ -93,11 +99,32 @@ module mxu_dec #(
   assign rs_en   = ins[T_MXU_RS_REG_MSB:T_MXU_RS_REG_LSB] != 5'd0;
   assign m_en    = ins[T_MXU_M_REG_MSB:T_MXU_M_REG_LSB] != 5'd0;
 
-  // ---- derived values. 96-bit arithmetic for the extents: 64-bit register + 2^64 rows x 2^31 pitch cannot wrap.
+  // ---- derived values (M-24, review I-3). No divider and no wide multiplier: every divisor is a power of two (shift), and an
+  // extent is only looked at under the M-18 priority, i.e. after the word, space, descriptor and alignment checks and the ACC
+  // RANGE check have passed. At that point K, N are in 1 .. 65535 (descriptor check; they are 16-bit TD fields), s1 >= 0
+  // (alignment check: bit 31 clear), and M <= ACC_ROWS (ACC check). The products below are exact under those conditions; where a
+  // condition does not hold an earlier flag in the priority chain wins, so the value of the later flag is never used. The sums
+  // stay 96 bits wide (a 64-bit register + a product below 2^47 + 2^17 cannot wrap).
+  localparam int LD  = $clog2(DIM);
+  localparam int RW  = $clog2(ACC_ROWS + 1);          // bits of M and R[acc_reg] once they are <= ACC_ROWS (12 at 2048)
+  localparam int MW  = $clog2(ACC_ROWS);              // bits of M - 1, 1 <= M <= ACC_ROWS (11)
+  localparam int NTW = 17 - LD;                       // bits of ceil(65535 / DIM)
   logic        fp8, bf16;
-  logic [63:0] vK, vM, vN, vKw, vNT, vKTE, veb, vKF, vKTF, vCSP;
-  logic [15:0] vKT;                                  // K <= 65535 and a K tile has at least 16 elements
+  logic [63:0] vM;
+  logic [15:0] vK, vN, vKw, vKT;                      // K <= 65535 and a K tile has at least 16 elements
+  logic [NTW-1:0] vNT;
+  logic [9:0]  vKTF;                                  // ceil(K / 128 or 256) <= 513
+  logic [18:0] vCSP;                                  // roundup(4 N, 64) <= 2^18
+  logic [12:0] csp_q;
   logic [95:0] a_ext, w_ext, cs_ext, rs_ext;          // end (exclusive) of the bytes of each operand
+  logic [16:0] ka_b, wk_b;                            // K * bytes per element, the second W extent term
+  logic [15:0] w_rows, w_elem, w_rm1;                 // W: rows along s1 and elements per row (trans_w swaps K and N)
+  logic [MW-1:0] a_m1;
+  logic [MW+30:0] a_prod;
+  logic [46:0] w_prod;
+  logic [9:0]  cs_rm1;
+  logic [28:0] cs_prod;
+  logic [NTW+RW:0] acc_sum;                           // R[acc_reg] + NT M on its low bits
   logic        m_zero;
   assign m_zero = (vM == 64'd0);
   // M-18 order: word fields, TD_SPACE (A, W), descriptor rows (no address), alignment (A, W, s1 A, s1 W, cs, rs), RANGE (ACC, A, W, cs, rs)
@@ -109,28 +136,40 @@ module mxu_dec #(
   always_comb begin
     fp8  = (a_dt == 5'(DTYPE_E4M3)) && (w_dt == 5'(DTYPE_E4M3));
     bf16 = (a_dt == 5'(DTYPE_BF16)) && (w_dt == 5'(DTYPE_BF16));
-    veb  = bf16 ? 64'd2 : 64'd1;
-    vK   = 64'(a_n0);
+    vK   = a_n0;
     vM   = m_en ? r_m : 64'(a_n1);               // R[m_reg] as a 64-bit unsigned number, compared in full (M-14)
-    vKw  = i_trans ? 64'(w_n0) : 64'(w_n1);
-    vN   = i_trans ? 64'(w_n1) : 64'(w_n0);
-    vNT  = (vN + 64'(DIM) - 64'd1) / 64'(DIM);
-    vKTE = bf16 ? 64'(2 * DIM) : 64'(4 * DIM);
-    vKT  = 16'((vK + vKTE - 64'd1) / vKTE);      // K tiles (passes) of the MXU
-    vKF  = bf16 ? 64'd128 : 64'd256;             // fold tile of the column scales, the same in every config (M-13)
-    vKTF = (vK + vKF - 64'd1) / vKF;             // rows of the column-scale array
-    vCSP = ((64'd4 * vN + 64'd63) / 64'd64) * 64'd64;
-    a_ext  = 96'(r_a) + 96'(vM - 64'd1) * 96'(a_s1) + 96'(vK * veb);
-    w_ext  = i_trans ? (96'(r_w) + 96'(vN - 64'd1) * 96'(w_s1) + 96'(vK * veb)) : (96'(r_w) + 96'(vK - 64'd1) * 96'(w_s1) + 96'(vN * veb));
-    cs_ext = 96'(r_cs) + 96'(vKTF - 64'd1) * 96'(vCSP) + 96'(64'd4 * vN);
-    rs_ext = 96'(r_rs) + 96'(64'd4) * 96'(vM);
+    vKw  = i_trans ? w_n0 : w_n1;
+    vN   = i_trans ? w_n1 : w_n0;
+    vNT  = NTW'((17'(vN) + 17'(DIM - 1)) >> LD);
+    vKT  = 16'((17'(vK) + (bf16 ? 17'(2 * DIM - 1) : 17'(4 * DIM - 1))) >> (bf16 ? LD + 1 : LD + 2));   // K tiles (passes) of the MXU
+    // fold tile of the column scales (128 / 256), the same in every config (M-13): rows of the column-scale array
+    vKTF = 10'((17'(vK) + (bf16 ? 17'd127 : 17'd255)) >> (bf16 ? 7 : 8));
+    csp_q = 13'((19'(vN) * 19'd4 + 19'd63) >> 6);
+    vCSP = {csp_q, 6'd0};                        // roundup(4 N, 64)
+    ka_b = bf16 ? {vK, 1'b0} : {1'b0, vK};
+    // A: (M - 1) x s1 on MW x 31 bits (M <= ACC_ROWS, s1 >= 0)
+    a_m1   = MW'(vM - 64'd1);
+    a_prod = a_m1 * a_s1[30:0];
+    a_ext  = 96'(r_a) + 96'(a_prod) + 96'(ka_b);
+    // W: one product, its operands muxed by trans_w (rows >= 1 after the descriptor check)
+    w_rows = i_trans ? vN : vK;
+    w_elem = i_trans ? vK : vN;
+    wk_b   = bf16 ? {w_elem, 1'b0} : {1'b0, w_elem};
+    w_rm1  = w_rows - 16'd1;
+    w_prod = w_rm1 * w_s1[30:0];
+    w_ext  = 96'(r_w) + 96'(w_prod) + 96'(wk_b);
+    // cs: (rows of the scale array - 1) x CSP on 10 x 19 bits
+    cs_rm1  = vKTF - 10'd1;
+    cs_prod = cs_rm1 * vCSP;
+    cs_ext = 96'(r_cs) + 96'(cs_prod) + 96'(vN) * 96'd4;
+    rs_ext = 96'(r_rs) + 96'({vM[RW-1:0], 2'd0});      // 4 M, M <= ACC_ROWS
 
     bad_op  = ins[127:120] != OP_MXU_MM;
     f_word  = (ins[38:0] != 39'd0) || (i_mode != 3'd0) || (i_accm == 2'd3) || (i_accm == 2'd2 ? !rs_en : rs_en);
     f_sp_a  = (a_sp != SPACE_SPM);
     f_sp_w  = (w_sp != SPACE_SPM);
     f_desc  = !(fp8 || bf16) || (a_fl != 8'd0) || (w_fl != 8'd0) || (a_n2 != 16'd1) || (a_n3 != 16'd1) || (w_n2 != 16'd1) || (w_n3 != 16'd1) ||
-              (vK == 64'd0) || (vK != vKw) || (vN == 64'd0);
+              (vK == 16'd0) || (vK != vKw) || (vN == 16'd0);
     // 64 B in every config (the SPM bank width, M-10); N has no rule (M-11); a negative s1 is an alignment fault of that s1
     f_al_a  = (r_a[5:0] != 6'd0);
     f_al_w  = (r_w[5:0] != 6'd0);
@@ -143,7 +182,8 @@ module mxu_dec #(
     // (A and the rowscale of an M = 0 instruction) cannot be out of range. Lanes the MXU reads past an extent are discarded: they
     // stay inside the 64 B granule of the extent, except the cs window (4 DIM B, DIM >= 32) and the BF16 non-trans window
     // (2 DIM B, DIM = 64), which wrap in the 22-bit SPM address (mxu.md 4.1).
-    f_r_acc = (r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || (r_acc + vNT * vM > 64'(ACC_ROWS));
+    acc_sum = (NTW+RW+1)'(r_acc[RW-1:0]) + (NTW+RW+1)'(vNT * vM[RW-1:0]);   // meaningful when the first two terms are false
+    f_r_acc = (r_acc > 64'(ACC_ROWS)) || (vM > 64'(ACC_ROWS)) || (acc_sum > (NTW+RW+1)'(ACC_ROWS));
     f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));
     f_r_w   = (w_ext > 96'(SPM_BYTES));
     f_r_cs  = cs_en && (cs_ext > 96'(SPM_BYTES));
@@ -220,9 +260,9 @@ module mxu_dec #(
       c_bf16     <= bf16;
       c_cs_en    <= cs_en;
       c_accm     <= i_accm;
-      c_K        <= 16'(vK);
+      c_K        <= vK;
       c_M        <= 16'(vM);
-      c_N        <= 16'(vN);
+      c_N        <= vN;
       c_KT       <= vKT;
       c_NT       <= 16'(vNT);
       c_a_base   <= 22'(r_a);

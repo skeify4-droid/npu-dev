@@ -9,14 +9,14 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 F=build/mxu_review/fix; mkdir -p "$F"
-python3 - <<'EOF'
-s = open('rtl/core/mxu_array.sv').read()
-for old, new in (("  logic [31:0] ps [ROWS][COLS];", "  logic [ROWS-1:0][COLS-1:0][31:0] ps;"),
-                 ("  logic [3:0]  fl [ROWS][COLS];", "  logic [ROWS-1:0][COLS-1:0][3:0]  fl;")):
-    assert s.count(old) == 1, old
-    s = s.replace(old, new)
-open('build/mxu_review/fix/mxu_array.sv', 'w').write(s)
-EOF
+# Author's adaptation, 2026-11-12 (after the fix of I-2 is in rtl/core/mxu_array.sv): the "original" is now the file of the reviewed
+# commit (OLD_REF, default 0255c28, taken from git) in $F/mxu_array_orig.sv, and the "copy" $F/mxu_array.sv (the path syn_core.sh's
+# mxu_array_bbpe and gl_sim.py read) is a plain copy of the tree's file, which must already have ps / fl packed. The reviewer's version
+# edited the original into the packed copy with python; the checks below are unchanged.
+OLD_REF=${OLD_REF:-0255c28}
+git show "$OLD_REF:rtl/core/mxu_array.sv" > "$F/mxu_array_orig.sv"
+cp rtl/core/mxu_array.sv "$F/mxu_array.sv"
+grep -q 'logic \[ROWS-1:0\]\[COLS-1:0\]\[31:0\] ps;' "$F/mxu_array.sv" || { echo "rtl/core/mxu_array.sv: ps is not packed"; exit 1; }
 # a PE stand-in with the same ports and latency shape (not a blackbox, so the original elaborates the usual way)
 cat >"$F/pe_standin.sv" <<'EOF'
 module mxu_pe #(parameter bit REG_DOT = 1'b1, parameter bit REG_OUT = 1'b1) (
@@ -29,7 +29,7 @@ endmodule
 EOF
 printf 'module mxu_pe #(parameter bit REG_DOT=1, parameter bit REG_OUT=1) (input logic clk, rst_n, mode_bf16, input logic [31:0] a, w, psum_in, output logic [31:0] psum_out, output logic [3:0] flags);\nendmodule\n' >"$F/pe_bb.sv"
 
-for src in rtl/core/mxu_array.sv "$F/mxu_array.sv"; do
+for src in "$F/mxu_array_orig.sv" "$F/mxu_array.sv"; do
   yosys -q -p "read_verilog -sv -lib $F/pe_bb.sv; read_verilog -sv $src; hierarchy -top mxu_array; proc; opt_clean;
                tee -q -o $F/count.txt select -count t:mxu_pe" >/dev/null
   echo "PE blackbox, $src: $(cat $F/count.txt) mxu_pe instances left after proc; opt_clean (want 64)"
@@ -37,7 +37,7 @@ done
 
 for d in 8 16; do
   yosys -q -l "$F/equiv_$d.log" -p "
-    read_verilog -sv $F/pe_standin.sv rtl/core/mxu_array.sv; chparam -set ROWS $d -set COLS $d mxu_array; hierarchy -auto-top;
+    read_verilog -sv $F/pe_standin.sv $F/mxu_array_orig.sv; chparam -set ROWS $d -set COLS $d mxu_array; hierarchy -auto-top;
     proc; flatten; opt_clean; rename -top gold; design -stash gold;
     read_verilog -sv $F/pe_standin.sv $F/mxu_array.sv; chparam -set ROWS $d -set COLS $d mxu_array; hierarchy -auto-top;
     proc; flatten; opt_clean; rename -top gate; design -stash gate;

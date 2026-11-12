@@ -262,8 +262,10 @@ module mxu_tc #(
   end
   longint last_row_cyc = 0;
   logic [4:0] dsr = 5'd0;
-  assign acc_done = dsr[4];       // five cycles after the last row
+  logic spur_done = 1'b0;         // I-9 (review part I): one acc_done with nothing in flight, right after reset; it must be ignored
+  assign acc_done = dsr[4] | spur_done;       // five cycles after the last row
   longint row_last [0:ACCR-1];
+  always @(posedge clk) if (spur_done && sem_inc_valid) begin errors++; $display("%s: sem_inc for an acc_done with nothing in flight", PRE); end
   int done_cnt = 0;
   logic [3:0] flags_or = 4'd0;
   int rows_seen = 0;
@@ -326,6 +328,13 @@ module mxu_tc #(
     for (int r = 0; r < ACCR; r++) for (int c = 0; c < DIM; c++) accm[r*DIM + c] = acc0[r][32*c +: 32];
     repeat (4) @(posedge clk);
     rst_n = 1;
+    // one acc_done pulse (a full cycle, changed at the falling edge) while no instruction is in flight: the first instruction needs
+    // at least the two TD reads before it enters the FIFO, so the FIFO is empty here. A contract violation of the ACC, which the
+    // MXU must still survive (the unguarded pop wrapped inf_cnt to 7 and stopped the MXU for good).
+    @(negedge clk); spur_done = 1'b1;
+    if (dut.inf_cnt != 0 || dut.inf_push) begin errors++; $display("%s: the spurious acc_done pulse met a non-empty FIFO (test setup)", PRE); end
+    @(negedge clk); spur_done = 1'b0;
+    if (dut.inf_cnt != 0) begin errors++; $display("%s: acc_done with nothing in flight moved inf_cnt to %0d", PRE, dut.inf_cnt); end
     // wait for all completions (instructions with a semaphore) or the time limit
     fork
       begin : w_done
