@@ -2,7 +2,9 @@
 
 Part **S** (below) reviews the spec. Part **R** ([further down](#part-r-bit-exact-semantics-against-an-independent-oracle-commit-2cc2d4b))
 reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle. Part **I**
-([at the end](#part-i-implementability-of-the-rtl-commit-db5464f)) reviews the RTL of commit db5464f for synthesis and structure.
+([further down](#part-i-implementability-of-the-rtl-commit-db5464f)) reviews the RTL of commit db5464f for synthesis and structure.
+Part **H** ([at the end](#part-h-control-hazards-and-stalls-commit-517ed44)) reviews the control of commit 517ed44 under random
+stalls, delays and faults.
 
 Scope of this part (**S**): `docs/spec/mxu.md` against the frozen architecture: microarch.md §2.2 and §5, numerics.md N-3 / N-5 /
 N-8, arith.md "Integration contract" items 1-5, isa.md §3-5 (and §8, which (a) needs), isa_ref.md `MXU_MM`, memmap.md §4. No RTL was
@@ -986,3 +988,270 @@ All but `:444` sit between the loop counters and the ports, with no register: `w
 - **I-7 - I-10.** Not mentioned. status.md:1108 reports "Lint clean at DIM 8, 16, 32, 64", which I confirm.
 - **I-11.** status.md:1124 repeats "+131 k flops" for the third buffer without an area share; the 1.5 % is in mxu.md M-2 / M-9 only.
 - The PE number checks out: `make syn BLOCK=mxu_pe` gives 6,580 cells now, as in status.md:1029 and arith_review.md.
+
+---
+
+## Part H: control hazards and stalls (commit 517ed44)
+
+Scope: the control of `rtl/core/mxu.sv` / `mxu_dec.sv` under hostile timing: independent random stalls on the three SPM ports,
+`SPM_LAT` 1-5, `ACC_LAT` 1-24, `CS_DEPTH` 2-4, `acc_done` later than `ACC_LAT`, MQ and DTAB gaps, back-to-back instructions of
+different shapes (M, N, K, mode, `trans_w`, `acc_mode`, column scales change while the previous pass streams), `M = 0`, semaphore
+waits, a fault followed by a reset, and a reset in mid-flight. The question is only "wrong result or hang"; the arithmetic is part
+R's. I wrote the findings before reading `docs/reports/status.md`; the comparison is at the end. No file of the author was changed.
+Labels and severities as in part S.
+
+### Summary
+
+**No wrong result and no hang found.** 446 random programs on the real RTL (DIM 8, 16, 32; 10,846 instructions taken, 174,858
+ACC rows, 127 faults, 179 resets) and 6 control-only programs at DIM 32 pass every check below. The environment kills all 34
+control mutants it should kill (26 of the author's, 13 of mine, 5 expected equivalents survive), including `inf_mem_always`, which
+`tb_mxu` misses (mxu.md §9).
+
+| # | Sev | Topic | Status |
+|---|---|---|---|
+| H-1 | L | The rowscale reservation limit (`rs_res < RS_DEPTH`) never binds at DIM 8 / 16 / 32. The throttle path is untested, and removing it is not seen by any test | confirmed (8, 16, 32); DIM 64 suspected to bind, not simulated |
+| H-2 | L | `tb_mxu` never delays `acc_done`, so the in-flight FIFO is never full with different entries. This is the author's open item. A delayed `acc_done` closes it (`inf_mem_always` is killed here) | confirmed |
+| H-3 | L | acc.md / mxu.md §5 say `acc_done` comes *exactly* `ACC_LAT` after the last row. The MXU only needs "no earlier than"; the contract is stricter than the design needs | confirmed (all runs with a delayed `acc_done` pass) |
+
+Observations, no finding:
+- The same-instruction gap `ACC_LAT - M` has one cycle of slack, as mxu.md §4.4 says: `ACC_LAT - M - 1` passes everything (mutant
+  `h_gap_in_short1`), and `- 2` fails.
+- A W beat that is not the first of its group also clears `free_g`, which nothing reads (`h_free_first_only` is equivalent).
+- The cross-instruction bound of M-22 is tight. 226 row pairs of two different instructions were updated exactly `ACC_LAT`
+  cycles apart (R-1's worst pair: last row of the previous instruction, first row of the next). None was closer.
+
+### Method
+
+Scripts are in `scripts/mxu_review/`; build and case outputs go to `build/mxu_review_hz/`; logs are `logs/hz_*`. Everything ran
+under `scripts/memrun`, one job at a time. The largest peak was 0.72 GB, for the campaign including DIM 32.
+
+- **Testbench** `tb_mxu_hz.sv` is new. It does not use `tb_mxu`, `tb_mxu_rev.sv`, `gen_mxu_vectors.py` or `arith_ref.py`. It
+  drives the ports and logs; it knows no expected value.
+  - **MQ head:** random gaps; once raised, valid stays high.
+  - **Semaphores:** 64 entries, read combinationally. Increments come from `sem_inc` and from "other engines" at scheduled cycles.
+  - **DTAB:** the grant comes after a random delay of 0-8 cycles.
+  - **SPM ports:** each of A, W and scale has its own stall process: a per-cycle `ready`-low probability up to 60%, plus bursts
+    of 1-200 cycles.
+    - The `astall` style makes only A stall long, so the loader runs ahead of the stream.
+    - The `rdyv` style raises `ready` only for a request with a valid lane.
+    - Data arrive exactly `SPM_LAT` after the grant. Random garbage is on the bus in every other cycle and on every invalid lane.
+    - A valid lane outside the SPM or not `LB`-aligned is logged.
+  - **`acc_done`:** comes `ACC_LAT + 0..400` cycles after each `acc_last` row, in order, one per cycle.
+  - **Fault and reset:** after a fault, a reset follows 0-3000 cycles later. Some runs instead reset at a random cycle with work
+    in flight. Segment 1 then runs with fresh semaphores.
+  - **Coverage counters** read DUT internals (below).
+  - **Watchdogs:** 20,000 cycles without a take or a `sem_inc`, or 2x the expected ACC rows, ends the run as `TIMEOUT`.
+- **Generator / checker** `hz_run.py`.
+  - **Data are exactly representable:**
+    - A, W: halves in [-8, 8]; ACC init: multiples of 1/8; column scales and rowscales: 0.5 / 1 / 2.
+    - So every partial sum and ACC update is exact in FP32, whatever the order and rounding. The expectation is plain Python
+      arithmetic; the checker flags any inexact step as a generator problem, and none occurred.
+    - Every byte not in an operand is `0xFF` (NaN in E4M3, BF16 and FP32), so a lane used wrongly shows as a NaN or a flag.
+  - **Shapes:**
+    - K: 1-3 tiles, with tails;
+    - N: 1 to 2.5·DIM (4·DIM for the `rsfull` focus);
+    - M: 0 in 12% of instructions; 1-3; around `ACC_LAT` and `GRP`; up to 6·DIM;
+    - `m_reg` with a decoy `n1` in 30%.
+  - **ACC bases:** 70% overlap the previous instruction. 35% of those put the first row on (or one or two before) the previous
+    instruction's last row.
+  - **Mix:** column scales in 45% of instructions (all of them in the `cs_small_k` focus, with K below one tile); RESCALE in 2 of 7.
+  - **Semaphores:** ssem / sinc non-zero in 90% of instructions. Waits go on an earlier instruction's cumulative value (15%) or
+    on an external increment (7%).
+  - **Illegal instruction:** in 30% of programs, segment 0 ends with one of A misaligned, K mismatch, ACC `RANGE`, W
+    `TD_SPACE`, or a reserved word bit. 1-3 legal instructions follow it, which must never be taken.
+- **Checks**, per segment. A segment cut by a reset must be a prefix of the expected one, unless the reset came 3000 cycles after
+  the fault; then the instructions in flight must have completed.
+  1. **ACC stream, row by row,** in the mxu.md §4.2 order. The checker compares:
+     - row, `ncols`, rescale / overwrite / use_cs / last;
+     - the rowscale (on rescale rows);
+     - column scales and partial sums of the columns `< ncols`.
+  2. **Spacing:** two updates of an ACC row at least `ACC_LAT` cycles apart.
+  3. **Timed ACC:** the RTL's stream is applied to a timed ACC model (read at `acc_valid`, write visible `ACC_LAT` later). The
+     resulting image must equal the sequential expectation.
+  4. **`sem_inc`:**
+     - in program order, exactly one per instruction with a non-zero `{ssem, sinc}`;
+     - never before the cycle in which the last write of its instruction is visible (for `M = 0`: the last write of every
+       earlier instruction);
+     - final semaphore values match.
+  5. **Waits:** the semaphore condition holds at the take, and an instruction waiting on an earlier one is taken after that
+     one's `sem_inc`.
+  6. **Faults:** one fault with the expected cause and `FAULT_ADDR`; no take and no ACC row of the faulting or a later
+     instruction.
+  7. **Hangs and errors:** the run must end `IDLE` with everything taken. No X on the control outputs, no `fp_flags`, no lane
+     error.
+- **Configurations** (DIM / `SPM_LAT` / `ACC_LAT` / `CS_DEPTH`): 8/2/8/4, 8/1/8/4, 8/1/1/2, 8/1/2/2, 8/3/3/3, 8/5/13/2, 8/2/24/4,
+  8/1/5/3, 16/2/8/4, 16/1/3/2, 16/4/17/3 (40 seeds each), 32/2/8/4 (6 seeds).
+  - `--stub` replaces `mxu_pe` with `hz_pe_stub.sv`. Control is unchanged; partial sums and the image are not checked. That run
+    was 32/1/2/2, 6 seeds, 50% `rsfull` focus.
+  - DIM 64 is out of reach in Icarus even with stub PEs: about 260 cycles in 34 minutes.
+  The stub run took 178 instructions, 5,725 ACC rows and 3,991 s, with a peak of 0.10 GB (`logs/hz_stub32.log`). All 6 runs
+  pass, and `rsfull` stays 0 there too, including the two `rsfull`-focus programs.
+- **Validation** `hz_mutants.py`: one-change copies of `rtl/core`, 6 configurations x 6 seeds each.
+  - Of the author's list (`scripts/mxu_mutants/mxu_mutants.py`, used only for its text), the 26 that touch control.
+  - 13 of my own, targeted at the items of this part:
+    - `h_cs_full`: cs FIFO overfilled by one;
+    - `h_inf_room`: a fifth in-flight entry;
+    - `h_tok_over`: token overwritten;
+    - `h_ctx_ready`: next context while the load FSM runs;
+    - `h_zero_cnt1`: `M = 0` with one instruction in flight;
+    - `h_gap_last_live`: boundary gap from `tk_last`;
+    - `h_cs_free_lasti`: cs freed per instruction;
+    - `h_free_any`: a beat clears both buffers' flag;
+    - `h_s_tag_lane`: scales complete one lane early;
+    - `h_gap_in_short2`: same-instruction gap two short;
+    - three expected equivalents.
+
+  **Result: 39 mutants, 0 unexpected** (`logs/hz_mutants.log`, 1,607 s, 0.22 GB). How a few of them die:
+  - `gap_x_short`: "ACC row 193 updated at 1966 and 1978 (< ACC_LAT 13)";
+  - `token_live`: an A lane at 262144, outside the SPM;
+  - `no_free_gate`: a partial sum of 3.8e10 instead of -0.25;
+  - `inf_mem_always`, `h_inf_room`: `sem_inc` out of order;
+  - `zero_runs`: a 65,535-row pass, cut by the row watchdog.
+
+  Survivors, all expected:
+  - `gap_x_every_pass`, `token_at_request` (as the author lists them);
+  - `spur_pop` (this environment never sends a spurious `acc_done`; the I-9 guard is `tb_mxu`'s);
+  - `h_gap_in_short1`, `h_free_first_only`, `h_rs_res_off` (see H-1).
+
+**Coverage** (cycles summed over the 440 DIM 8 / 16 runs; the counters read DUT internals):
+
+| Situation | Counter | Cycles |
+|---|---|---|
+| in-flight FIFO full (`inf_cnt = 4`) | `inf4` | 35,784 |
+| ... with a head different from `ctx_sync` | `inf4d` | 35,341 |
+| first beat of a group waiting for `free_g` | `freew` | 80,694 |
+| load FSM in `L_PUSH` waiting for the token to be taken | `tokw` | 175,600 |
+| token ready, stream held by `gap_cnt` | `gapw` | 55,890 |
+| `L_CALC` held by a full column-scale FIFO | `csfull` | 33,359 |
+| stream held by the rowscale reservation limit | `rsfull` | **0** |
+| `M = 0` waiting in `D_PUSH` for the FIFO to drain | `zwait` | 140,213 |
+| A request stalled | `astall` | 268,506 |
+| cross-instruction row pair exactly `ACC_LAT` apart | `tight_x` | 224 (+2 at DIM 32) |
+
+The campaign took 1,017 s with 6 workers (`logs/hz_campaign.log`). Of the 446 runs:
+- 127 faults: 72 `ILLEGAL_FIELD`, 33 `TD_SPACE`, 22 `RANGE`, each with the right `FAULT_ADDR`;
+- 179 resets, 151 of them cutting a segment with work in flight;
+- 9,504 `sem_inc`, 9,334 `acc_done`;
+- every run ended `IDLE`.
+
+The items asked for:
+- **Token and `s_*` copies:**
+  - The configuration of a streaming pass never changes when the next token or context is written (`tokw`).
+  - The three mutants that read live registers (`token_live`, `s_cfg_always`, `h_gap_last_live`) die.
+- **`free_g` under long A stalls:** the `astall` runs hold A for up to 200 cycles while the loader fills the other buffer and
+  waits on the taps (`freew`). No beat overwrote an uncopied shadow word; `no_free_gate` and `h_free_any` die.
+- **`cs_cnt` / `rs_res`:** the cs FIFO runs full often (`csfull`, `CS_DEPTH` 2 included), with no lost or duplicated entry. On
+  `rs_res` see H-1.
+- **`gap_cnt` across instruction boundaries:** an `M = 0` instruction in between, a semaphore wait in between, and any M change.
+  The worst pair is reached at exactly `ACC_LAT` (`tight_x`) and never below.
+- **`cs_reg` with K below one tile:** the `cs_small_k` focus, about 30% of instructions in a third of the programs. All W beats
+  past the first group are empty and self-granted, so the scale fetch sets the load time. Correct.
+- **`inf_cnt` reaching 4:** reached in most runs with `acc_done` delays, with different heads (`inf4d`). Completion order and
+  values are correct.
+- **`SPM_LAT = 1`:** 5 configurations (with `ACC_LAT` 1, 2, 5, 8 and DIM 8 / 16). Nothing found.
+- **After a fault:** no further take, in-flight instructions complete when given time, and the next segment after the reset is
+  correct, including resets with rows in the array and responses in the SPM pipeline.
+
+### H-1 (L; confirmed at DIM 8 / 16 / 32, suspected at DIM 64) The rowscale reservation limit never binds in any test
+
+`mxu.sv:422`: `rs_want = ... && (rs_res < RS_DEPTH)` with `RS_DEPTH = (2·SPM_LAT + DIM + 6) / GRP + 3` (`mxu.sv:25`).
+
+**Measured:**
+- In 446 runs plus the 6 DIM 32 stub runs, the stream never waited on that condition (`rsfull = 0`). That holds even in the `rescale` focus and in the
+  `rsfull` focus: RESCALE, one K tile, 2-4 N tiles, M between GRP+1 and 3·GRP, so that a lane is held across pass boundaries.
+- The mutant that removes the count (`h_rs_res_off`: `rs_res <= '0`) passes every run.
+- The formal P5 `assert (rs_res <= RS_DEPTH)` is therefore about a bound that the bounded proofs (DIM 8, `M <= 3`) cannot approach.
+
+**Bound:**
+- A lane is held from its request until its last row leaves the array, at most `SPM_LAT + ARR_LAT + 1` cycles after that row's A
+  grant.
+- Rows issue at most one per cycle, and only `t = 0` passes reserve.
+- Continuous rows hold at most `ceil((SPM_LAT + DIM + 3) / GRP) + 2` lanes, and each pass boundary inside that window adds a partial
+  lane:
+  - DIM 8, `SPM_LAT` 2: 9 lanes against `RS_DEPTH` 12;
+  - DIM 16: 8 against 9.
+- A sequence of short rescaled passes only gets above `RS_DEPTH` if the passes come faster than the tile period. They cannot (one
+  pass per N tile, each needs its own tile).
+- At DIM 64, `RS_DEPTH = 7` and the window is 69 cycles. Two passes of about 40 rows, three lanes each, plus the next reservation
+  come to 7. The limit can bind there; I did not simulate DIM 64 (see Method).
+
+**Consequence:** none for correctness at DIM 8 / 16 / 32. If the limit is wrong at DIM 64, nothing in the test suite would see it:
+- set too low, it costs stalls;
+- removed or too high, the ring overwrites a lane in use and RESCALE rows get the wrong rowscale.
+
+**Proposal:** state the bound in a comment next to `RS_DEPTH`. Then either:
+- add a cover point (`need_rs_lane && rs_res == RS_DEPTH`) to a run that can reach it (a DIM 64 Verilator run of `tb_mxu` or of
+  this environment's programs); or
+- size `RS_DEPTH` from the bound and add an assertion that the limit never binds.
+
+### H-2 (L, confirmed) The in-flight FIFO is never full with different entries in `tb_mxu`; a delayed `acc_done` closes it
+
+**Measured:** here, `inf_cnt = 4` with a head different from `ctx_sync` occurs for 35,341 cycles. The mutant `inf_mem_always`
+(which `mxu_mutants.py` lists as `equiv` because `tb_mxu` cannot see it) is killed: in the first failing run, the 4th `sem_inc` is
+(29, 12) instead of (45, 4).
+
+**Why `tb_mxu` misses it:** its ACC model sends `acc_done` exactly `ACC_LAT` after the last row, so at most one instruction waits
+for completion while the next streams. The author already records the remedy in mxu.md §9: a slower `acc_done` in one `tb_mxu`
+instance, no new vectors needed. This part confirms that the remedy works, and that the design is correct under it.
+
+**Proposal:** give one `tb_mxu` instance a delayed `acc_done` (`ACC_LAT + 0..150`, in order). Then move `inf_mem_always` back to
+`kill`.
+
+### H-3 (L, confirmed) The `acc_done` contract is "exactly `ACC_LAT`"; the MXU needs only "not earlier"
+
+acc.md §5 and mxu.md §5 (`acc_done` row) say the pulse comes exactly `ACC_LAT` cycles after the `acc_valid` of the `acc_last`
+row.
+
+**What the MXU uses:** `acc_done` only pops the in-flight FIFO and raises `sem_inc` (`mxu.sv:133`, `:153`). The spacing rule does
+not depend on it.
+
+**Measured:** runs in which up to 100% of the `acc_done` pulses were 0-400 cycles late all pass, including `M = 0` completions
+waiting behind them.
+
+**Consequence:** none today. But "exactly" forbids a `core/acc` that delays the pulse, for example behind a VPU access on the same
+bank (acc.md §7) or through a register stage. "At least `ACC_LAT` after the row, in order, one per `acc_last` row" is what the
+MXU and the semaphore semantics (isa.md §3: "ACC written") need.
+
+**Proposal:** relax the wording in acc.md §5 and mxu.md §5. Keep "exactly" only as the timing `core/acc` is designed to.
+
+### Not covered
+
+- DIM 64. Only the bound argument of H-1 applies there.
+- `M` above 6·DIM (384 at DIM 64). `ACC_LAT` above 24 (the guard allows 255).
+- Spurious `acc_done` (the I-9 path; `tb_mxu` covers it).
+- An SPM whose latency varies. The contract fixes it.
+- Specials and rounding: the data are exact by construction; part R covers them.
+- The decoder's arithmetic beyond the five fault kinds.
+
+**Confirmation run.** The 446-run campaign used the generator before the `rsfull` focus was added. A confirmation run with the
+final scripts passed: 132 runs, 3,359 instructions, 52,069 rows, `rsfull = 0`, `tight_x = 64`, 252 s (`logs/hz_final.log`; DIM 8 /
+16 configurations, 12 seeds from 500).
+
+Reproduce (each under `scripts/memrun`, one at a time):
+- `python3 scripts/mxu_review/hz_run.py --seeds 40 --seed0 100 --jobs 6 --quiet` for the DIM 8 / 16 configurations, about 17 min;
+- `--cfg d32_l2_a8 --seeds 6`;
+- `--stub --cfg d32_l1_a2 --seeds 6`, about 67 min;
+- `python3 scripts/mxu_review/hz_mutants.py`, about 27 min.
+
+### Comparison with status.md (read after the above)
+
+- **No wrong result, no hang.** This agrees with what status.md claims for the MXU:
+  - status.md:1107-1108: grant stalls, and a long-A-stall run that exercises the buffer interlock;
+  - status.md:1120: `+BANK=2` gang splits with no deadlock;
+  - the formal P1-P5 to depth 56 (status.md, "Formal (mxu.sby)").
+
+  status.md notes "no liveness proof ... DIM 8 only". This part adds simulation evidence for liveness:
+  - random independent stalls on all three ports, `ready`-needs-`valid`, delayed `acc_done`, and resets with work in flight;
+  - at DIM 8, 16 and 32;
+  - `SPM_LAT` 1-5 (status.md and mxu.md §6 report only the default 2);
+  - `ACC_LAT` 1-24 (`tb_mxu` uses 8 and 24).
+
+  The one deadlock status.md records (the second beat of a group waiting for its own `free` flag at DIM >= 16, fixed) would
+  show here as a `TIMEOUT`.
+- **H-1.** Neither status.md nor mxu.md mentions `RS_DEPTH`, how it is sized, or that its limit never binds. mxu.md M-7 says only
+  "rowscale prefetched in 16-row lanes into a FIFO". **Not known.**
+- **H-2.** **Known:** mxu.md §9, last open item, and the `inf_mem_always` note in `mxu_mutants.py`. status.md does not mention
+  it. This part confirms the proposed remedy (a delayed `acc_done`) and that the RTL is correct under it.
+- **H-3.** Not mentioned. acc.md §5 and mxu.md §5 state "exactly" as the contract. **Not known.**
+- **Observations.** mxu.md §4.4 already records the one cycle of slack of the same-instruction gap ("one cycle of slack"). The
+  redundant `free_g` clear is not mentioned and costs nothing.
