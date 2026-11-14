@@ -3,8 +3,9 @@
 Part **S** (below) reviews the spec. Part **R** ([further down](#part-r-bit-exact-semantics-against-an-independent-oracle-commit-2cc2d4b))
 reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle. Part **I**
 ([further down](#part-i-implementability-of-the-rtl-commit-db5464f)) reviews the RTL of commit db5464f for synthesis and structure.
-Part **H** ([at the end](#part-h-control-hazards-and-stalls-commit-517ed44)) reviews the control of commit 517ed44 under random
-stalls, delays and faults.
+Part **H** ([further down](#part-h-control-hazards-and-stalls-commit-517ed44)) reviews the control of commit 517ed44 under random
+stalls, delays and faults. Part **T** ([at the end](#part-t-quality-of-the-mxu-tests-commit-4b87648)) reviews the author's tests
+(`tb_mxu_array`, `tb_mxu`, `gen_mxu_vectors.py`, the vector lock) with the reviewer's own mutants.
 
 Scope of this part (**S**): `docs/spec/mxu.md` against the frozen architecture: microarch.md §2.2 and §5, numerics.md N-3 / N-5 /
 N-8, arith.md "Integration contract" items 1-5, isa.md §3-5 (and §8, which (a) needs), isa_ref.md `MXU_MM`, memmap.md §4. No RTL was
@@ -1255,3 +1256,437 @@ Reproduce (each under `scripts/memrun`, one at a time):
 - **H-3.** Not mentioned. acc.md §5 and mxu.md §5 state "exactly" as the contract. **Not known.**
 - **Observations.** mxu.md §4.4 already records the one cycle of slack of the same-instruction gap ("one cycle of slack"). The
   redundant `free_g` clear is not mentioned and costs nothing.
+
+## Part T: quality of the MXU tests (commit 4b87648)
+
+Scope: the author's tests, not the RTL. `tb/unit/tb_mxu_array.sv`, `tb/unit/tb_mxu.sv`, `scripts/gen_mxu_vectors.py` and the
+vector lock (`scripts/mxu_lock.py`, `scripts/mxu_vectors.lock`), as `make unit` runs them. The question is which behaviours a wrong
+RTL can still pass.
+- I wrote 67 one-change mutants of `rtl/core/mxu*.sv` without reading the author's mutant list (I saw only the first ten lines of
+  `mxu_mutants.py`).
+- I wrote each prediction (kill / survive / equivalent) before the run.
+- I read `docs/reports/status.md` and the rest of `mxu_mutants.py` only after the findings below were written; the comparison is
+  at the end.
+- No checker of mine imports `arith_ref.py` or reuses `gen_mxu_vectors.py`. No file of the author was changed.
+
+Labels and severities are as in part S. Here **H/M/L** rate what the gap lets through: M = a wrong result, a hang or a contract
+violation could ship unseen.
+
+### Summary
+
+**`make unit` kills 36 of 67 mutants; 31 survive.** Of the survivors:
+- **20 are real defects that `make unit` misses.** 17 were confirmed by an independent run that kills them; 2 by construction
+  against the spec; 1 is suspected.
+- **1 is a 7 % slowdown.**
+- **1 is a throttle that never binds below DIM 64** (H-1).
+- **9 are equivalent at every output.**
+
+`tb_mxu_array` is strong: it killed the one array mutant that was not equivalent within 18 s. The gaps are in `tb_mxu` and its
+vectors:
+- every legality check is tested only away from its boundary;
+- one configuration of `SPM_LAT` / `CS_DEPTH`;
+- a 128 KiB SPM and 256 ACC rows;
+- semaphore values of at most 5 / 3;
+- a whole-run OR of the flags;
+- completion not timed against `acc_done`.
+
+The vector lock works as claimed, but it locks a fault file that no testbench runs, and one case in that file is wrong.
+
+| # | Sev | Topic | Status |
+|---|---|---|---|
+| T-1 | M | `mxu_fault_16.hex` is generated and locked but never run. Case 49 of it expects a `RANGE` fault for a legal instruction | confirmed (run) |
+| T-2 | M | Every legality check is tested only away from its boundary. 7 decoder mutants survive: `>=` at the A / W / rowscale / ACC end, floor(N / DIM) in the ACC check, BF16 A extent in elements, unsigned semaphore wait | confirmed (directed run on `mxu_dec`, and the random environment for two of them) |
+| T-3 | M | No `K = n·KTILE + 1`: a ceiling off by one drops the last one-element K pass | confirmed (random environment: 197 of 232 rows) |
+| T-4 | M | The M-22 boundary gap is tested only for a previous `M` of 1, 2 or `>= ACC_LAT + 1`. A gap one cycle short for `M = 3` survives | confirmed (random environment: row updated 7 cycles apart, `ACC_LAT` 8) |
+| T-5 | M | Completion is not checked against `acc_done`. The header claims the check; its variables are declared and unused | confirmed (random environment: `sem_inc` 8 cycles before the write is visible) |
+| T-6 | M | One configuration only: `SPM_LAT` 2, `CS_DEPTH` 4; the cs FIFO is never full; DIM 32 is one M = 1 instruction, DIM 64 none | confirmed (random environment kills `SPM_LAT` and `CS_DEPTH` mutants) |
+| T-7 | M | 128 KiB SPM and 256 ACC rows: address bits 17-21 and `acc_row` bits 8-10 are never non-zero | confirmed (random environment, 256 KiB / 512 rows) |
+| T-8 | M | Flags: one OR over the whole run, expected value NANIN only. Timing, pulse shape, column mask and INV / OVF are unchecked at the MXU port | confirmed by construction (late, sticky); suspected (column mask) |
+| T-9 | L | Semaphores: `sinc <= 3`, `ssem <= 5`, no wrap | confirmed (random environment; directed run for the wrap) |
+| T-10 | L | Performance is bounded only at DIM 32, M = 1, 26 cycles against 21.5 measured. The printed cycle counts are not compared | confirmed (+7.2 % cycles at DIM 8 passes) |
+| T-11 | L | Nothing checks that a requested lane lies in its operand's extent: lanes past K are over-read unseen | confirmed (mutants equivalent at the ACC); impact suspected |
+| T-12 | L | Vector lock: sound. Two weak spots: a deleted file is not regenerated, and without the lock a short `exp.hex` silently drops the ordering check | confirmed |
+
+### Method
+
+Scripts are in `scripts/mxu_review/` and outputs in `build/mxu_review_tq/`. Logs are `logs/tq_*`. Heavy runs went under
+`scripts/memrun`. The mutant run used 5 + 3 parallel workers at the user's request, each with its own `BUILD` copy; peak 1.54 GB
+per worker, 0.88 GB per `vvp`.
+
+**Mutants: `tq_mutants.py`.**
+- **Copy:** each mutant is a copy of `rtl/` with `core` copied and `arith` / `common` symlinked, and one textual change (`old`
+  must occur exactly once; `check` mode).
+- **Compile:** all 67 copies compile with `tb_mxu` (`compile` mode). A compile failure would be reported as such, never as a kill.
+- **Judge:** the real recipe,
+  `make unit RTL_DIR=<copy>/rtl UNIT_TB="tb/unit/tb_mxu_array.sv tb/unit/tb_mxu.sv" BUILD=<worker copy>`. That includes the
+  vector locks, the compile inside `build/mxu`, the grep for `PASS` and the grep for vector-file warnings. Only these two
+  testbenches read `rtl/core`.
+- **Baseline:** the unmutated copy passes in 183 s.
+- **Results:** `build/mxu_review_tq/results_uniq.tsv`, with a `make_unit.log` per mutant.
+
+**Independent confirmation of the survivors.** A survivor proves a test gap, not a defect, so each survivor was run against
+checks that do not share the author's code.
+- **Random environment** (`tq_hz.sh`): part H's `hz_run.py`, independent of `arith_ref.py` and `gen_mxu_vectors.py`.
+  - Configurations: 6 (DIM 8 / 16, `SPM_LAT` 1-5, `ACC_LAT` 1-13, `CS_DEPTH` 2-4), 6 seeds each.
+  - Sizes: 256 KiB SPM, 256 / 512 ACC rows.
+  - `acc_done` comes `ACC_LAT + 0..400` cycles after the last row.
+  - Exact data, so it checks completion order and time, ACC spacing, rows and values, but not flags.
+  - Wall time 1,908 s.
+  - Its checker crashed on an ACC row past `ACC_ROWS` instead of reporting it. Fixed: `run_one` now reports such a stream as a
+    failure. The one affected mutant was re-run (`logs/tq_hz_ntfloor.log`).
+- **Directed decoder test** (`tq_dec_dir.sv`, `tq_dec_dir.sh`): seven edge cases on `mxu_dec` alone, with expected results written
+  by hand from mxu.md §4.1. The unmutated decoder passes all seven.
+- **Fault file DIM 16** (`tq_fault16.sv`): the author's `mxu_fault_tc` instantiated on `mxu_fault_16.hex`.
+- **Lock experiments** (`tq_lock.sh`, `logs/tq_lock.log`): missing, short, long, edited and consistently-edited files, on copies
+  of `build/`. A second part runs `vvp` directly, to see what the testbench catches without the lock.
+
+### Mutant results
+
+Killed (36): 9 decode, 7 address, 3 tail, 5 packer, 6 buffer, 5 exit, 1 array.
+
+| Area | Mutants killed |
+|---|---|
+| decode | `dec_cs_range_ge` (by the S-10 case), `dec_csp_floor`, `dec_wait_strict`, `dec_rs_only_resc`, `dec_w3_check`, `dec_m_tdonly`, `dec_kw_trans`, `dec_a_pitch_w`, `dec_flag_wrap` |
+| address | `ag_accrow_jdim`, `ag_cs_row_t`, `ag_cs_shift_tiny`, `ag_nontrans_idx`, `ag_bf16_half`, `ag_trans_g`, `ag_wbase_t` |
+| tail | `tm_a_kb_le`, `tm_w_k_nontrans`, `tm_ncols_full` |
+| packer | `pk_trans_nbytes_le`, `pk_trans_order`, `pk_bf16_lo`, `pk_fp8_col`, `pk_bf16_q` |
+| buffer | `bf_free_noclear`, `bf_free_any_buf`, `bf_free_every_beat`, `bf_one_buffer`, `bf_tok_overwrite`, `bf_swap_buf0` |
+| exit | `ex_ovw_all_t`, `ex_last_every_pass`, `ex_cs_pop_lasti`, `ex_rs_lastp`, `ex_zinc_head` |
+| array | `ar_flag_stage` (`tb_mxu_array`, 18 s) |
+
+Notes on the kills:
+- **Only one instance catches some of them.** `ag_cs_shift_tiny` and `ag_nontrans_idx` are wrong only at DIM 16 and are killed
+  only by the DIM 16 instances. `bf_one_buffer` (one shadow buffer: correct but slow) is killed only by the DIM 32 period bound
+  (43 > 26).
+- **One kill is indirect.** `ex_last_every_pass` (`acc_last` on the last row of every pass) gives extra `acc_done` pulses. They
+  retire the in-flight FIFO early, `tb_mxu`'s end condition (`tb_mxu.sv:341`: semaphores at their final value and
+  `inf_cnt == 0`) is met before the last passes have reached the ACC, and the final ACC compare fails. No check looks at
+  `acc_last` or at the number of `acc_done` pulses.
+
+Survivors (31), each with its one-line reason. "Killed by hz" / "killed by directed" name the independent check that shows the
+mutant is a real defect.
+
+| Mutant | Change | Reason it survives `make unit` | Independent check |
+|---|---|---|---|
+| `dec_acc_ge` | ACC `RANGE` uses `>=` | no legal instruction ends exactly at `ACC_ROWS` (T-2) | killed by hz (legal instruction faulted) and directed |
+| `dec_a_range_ge` | A extent `>=` | no legal A ends at the SPM end (T-2) | killed by directed |
+| `dec_w_range_ge` | W extent `>=` | no legal W ends at the SPM end (T-2) | killed by directed |
+| `dec_rs_range_ge` | rowscale extent `>=` | no legal rowscale ends at the SPM end (T-2) | killed by directed |
+| `dec_nt_floor` | ACC check with `floor(N / DIM)` | the NT·M fault cases run only at DIM 8, with N a multiple of 8 (T-1, T-2) | killed by hz (ACC row 256 written, `ACC_ROWS` 256) and directed |
+| `dec_ka_bf16` | BF16 A extent counted in elements | every `RANGE` fault case is FP8 (T-2) | killed by directed (BF16 A overruns the SPM, no fault) |
+| `dec_wait_unsigned` | semaphore wait compares unsigned | no semaphore wraps (T-9) | killed by directed (`sem` 2 vs `wval` 2^32 - 2: never starts) |
+| `dec_kt_ceil` | `4·DIM - 1` -> `4·DIM - 2` in the K tile count | no K with `K mod 4·DIM == 1` (T-3) | killed by hz (197 of 232 rows) |
+| `ag_a_addr_17b` | A start address cut to 17 bits | SPM of 128 KiB (T-7) | killed by hz (256 KiB SPM) |
+| `ag_accrow_8b` | ACC row counter wraps at 256 | 256 ACC rows (T-7) | killed by hz at DIM 16 (row 369 went to 113) |
+| `bf_cs_full_off` | column-scale FIFO full check removed | `CS_DEPTH` 4 is never filled (T-6) | killed by hz (`CS_DEPTH` 2 / 3: a pass gets another pass's scales) |
+| `bf_inf_room_off` | in-flight FIFO full check removed | `acc_done` is never late in `tb_mxu` (T-6, H-2) | killed by hz (wrong `sem_inc` sequence) |
+| `bf_spm_lat_hard` | scale tag latency fixed to 2 | `SPM_LAT` is 2 in every instance (T-6) | killed by hz (`SPM_LAT` 1 / 3 / 5) |
+| `ex_pop_at_last_row` | `sem_inc` at the `acc_last` row, not at `acc_done` | completion time not checked (T-5) | killed by hz (`sem_inc` at 118, write visible at 126) |
+| `ex_sem_amt3` | bit 3 of `sinc` dropped | every `sinc` is <= 3 (T-9) | killed by hz |
+| `ex_sem_idx5` | bit 5 of `ssem` dropped | every `ssem` is <= 5 (T-9) | killed by hz |
+| `ex_gap_x_m4` | boundary gap `ACC_LAT - 3` after an `M = 3` instruction | no `M` in 3 .. `ACC_LAT` before an overlapping instruction (T-4) | killed by hz (row 86 updated 7 cycles apart, `ACC_LAT` 8) |
+| `ex_flags_late` | `fp_flags` 32 cycles late | whole-run OR (T-8) | by construction: the flags of an instruction's last row come after its `sem_inc` (mxu.md §3: "out no later than its row") |
+| `ex_flags_sticky` | `fp_flags` sticky | whole-run OR (T-8) | by construction: microarch.md:727 says "pulse"; after software clears `FP_STATUS` (write 1 to clear) the MXU sets it again every cycle |
+| `ex_flags_nomask` | no column mask on the flags at the `mxu` level | whole-run OR, and no Inf in any `tb_mxu` operand (T-8) | suspected: a BF16 A with Inf against the zeroed dead columns gives INV (microarch.md:727: "columns < N only"); not reproduced |
+| `ex_gap_plus1` | one idle cycle more per pass | performance bounded only at DIM 32 (T-10) | measured from the `make unit` logs: DIM 8 1,542 -> 1,653 cycles (+7.2 %), DIM 16 +0.2 %, DIM 32 unchanged |
+| `bf_rs_res_off` | rowscale reservation limit removed | the limit never binds at DIM 8-32 (H-1) | survives hz too; not a defect below DIM 64 |
+| `tm_a_lane_extra` | an A lane past the tile's K is requested | data masked; requests not checked against the extents (T-11) | equivalent at the outputs (hz too) |
+| `tm_w_lane_k_trans` | trans W lanes of groups past K requested | data zeroed by `nbytes`; same (T-11) | equivalent at the outputs (hz too) |
+| `pk_trans_lanev` | packer ignores `lane_v` (trans) | only dead columns (`>= N`) change; the ACC writes `< ncols` and the array masks their flags | equivalent |
+| `pk_fp8_ncols` | packer does not zero columns `>= N` (FP8 non-trans) | same | equivalent (author: `ncols_pack`) |
+| `pk_bf16_ncols` | same, BF16 non-trans | same; also, BF16 non-trans never has an N tail in `tb_mxu` | equivalent |
+| `tm_tkb_ge` | `>` -> `>=` in the `t_kb` clamp | both branches give KB | equivalent |
+| `ex_gap_x_m3` | boundary gap from `M >= 3` | for `M = 2` the old gap `ACC_LAT - 2` equals `GAP_X` | equivalent |
+| `ar_a_nozero` | invalid waves not zeroed | their outputs and flags are masked by the valid chain | equivalent |
+| `ar_swap_prio` | buffer 1 swap has priority | the two swap chains never pulse in the same row and cycle | equivalent |
+
+Two of my predictions were wrong. `ex_last_every_pass` was killed, though indirectly (above). `ex_gap_x_m4` survived, which is T-4.
+
+### T-1 (M, confirmed) `mxu_fault_16.hex` is never run, and case 49 of it is wrong
+
+**What happens:**
+- `gen_mxu_vectors.py:660` writes the fault vectors for DIM 8 and 16, and `scripts/mxu_vectors.lock` locks both files.
+- `tb_mxu` instantiates `mxu_fault_tc` only with DIM 8 and `mxu_fault_8.hex` (`tb_mxu.sv:478`, `:484`).
+
+So the decoder's fault priority, causes and `FAULT_ADDR` are checked only at DIM 8. The DIM-dependent parts of the decoder are
+`vNT` and `vKT` (shifts by `LD`), `NTW` and the extents; at DIM 16 they are reached only through legal instructions.
+
+**Running the file** (`tq_fault16.sv`, the author's own `mxu_fault_tc`):
+- DIM 8 passes.
+- DIM 16 fails case 49: `fault case 49: valid 0 cause 0 expected 7` and `33 SPM / ACC / semaphore actions`.
+
+Case 49 is `gen_mxu_vectors.py:590`, `add(RANGE, (ACCR - 9) | B63, acc=ACCR - 9, w_over=dict(n1=40))`. Its comment says "5 N tiles
+at DIM 8, 3 at DIM 16". At DIM 16, `247 + 3·2 = 253 <= 256` is legal, and the RTL is right to run it. The expectation is wrong, and
+nobody sees it because the file is never simulated.
+
+**Proposal:**
+- Instantiate `mxu_fault_tc` for DIM 16 in `tb_mxu` (a second `tf` instance, `mxu_fault_16.hex`).
+- Make case 49 a fault at every DIM: `N = 4·DIM + DIM/2` (`NT = 5`, not a multiple of DIM, which also kills `dec_nt_floor`) and
+  `acc = ACCR - 5·M + 1`.
+- Regenerate, then `--lock`.
+
+### T-2 (M, confirmed) Every legality check is tested only away from its boundary
+
+**Measured:**
+- Seven one-character changes of the checks survive `make unit` (table above).
+- Each one is killed by a directed case of `tq_dec_dir.sv` that a legal or illegal instruction of the right shape triggers.
+- All seven cases pass on the unmutated `mxu_dec` (`scripts/mxu_review/tq_dec_dir.sh`, seconds).
+
+| Case | Instruction | Expected (mxu.md §4.1) | Mutant result |
+|---|---|---|---|
+| `a_at_end` | FP8 K = 64, M = 1, `R[a] = SPM - 64` | ok (extent ends at the end) | `dec_a_range_ge`: `RANGE` at `0x1ffc0` |
+| `w_at_end` | 8 W rows of 64 B from `SPM - 512` | ok | `dec_w_range_ge`: `RANGE` |
+| `rs_at_end` | RESCALE, M = 16, `R[rs] = SPM - 64` | ok | `dec_rs_range_ge`: `RANGE` |
+| `acc_at_end` | M = 8, N = 8, `R[acc] = 248` | ok (rows 248-255) | `dec_acc_ge`: `RANGE` `0x80000000000000f8` |
+| `bf16_a_over` | BF16 K = 64 (128 B), `R[a] = SPM - 64` | `RANGE` at `SPM - 64` | `dec_ka_bf16`: ok (the A overrun runs) |
+| `nt_ragged` | N = 36 (`NT` 5), M = 2, `R[acc] = 247` | `RANGE` | `dec_nt_floor`: ok (writes ACC row 256) |
+| `wait_wrap` | `wsem` 1, `wval = 2^32 - 2`, `sem = 2` | taken (serial-number compare) | `dec_wait_unsigned`: never taken |
+
+**Why `tb_mxu` misses them:**
+- The fault cases are all FP8.
+- The legal instructions' extents never end at a boundary. The one exception is S-10's column scales, which is why
+  `dec_cs_range_ge` is killed.
+- The NT·M fault cases use `N` a multiple of DIM.
+
+**Proposal:** add the seven cases above to the fault list (the "ok" ones as legal instructions in `build_top`, or a "legal" mode of
+`mxu_fault_tc` that expects a context and no fault), at DIM 8 and 16.
+
+### T-3 (M, confirmed) No K with a one-element last K pass
+
+**Measured:** `dec_kt_ceil` (`mxu_dec.sv:144`, `4·DIM - 1` -> `4·DIM - 2`) computes `KT` one too small when `K mod 4·DIM == 1`, and
+silently drops the last pass. The random environment kills it ("only 197 of 232 ACC rows").
+
+**Why `tb_mxu` misses it:** its K values are 4D, 5D+1, 4D+5, 8D, 10, 200, 256+6D+3 (FP8) and D+1, 2D, 131, 128+2D+5 (BF16). None is
+`n·KTILE + 1`. The BF16 ceiling has the same gap.
+
+**Proposal:** one FP8 and one BF16 instruction with `K = KTILE + 1` (and one with `K = 1`).
+
+### T-4 (M, confirmed) The M-22 boundary gap is tested for only some previous `M`
+
+**Measured:** `ex_gap_x_m4` (`mxu.sv:475`, `s_Mrows >= 2` -> `>= 4`) gives an `M = 3` instruction the old gap `ACC_LAT - 3`. The next
+instruction's row 0 can then land on its last row 7 cycles later. The random environment kills it: "ACC row 86 updated at 4933 and
+4940 (< `ACC_LAT` 8)".
+
+**Why `tb_mxu` misses it:**
+- The R-1 chains (`gen_mxu_vectors.py:464-473`) put an overlapping instruction behind previous instructions with `M` = 1, 2, and
+  `M` >= `D + 1` (>= 9).
+- For `M` = 1 and 2 the old and new gaps agree.
+- An `M` in 3 .. `ACC_LAT - 1` before an overlapping instruction is not there, and that is exactly the range the M-22 change
+  affects at `ACC_LAT` 8. At `ACC_LAT` 24 (`t8s`) the untested range is 3 .. 23.
+- The author's `bmc_d` (`M <= 3`) would see it, but it is not part of `make unit`.
+
+**Proposal:** add to the R-1 groups an `M = 3` (and an `M = ACC_LAT - 1`) instruction followed by `M = 1` on its last row.
+
+### T-5 (M, confirmed) Completion is not checked against `acc_done`
+
+**The claim:** `tb_mxu.sv:15` lists "sem_inc only after acc_done" among the checks, and `:112-113` declare `last_done_cnt` and
+`pending_done` ("acc_done pulses issued and not yet matched by a sem_inc"). Neither is used. The checks that exist are the final
+semaphore values and one ordering pair (`:361`).
+
+**Measured:** `ex_pop_at_last_row` (`mxu.sv:133`: pop on `acc_valid && acc_last` instead of `acc_done`) passes `make unit`. It
+completes every instruction before its last write is visible: hz, "sem_inc of instruction 1 at 118, a write is visible only at
+126". isa.md §3 defines the MXU's completion as "ACC written".
+
+**A side note on the testbench's ACC model:** `tb_mxu.sv:266` sends `acc_done` 5 cycles after the last row, whatever `ACC_LAT` (8
+or 24). The contract (mxu.md §5) is "exactly `ACC_LAT`". So `tb_mxu` drives `acc_done` earlier than any legal `core/acc`. This is
+harmless for the MXU, but it means no instance runs with the contract's timing. Part H's H-2 text ("exactly `ACC_LAT` after the
+last row") describes the model wrongly; the author's §9 note ("5 cycles") is right.
+
+**Proposal:** implement the declared check: count `acc_done` pulses, and fail on a `sem_inc` of an instruction with rows that is
+not matched by an earlier pulse. Give `acc_done` the delay `ACC_LAT` (plus a random extra in one instance, which also closes H-2).
+
+### T-6 (M, confirmed) One configuration of the parameters; two FIFO-full paths never taken
+
+**Measured:**
+- Every `tb_mxu` instance has `SPM_LAT` 2 and `CS_DEPTH` 4.
+- `bf_spm_lat_hard` (`mxu.sv:178`, `s_tag[SPM_LAT-1]` -> `s_tag[1]`) survives; it is equivalent at 2. The random environment kills
+  it at `SPM_LAT` 1 / 3 / 5 (wrong column scales).
+- `bf_cs_full_off` (`mxu.sv:331`, the cs FIFO full check removed) survives. With `CS_DEPTH` 2 / 3 the random environment kills it
+  (a pass is scaled with another pass's scales); with `CS_DEPTH` 4 no `tb_mxu` program fills the FIFO.
+- `bf_inf_room_off` survives as well. It is part H's H-2: the in-flight FIFO is never full without a late `acc_done`.
+- DIM 32 runs one `M = 1`, FP8, trans instruction, with no column scales, no rescale and no non-trans W. DIM 64 (FULL, the product
+  configuration) is not simulated by `make unit`.
+
+So an RTL whose control is right only at the tested values passes. Two places where that is likely: a tag pipeline hard-coded to
+the default latency, and a full flag sized wrong.
+
+**Proposal:**
+- Add `tb_mxu` instances with `SPM_LAT` 1 and 3 and `CS_DEPTH` 2. The same vectors serve.
+- Add a few non-trans / BF16 / column-scale instructions to the DIM 32 set.
+- Run DIM 64 in Verilator (part H: Icarus is impractical there).
+
+### T-7 (M, confirmed) The testbench SPM and ACC are too small to reach the high address and row bits
+
+**The sizes:** `gen_mxu_vectors.py:40` makes the SPM 128 KiB (64 KiB at DIM 32), and `:332` gives the ACC 256 rows. The RTL's lane
+addresses are 22 bits (4 MiB SPM) and `acc_row` is 11 bits (2,048 rows).
+
+**Measured:**
+- `ag_a_addr_17b` (`mxu.sv:462`, A address cut to 17 bits) survives `make unit` and is killed by hz's 256 KiB SPM.
+- `ag_accrow_8b` (`mxu.sv:470`, the row counter wraps at 256) survives and is killed by hz at DIM 16 with 512 rows ("row 369" sent
+  as 113).
+
+In `make unit`, bits 17-21 of every SPM address and bits 8-10 of `acc_row` are never non-zero. Part H's DIM 32 runs reached
+SPM bit 18 and row bit 9. Bits 19-21 and row bit 10 are reached by no simulation of either reviewer, except stub-PE runs at DIM 64.
+
+**Proposal:** run one `tb_mxu` instance with a sparse SPM model (an associative array, or a few windows at high addresses) and
+`ACC_ROWS` 2048, with operands placed above 2 MiB and ACC bases above 1024.
+
+### T-8 (M; late and sticky confirmed by construction, column mask suspected) The flags are checked as one OR over the run
+
+**What `tb_mxu` checks:**
+- `tb_mxu.sv:356` compares `flags_or`, the OR of `fp_flags` over the whole run, with `exp.hex`.
+- The expected value is `8` (NANIN only) at DIM 8 and 16, and `0` at DIM 32 (`build/mxu/mxu_*_exp.hex`).
+- One instruction (case 7, FP8 specials) produces it.
+- At the `mxu` port nothing checks when a flag comes, that it is a pulse, which instruction it belongs to, the column mask, or INV
+  and OVF.
+
+**Surviving mutants:**
+- `ex_flags_late` (`mxu.sv:556`, delayed 32 cycles): its flags arrive after the instruction's `sem_inc` (5 cycles after the last
+  row here, `ACC_LAT` with a real ACC). Software that waits on the semaphore and reads `FP_STATUS` misses them. mxu.md §3 says all
+  flags of a wave are out no later than its row.
+- `ex_flags_sticky`: microarch.md:727 defines the port as a "pulse, valid-qualified". `FP_STATUS` is write-1-to-clear
+  (microarch.md:697), so a sticky MXU output re-sets it after every clear.
+- `ex_flags_nomask`: the `mxu` passes all columns to the array's flag mask. A BF16 A element of Inf meets the zeroed W of a
+  column >= N and raises INV, which microarch.md:727 ("columns < N only") forbids. Not reproduced: `tb_mxu` has no BF16 Inf
+  operand and its OR already contains NANIN.
+
+`tb_mxu_array` checks flags exactly, every cycle (it killed `ar_flag_stage` at once), so the array is covered. The gap is the
+`mxu` wiring and the instruction-level contract.
+
+**Proposal:**
+- Record `fp_flags` per cycle in `tb_mxu`, and expect per instruction: the OR of its rows' flags, all out no later than its
+  `sem_inc`, and 0 in every cycle with no flagged wave.
+- The generator already computes per-row flags (`chain`); export them per instruction.
+- Add one BF16 instruction with Inf and NaN in A and an N tail, so that INV / OVF and the column mask appear at the top level.
+
+### T-9 (L, confirmed) Semaphore fields and the wait compare are tested on small values only
+
+**The values:** `exp.hex` gives final semaphores 1, 3, 1, 3, 3. The largest `sinc` is 3 (`gen_mxu_vectors.py:447`) and the largest
+`ssem` is 5; no value wraps.
+
+**Measured:**
+- `ex_sem_amt3` (bit 3 of `sinc` dropped) and `ex_sem_idx5` (bit 5 of `ssem` dropped) survive `make unit`; hz kills both (it uses
+  the full ranges).
+- `dec_wait_unsigned` (`mxu_dec.sv:64`, unsigned compare) survives everywhere except the directed `wait_wrap` case.
+- The serial-number compare of mxu.md §5, `(int32)(val - wval) >= 0`, exists exactly for the wrap.
+
+**Proposal:** `sinc` 8-15, `ssem` 32-63, and one wait across `2^32` (preload the semaphore in the testbench).
+
+### T-10 (L, confirmed) Performance is checked at one point with a loose bound
+
+**What is checked:** `MAX_PERIOD` is set only for the DIM 32 instance (26 cycles, against 21.5 measured, mxu.md §7). Every instance
+prints `<rows> ACC rows in <cycles> cycles` (`tb_mxu.sv:365`), and nothing compares that number.
+
+**Measured:**
+- `ex_gap_plus1` (one idle cycle per pass) passes: DIM 8 takes 1,653 cycles instead of 1,542 (+7.2 %), DIM 16 +0.2 %, DIM 32
+  unchanged at 162.
+- `bf_one_buffer` (one shadow buffer, the design before M-9) is killed only by the DIM 32 bound.
+
+**Proposal:** record the cycle count of the deterministic instances (no stalls) in `exp.hex`, and fail on more than a few percent.
+Alternatively, give DIM 8 / 16 `MAX_PERIOD` cases at the measured 13-cycle period (§7) with a one-cycle margin.
+
+### T-11 (L; gap confirmed, impact suspected) Requested lanes are not checked against the operand extents
+
+**What is checked:** `tb_mxu.sv:244-252` checks that each requested lane is aligned and inside the SPM.
+
+**Measured:** `tm_a_lane_extra` (`mxu.sv:426`, an A lane past the tile's K) and `tm_w_lane_k_trans` (`mxu.sv:225`, trans W lanes of
+groups past K) survive `make unit` and hz. Their data are masked, so they are equivalent at the ACC.
+
+**Why it matters:** mxu.md §4.1 (S-10) makes `RANGE` a check on operand extents. Its argument that over-reads are harmless rests on
+the MXU reading past an extent only inside the 64 B granule of the extent, except two listed windows. These mutants break that
+argument (a lane at a 64 B boundary past the last A row can lie past the end of the SPM), and no check sees it. The packer's
+N-tail zeroing (`pk_*_ncols`, `pk_trans_lanev`) is likewise invisible: dead columns are dropped by the ACC's `ncols` and by the
+array's column mask, so it is redundant.
+
+**Proposal:** in `tb_mxu`, check every granted lane against the 64 B granules of the current instruction's operands, plus the two
+exceptions of §4.1 (the generator knows the operands).
+
+### T-12 (L, confirmed) The vector lock: sound, two weak spots
+
+The prompt for this part assumed `mxu-vec` has no lock. It has one since part I (`scripts/mxu_lock.py`, `scripts/mxu_vectors.lock`,
+checked by `make mxu-vec` and so by `make unit`).
+
+**Lock experiments** (`tq_lock.sh`, on copies of `build/`):
+
+| Case | `make unit` |
+|---|---|
+| unchanged copy | PASS |
+| `mxu_8_exp.hex` deleted | FAIL (`mxu_8_exp.hex: missing`) |
+| last row of `mxu_8_spm.hex` removed | FAIL (rows 131071 vs 131072) |
+| one row appended to `mxu_array_8.hex` | FAIL (rows 189 vs 188) |
+| one digit of `mxu_8_acc1.hex` changed | FAIL (sha differs) |
+| `prog.hex` and `counts.svh` shortened consistently | FAIL (`counts.svh` differs) |
+| generator newer than the stamp, output unchanged | PASS (regenerated, matches) |
+
+**The two weak spots:**
+- **A deleted file is not regenerated.** `make mxu-vec` fails again, and its message says "run make mxu-vec". `arith-vec` has a
+  `--check` step that regenerates missing outputs; `mxu-vec` does not. Only `rm build/mxu/.stamp` recovers. This is a usability
+  problem, not a hole.
+- **Without the lock, the testbench alone is weaker.** Running `vvp` directly (as review scripts do):
+  - a missing file fails, through X values;
+  - a short `acc1` fails;
+  - a short or long `exp.hex` passes, because the ordering pair becomes X and the check at `tb_mxu.sv:361` is skipped; only
+    `make unit`'s grep for "Not enough words" / "Too many words" catches it;
+  - a row with fewer hex digits but the same row count is padded with zeros silently. Here the `prog` row was caught by its
+    effect; nothing checks the width of a row.
+  
+  So the lock, plus the grep, is the guard. The testbench has no row checks of its own, unlike the arith testbenches.
+
+**What the lock cannot do:** it binds `build/mxu` to what the generator produced when the lock was written. It does not judge
+whether that output is right, so it faithfully locks the wrong case 49 of T-1.
+
+**Proposal:**
+- Give `mxu-vec` the `--check` / regenerate step of `arith-vec`.
+- Have `tb_mxu` check `$readmemh` row counts itself (fill with a sentinel and test the last row), as the arith testbenches do.
+- Lock only files that a testbench reads, or run every locked file (T-1).
+
+### Not covered
+
+- Array mutants that matter only at DIM 32 / 64. Outside the single DIM 32 instruction, only `make lint` elaborates those
+  arrays.
+- The author's formal tasks and miter. They are not part of `make unit` and were not run here. Several survivors above
+  (`ex_gap_x_m4`, `dec_nt_floor`, `dec_ka_bf16`) have counterparts there (below).
+- The flag survivors in simulation: hz uses exact data and expects `fp_flags = 0`.
+
+Reproduce (each under `scripts/memrun`):
+- `python3 scripts/mxu_review/tq_mutants.py run --jobs 5`: about 50 min with 5 + 3 workers; about 3.5 h serially.
+- `scripts/mxu_review/tq_hz.sh`: 32 min.
+- `scripts/mxu_review/tq_dec_dir.sh`: seconds.
+- `scripts/mxu_review/tq_lock.sh`: 7 min.
+- `tq_fault16.sv`: compile with `tb/unit/tb_mxu.sv` in `build/mxu`, top `tq_fault16`; 3 s.
+
+### Comparison with status.md and the author's mutants (read after the above)
+
+- **T-1.** status.md (MXU results, 2026-11-08) and mxu.md §6 report "72 illegal instructions". That count is DIM 8 only. Neither
+  says that the DIM 16 file exists unrun, and the wrong case 49 is not known. **Not known.**
+- **T-2.** **Partly known.**
+  - mxu.md §9 records that "`tb_mxu` does not reach the extent aliasing cases of the decoder" (mutants `range_a_m0`,
+    `range_acc_wrap`, caught by the miter against 0255c28).
+  - The author's set has miter mutants close to two of mine: `dec_nt_floor` (the loop's `vNT` rounded down, not only the check),
+    and `dec_a_bytes` ≈ my `dec_ka_bf16`. They are judged by the miter, a comparison with an older decoder that was itself checked
+    only by `tb_mxu`, and not by `make unit`.
+  - The author's range mutants remove a check entirely (`range_w`, `range_rs`, `range_a_zero`, killed). None moves a comparator
+    onto its boundary, and no "ok at the boundary" case exists. The boundary gap (`>=`) and the unsigned wait are **not known**.
+- **T-3.** Not known; the author's `fold_tiles` / `dec_kt_shift` change the rounding grossly and are killed or mitered.
+- **T-4.** **Known as a formal-only check.** The author's `gap_x_off` / `gap_x_short` are killed by `tb_mxu` and by `bmc_d`; an `M`
+  between 3 and `ACC_LAT - 1` is not among the R-1 vectors, and status.md does not mention that range.
+- **T-5.** Not known.
+  - mxu.md §6 lists `tb_mxu`'s checks correctly (final semaphore values, order of the first increments).
+  - Only the `tb_mxu` header (`:15`) claims "sem_inc only after acc_done", and the variables for it are unused.
+  - The author's `spur_pop` covers only the spurious pulse (I-9).
+- **T-6.** **Partly known.**
+  - H-2 / `inf_mem_always` (mxu.md §9) covers the in-flight FIFO.
+  - H-1 covers `RS_DEPTH`.
+  - status.md lists "one 32 x 32 decode instruction" as the DIM 32 test, and mxu.md §9 says DIM 64 was simulated at `M = 1`
+    (by `mxu_perf.sh`, not `make unit`).
+  - The `SPM_LAT` / `CS_DEPTH` coverage and the never-full cs FIFO are **not known**. P5 bounds
+    `cs_cnt <= CS_DEPTH` (mxu.md §6), but the full branch is never taken in simulation.
+- **T-7, T-8, T-9, T-11.** Not mentioned. The author's `ncols_pack` (equivalent) agrees with my `pk_fp8_ncols`; we agree that the
+  packer's N zeroing is invisible.
+- **T-10.** status.md reports the periods as measured by `mxu_perf.sh`. That nothing in `make unit` holds them except the DIM 32
+  bound is not stated.
+- **T-12.** The lock is documented in CLAUDE.md, the Makefile and mxu.md §6, and it works as documented. The two weak spots are
+  not mentioned.
+- **Overlap of the mutant sets.** Of my 31 survivors, 3 have an author counterpart with the same verdict: `ncols_pack`
+  (equivalent), `inf_mem_always` (H-2), and the `RS_DEPTH` throttle (H-1, part H). 2 have a miter counterpart outside `make unit`
+  (above). The other 26 have no counterpart among the author's 106 mutants.

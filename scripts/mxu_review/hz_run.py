@@ -654,6 +654,9 @@ def check(p, path):
             timed = [list(x) for x in seg.acc0]
             pend = []
             for g in got:
+                if g['row'] >= len(timed):          # an instruction past ACC_ROWS ran (review part T: report, do not crash)
+                    errs.append(tag + 'ACC row %d at cycle %d is past ACC_ROWS %d' % (g['row'], g['c'], len(timed)))
+                    break
                 while pend and pend[0][0] <= g['c']:
                     _, rr, v = pend.pop(0)
                     timed[rr] = v
@@ -744,6 +747,16 @@ def build(cfg, rtl):
     return out
 
 
+def rows_past(p, logp):
+    """the largest ACC row of the RTL's stream and ACC_ROWS (for the message of a checker that could not index a row)"""
+    try:
+        segs = parse(logp, p.dim)[0]
+        mx = max((g['row'] for sg in segs for g in sg['A']), default=-1)
+        return 'max ACC row %d, ACC_ROWS %d' % (mx, len(p.segs[0].acc0))
+    except Exception as e:  # noqa: BLE001
+        return 'unknown (%s)' % e
+
+
 def run_one(cfg, seed, vvp, keep, rtl_tag):
     p = Prog(cfg, seed).build()
     d = os.path.join(BUILD, 'cases', rtl_tag + ('_stub' if STUB else ''), p.name)
@@ -752,7 +765,10 @@ def run_one(cfg, seed, vvp, keep, rtl_tag):
     logp = os.path.join(d, 'log.txt')
     if not os.path.exists(logp):
         return p, ['no log; vvp rc %d: %s' % (r.returncode, r.stderr[-500:])], {}
-    errs, st = check(p, logp)
+    try:
+        errs, st = check(p, logp)
+    except (IndexError, KeyError) as e:     # review part T: a stream the checker cannot index (e.g. rows past ACC_ROWS) is a failure
+        errs, st = ['checker cannot follow the RTL stream (%s: %s); rows: %s' % (type(e).__name__, e, rows_past(p, logp)), ], {}
     if not errs and not keep:
         for f in os.listdir(d):
             os.remove(os.path.join(d, f))
