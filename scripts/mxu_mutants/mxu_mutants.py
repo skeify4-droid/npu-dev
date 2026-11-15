@@ -132,10 +132,10 @@ mut("gap_cnt", X, "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8
 mut("gap_x_off", X, "if (s_last && s_Mrows >= 16'd2) gap_cnt", "if (1'b0 && s_Mrows >= 16'd2) gap_cnt", exp="formal_x", note="R-1: no boundary gap (the old rule)")
 mut("gap_x_short", X, "localparam int GAP_X = (ACC_LAT > 2) ? ACC_LAT - 2 : 0;", "localparam int GAP_X = (ACC_LAT > 3) ? ACC_LAT - 3 : 0;", exp="formal_x",
     note="R-1: the boundary gap one cycle short (ACC_LAT - 1 cycles between the worst pair of rows)")
-mut("gap_x_every_pass", X, "if (s_last && s_Mrows >= 16'd2) gap_cnt", "if (1'b1 && s_Mrows >= 16'd2) gap_cnt", exp="equiv",
-    note="the boundary gap after every pass: safe and only slower (the pass period at M = 1 is longer than ACC_LAT - 2 anyway)")
+mut("gap_x_every_pass", X, "if (s_last && s_Mrows >= 16'd2) gap_cnt", "if (1'b1 && s_Mrows >= 16'd2) gap_cnt", exp="kill",
+    note="the boundary gap after every pass: safe and only slower (the pass period at M = 1 is longer than ACC_LAT - 2 anyway). Since TR-7 killed by the cycle-count bound CHKC (t8: 2417 cycles against 2281), no longer equivalent for the tests")
 # M-23 (review R-2): an empty W beat is granted by the MXU. tb_mxu runs two instances with an SPM whose ready needs a valid lane
-mut("w_gnt_wait", X, "assign w_gnt = w_want && (w_req_ready || wl_lane_v == 8'd0);", "assign w_gnt = w_want && w_req_ready;", exp="kill",
+mut("w_gnt_wait", X, "assign w_gnt = w_want && (w_req_ready || wl_lane_v == 8'd0);", "assign w_gnt = w_want && w_req_ready;", exp="kill_full",
     note="R-2: the MXU waits for the grant of an empty beat (hangs on the ready-needs-valid SPM of tb_mxu)")
 mut("sem_head", X, "assign sem_inc_idx   = sem_inc_w[9:4];", "assign sem_inc_idx   = sem_inc_w[3:0] + 6'd0;")
 
@@ -215,6 +215,43 @@ mut("dec_acc_sum_narrow", D, "logic [NTW+RW:0] acc_sum;", "logic [NTW+RW-1:0] ac
     note="the spare top bit of the sum is never used: NT <= 8192 and M <= 2048 give at most 8192 x 2048 + 2048 < 2^26 = 2^(NTW+RW)")
 mut("dec_csp_wide", D, "logic [12:0] csp_q;", "logic [13:0] csp_q;", exp="equiv_miter", note="one bit wider than the 4096 maximum of (4 N + 63) / 64")
 mut("dec_ktf_wide", D, "logic [9:0]  vKTF; ", "logic [10:0] vKTF; ", exp="equiv_miter", note="vKTF one bit wider than its 513 maximum (cs_rm1 stays 10 bits)")
+
+# ------------------------------------------------------------------------------------------- review part TR (2026-11-15, test fixes TR-1 .. TR-8)
+# Mutants for the checks of the TR fixes (all `kill` in `tb` mode: tb_mxu with the fault files, tb_mxu's instances, `--quick` has DIM 8 and its faults).
+# TR-1: the fault files' cases just past a boundary (trans W by 32 B, BF16 W, A by 1 / 16 B, BF16 K = 129 scale rows)
+mut("trf_w_ext_norow", D, "w_ext  = 96'(r_w) + 96'(w_prod) + 96'(wk_b);", "w_ext  = 96'(r_w) + 96'(w_prod);",
+    note="TR-1: the W extent without the length of its last row (every earlier illegal W case overran by whole rows)")
+mut("trf_w_bf16_elem", D, "wk_b   = bf16 ? {w_elem, 1'b0} : {1'b0, w_elem};", "wk_b   = {1'b0, w_elem};",
+    note="TR-1: the BF16 W row counted in elements (the decoder-miter mutant dec_w_bytes is the same change, judged by a miter)")
+mut("trf_a_range_tol31", D, "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES));", "f_r_a   = !m_zero && (a_ext > 96'(SPM_BYTES) + 96'd31);",
+    note="TR-1: an A overrun of 1 .. 31 B is no fault (the smallest overrun before was 32 B)")
+mut("trf_ktf_bf16", D, "(bf16 ? 17'd127 : 17'd255)", "(bf16 ? 17'd126 : 17'd255)",
+    note="TR-1 / TR-5: BF16 scale-array rows one short at K = 128 n + 1 (K = 129 from SPM - 64)")
+# TR-2: carries of the address and row counters
+mut("trf_a_carry16", X, "s_addr <= s_addr + s_a_pitch;", "s_addr <= {s_addr[21:16], 16'(s_addr[15:0] + s_a_pitch[15:0])};",
+    note="TR-2: the A row adder drops the carry into bit 16 (the dense A operand across 0xFF40 .. 0x10124)")
+mut("trf_accrow_carry8", X, "s_accrow <= s_accrow + 11'd1;", "s_accrow <= {s_accrow[10:8], s_accrow[7:0] + 8'd1};", exp="kill_full",
+    note="TR-2: the ACC row counter drops the carry into bit 8 (sparse pass over rows 1020 .. 1027)")
+mut("trf_accbase_carry8", X, "s_accrow <= tk_acc_base + 11'(64'(tk_j) * 64'(tk_M));", "s_accrow <= {tk_acc_base[10:8], 8'(tk_acc_base[7:0] + 8'(64'(tk_j) * 64'(tk_M)))};", exp="kill_full",
+    note="TR-2: the pass start acc_base + j M drops the carry into bit 8 (sparse acc_base 1272, M = 4, pass 2 at 1280)")
+# TR-4: parameter values between the tested ones (t8r: SPM_LAT 5, CS_DEPTH 3)
+mut("trf_cs_rd_pow2", X, "if (cs_free_ev) cs_rd <= (cs_rd == $bits(cs_rd)'(CS_DEPTH - 1)) ? '0 : cs_rd + 1'b1;", "if (cs_free_ev) cs_rd <= cs_rd + 1'b1;", exp="kill_full",
+    note="TR-4: the column-scale read pointer wraps at 2^bits: equivalent at CS_DEPTH 2 and 4, wrong at 3")
+mut("trf_atag_cap4", X, "= a_tag[SPM_LAT-1];", "= a_tag[(SPM_LAT > 4) ? 3 : SPM_LAT-1];", exp="kill_full",
+    note="TR-4: the A response tag at latency 4 when SPM_LAT >= 5")
+# TR-5: DIM 32 scale rows, the 2^31 wait
+mut("trf_cs_shift32", X, "64'(c_csp) * (64'(l_t) >> CS_SHIFT)", "64'(c_csp) * (64'(l_t) >> ((DIM == 32) ? CS_SHIFT + 1 : CS_SHIFT))", exp="kill_full",
+    note="TR-5: DIM 32 uses one scale row per 4 passes (the DIM 32 case has K = 512, two fold tiles, 4 passes)")
+mut("trf_wait_signed", D, "(32'($signed(sem_rd_val - q_wval)) < 32'h8000_0000)", "($signed(sem_rd_val) >= $signed(q_wval))",
+    note="TR-5: the semaphore wait compares signed values: wrong across 2^31 (preload 0x7FFFFFFE)")
+# TR-6 / TR-7: the flag port timing and the period
+mut("trf_flags_reg1", X, "assign fp_flags      = arr_flags;", "logic [3:0] tr_fq; always_ff @(posedge clk) tr_fq <= arr_flags; assign fp_flags = tr_fq;",
+    note="TR-6: fp_flags one cycle late. Killed because mxu.md 5 now states the exact port timing (PE row i of a wave at T + i + 3), not because it breaks completion")
+mut("trf_flags_validonly", X, "assign fp_flags      = arr_flags;", "assign fp_flags      = y_valid ? arr_flags : 4'd0;",
+    note="TR-6: flags dropped in cycles without an output row (the PE-row flags of a wave come before its row leaves)")
+mut("trf_gap_plus1_m2", X, "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows);",
+    "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows) + 8'(s_Mrows > 16'd1);",
+    note="TR-7: one idle cycle more after passes with 2 <= M < ACC_LAT: +5 % cycles at t8, caught by CHKC (the M = 1 period bound does not see it)")
 
 
 def build(m):

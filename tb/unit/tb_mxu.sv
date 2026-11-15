@@ -13,11 +13,19 @@
 // the commit), the data follow exactly SPM_LAT later. +BANK=1: the three ports have banks of their own (the old S-4 model);
 // +BANK=2: the ports share the banks, rotating priority per cycle. PERF = 1 adds the tile-period report (mxu.md section 7).
 // Checks: final ACC image (bit-exact); fp_flags in every cycle against the per-wave PE flags of build/mxu/<pre>flg.hex (PE row i of a wave
-// that leaves the array at cycle c is flagged at c - DIM + 1 + i, mxu.md 3: a pulse, column mask applied, nothing in a cycle without a
-// flagged wave) and their OR; the sem_inc sequence ({idx, amt} of every instruction with a semaphore, in order) and that no sem_inc
-// comes before the acc_done of its rows; acc_last on exactly the last row of every instruction (ins.hex); the final semaphore values;
-// the period of an M = 1 instruction with a bound (CHKP); no fault, no ACC hazard, the program finished within the time limit; the row
-// counts of every vector file ($readmemh); counters that say the FIFO-full paths were taken (EXP_CS_FULL, EXP_INF_FULL).
+// that leaves the array at cycle c is flagged at c - DIM + 1 + i, i.e. at T + i + 3 for the wave whose A row entered at T: this is the
+// fp_flags port contract of mxu.md 5, a pulse, column mask applied, nothing in a cycle without a flagged wave) and their OR; the sem_inc
+// sequence ({idx, amt} of every instruction with a semaphore, in order) and that no sem_inc comes before the acc_done of its rows; acc_last
+// on exactly the last row of every instruction (ins.hex); the final value of every one of the 64 semaphores (sem.hex: the preloaded ones
+// and 32 .. 63 included); the period of an M = 1 instruction with a bound (CHKP) and the total cycle count against the recorded one
+// (CHKC, exp.hex row 12, +2 % allowed); no fault, no ACC hazard, the program finished within the time limit; the row counts of every
+// vector file; counters that say the FIFO-full paths were taken (EXP_CS_FULL, EXP_INF_FULL; read through names of the RTL, not encodings).
+// CHKC is skipped with a bank model (+BANK): the total then depends on the conflicts of the layout. CHKP stays (its instruction is placed
+// conflict-free, W 2 KiB aligned and A 256 B aligned, mxu.md 7).
+// CHKP and CHKC are regression bounds of this RTL, not properties of the spec: the period bounds (9 / 13 / 26 cycles dense, 9 / 14 sparse)
+// and the cycle counts were measured at SPM_LAT 2 (t16x: 3), ACC_LAT 8, ideal ports (STALL_PCT 0, no bank model, no DONE_EXTRA) and hold for
+// no other parameter set (the bound grows by about a cycle per SPM_LAT, and is ACC_LAT + 1 at ACC_LAT >= 24); only the instances that
+// set CHKP / CHKC check them. A legal but slower redesign fails them by design: re-measure (mxu.md 7) and update the generator.
 // SPARSE = 1: the SPM is the windows of exp.hex rows 8 .. 11 in a 4 MiB address space (garbage elsewhere); ACCR = 2048 rows.
 `timescale 1ns/1ps
 `include "counts.svh"
@@ -36,7 +44,8 @@ module mxu_tc #(
   parameter int DONE_EXTRA = 0,      // > 0: acc_done comes ACC_LAT + (0 .. DONE_EXTRA) cycles after the acc_last row (in order)
   parameter int SPARSE    = 0,       // 1: windowed SPM (see the header), SPMB = rows of spm.hex, the MXU's SPM_BYTES is SPM_TOP
   parameter int SPM_TOP   = 0,
-  parameter int CHKP      = 0,       // 1: the period bound (maxp of ins.hex) of an M = 1 instruction is checked (needs ideal ports, ACC_LAT 8)
+  parameter int CHKP      = 0,       // 1: the period bound (maxp of ins.hex) of an M = 1 instruction is checked (needs ideal ports, SPM_LAT 2 (t16x 3), ACC_LAT 8)
+  parameter int CHKC      = 0,       // 1: the total cycle count is at most 102 % of exp.hex row 12 (same conditions as CHKP)
   parameter int EXP_CS_FULL  = 0,    // 1: the column-scale FIFO must have been full (a tile waited for a slot) at least once
   parameter int EXP_INF_FULL = 0,    // 1: the in-flight FIFO must have been full with a head that differs from the instruction behind it
   parameter int RDYV      = 0,       // 1: a port's ready is low while its request has no valid lane (M-23); +RDYV=n overrides
@@ -58,7 +67,8 @@ module mxu_tc #(
   logic [128+6*64+32-1:0] prog [0:NINS-1];
   logic [DIM*32-1:0]     acc0 [0:ACCR-1];
   logic [DIM*32-1:0]     acc1 [0:ACCR-1];
-  logic [63:0]           expv [0:11];           // flags, sem[1..5], ordering pair {A, B} (6 bits each), semaphore preload {idx, value}, 4 windows {base, size}
+  logic [63:0]           expv [0:13];           // flags, sem[1..5], ordering pair {A, B} (6 bits each), semaphore preload {idx, value}, 4 windows {base, size}, cycles, preload 2
+  logic [31:0]           semx [0:63];           // the final value of every semaphore
   logic [63:0]           insx [0:NINS-1];         // per instruction {maxp[7:0], nrows[23:0], ssem[5:0], sinc[3:0], 22'b0}
   logic [DIM*4-1:0]      flg  [0:NFLG-1];
   logic [31:0]           accm [0:ACCR*DIM-1];
@@ -127,9 +137,11 @@ module mxu_tc #(
   initial for (int i = 0; i < 64; i++) first_inc[i] = -1;
   int pre_idx = 0;            // semaphore preload (exp.hex row 7): sem[pre_idx] starts at pre_val (a wait across 2^32)
   logic [31:0] pre_val = 32'd0;
+  int pre_idx2 = 0;           // a second one (exp.hex row 13): a wait across 2^31
+  logic [31:0] pre_val2 = 32'd0;
   always @(posedge clk) begin
     if (!rst_n) begin
-      for (int i = 0; i < 64; i++) sem[i] <= (i == pre_idx && pre_idx != 0) ? pre_val : 32'd0;
+      for (int i = 0; i < 64; i++) sem[i] <= (i == pre_idx && pre_idx != 0) ? pre_val : (i == pre_idx2 && pre_idx2 != 0) ? pre_val2 : 32'd0;
     end else if (sem_inc_valid) begin
       sem[sem_inc_idx] <= sem[sem_inc_idx] + 32'(sem_inc_amt);
       if (first_inc[sem_inc_idx] < 0) first_inc[sem_inc_idx] = cyc;
@@ -330,8 +342,10 @@ module mxu_tc #(
         end
       end
       // ---- coverage
-      if (dut.lst == 3'd1 && dut.t_cs_en && dut.cs_cnt >= CS_DEPTH) cs_full_cyc++;
-      if (dut.inf_cnt == 3'd4) begin
+      // by the RTL's own names: the loader waits in L_CALC for a column-scale slot (t_cs_en, cs_cnt at the depth); the decoder's inf_room is
+      // low when the in-flight FIFO is full, whatever its depth and encoding
+      if (dut.lst == dut.L_CALC && dut.t_cs_en && dut.cs_cnt >= CS_DEPTH) cs_full_cyc++;
+      if (!dut.u_dec.inf_room) begin
         inf_full_cyc++;
         if (dut.inf_head != dut.inf_in && dut.inf_head[9:4] != 6'd0 && dut.inf_head[3:0] != 4'd0) inf_diff_cyc++;
       end
@@ -445,12 +459,14 @@ module mxu_tc #(
     $readmemh({PRE, "exp.hex"}, expv);
     $readmemh({PRE, "ins.hex"}, insx);
     $readmemh({PRE, "flg.hex"}, flg);
+    $readmemh({PRE, "sem.hex"}, semx);
     fcheck("spm", SPMB, 2);                fcheck("dtab", NTD, 64);               fcheck("prog", NINS, (128 + 6*64 + 32) / 4);
-    fcheck("acc0", ACCR, DIM * 8);         fcheck("acc1", ACCR, DIM * 8);         fcheck("exp", 12, 0);
-    fcheck("ins", NINS, 16);               fcheck("flg", NFLG, DIM);
+    fcheck("acc0", ACCR, DIM * 8);         fcheck("acc1", ACCR, DIM * 8);         fcheck("exp", 14, 0);
+    fcheck("ins", NINS, 16);               fcheck("flg", NFLG, DIM);               fcheck("sem", 64, 8);
     for (int r = 0; r < ACCR; r++) for (int c = 0; c < DIM; c++) accm[r*DIM + c] = acc0[r][32*c +: 32];
     // semaphore preload and SPM windows
     if (expv[7][37:32] != 6'd0) begin pre_idx = int'(expv[7][37:32]); pre_val = expv[7][31:0]; end
+    if (expv[13][37:32] != 6'd0) begin pre_idx2 = int'(expv[13][37:32]); pre_val2 = expv[13][31:0]; end
     wcum = 0;
     for (int w = 0; w < 4; w++) begin
       win_base[w] = int'(expv[8+w][63:32]); win_size[w] = int'(expv[8+w][31:0]); win_off[w] = wcum; wcum += win_size[w];
@@ -499,14 +515,21 @@ module mxu_tc #(
           errors++; if (errors < 12) $display("%s: ACC[%0d][%0d] = %h exp %h", PRE, r, c, accm[r*DIM + c], acc1[r][32*c +: 32]);
         end
     if (flags_or !== expv[0][3:0]) begin errors++; $display("%s: fp_flags OR %h exp %h", PRE, flags_or, expv[0][3:0]); end
-    for (int i = 1; i <= 5; i++)
-      if (sem[i] != expv[i]) begin errors++; $display("%s: sem[%0d] = %0d exp %0d", PRE, i, sem[i], expv[i]); end
+    for (int i = 0; i < 64; i++)
+      if (sem[i] !== semx[i]) begin errors++; if (errors < 12) $display("%s: sem[%0d] = %0d exp %0d", PRE, i, sem[i], semx[i]); end
     // retirement in order: the first increment of sem[A] (an instruction with rows) comes before the first one of sem[B] (an M = 0
     // instruction queued behind it)
     if (expv[6] != 0 && (first_inc[expv[6][11:6]] < 0 || first_inc[expv[6][5:0]] < 0 || first_inc[expv[6][11:6]] >= first_inc[expv[6][5:0]])) begin
       errors++; $display("%s: sem[%0d] incremented (cycle %0d) before sem[%0d] (cycle %0d): out-of-order completion", PRE, expv[6][5:0], first_inc[expv[6][5:0]], expv[6][11:6], first_inc[expv[6][11:6]]);
     end
     if (rows_seen == 0) begin errors++; $display("%s: no rows reached the ACC", PRE); end
+    // total time of the ideal instances (TR-7): at most 2 % above the cycle count recorded in exp.hex row 12
+    if (CHKC != 0 && bank_mode == 0) begin                 // ideal ports only: with a bank model the total depends on which beats collide
+      if (expv[12] == 64'd0) begin errors++; $display("%s: no cycle count recorded in exp.hex row 12", PRE); end
+      else if (cyc * 100 > longint'(expv[12]) * 102) begin
+        errors++; $display("%s: %0d cycles, more than 2 %% above the recorded %0d", PRE, cyc, expv[12]);
+      end
+    end
     $display("%s: %0d ACC rows in %0d cycles, flags %h; cs FIFO full %0d cycles, in-flight FIFO full %0d (head differs %0d), largest bounded row gap %0d",
              PRE, rows_seen, cyc, flags_or, cs_full_cyc, inf_full_cyc, inf_diff_cyc, maxgap);
     if (bank_mode != 0)
@@ -519,7 +542,9 @@ endmodule
 
 // Legality faults: every line is an illegal instruction (plus its two TDs) run after a reset. The MXU must raise the cause, stop
 // taking instructions and touch neither the SPM nor the ACC. A line with cause 0 is a legal instruction (T-2: extents that end exactly at
-// the end of the SPM / the ACC): no fault, a context is pushed, and every lane the MXU requests in the window lies inside the SPM.
+// the end of the SPM / the ACC): no fault, a context is pushed, and it runs until it has drained (TR-3: acc_done ACC_LAT cycles after the
+// acc_last row, as the ACC does, then the in-flight FIFO empty): every lane it requests lies inside the SPM, every ACC row is below ACCR,
+// exactly one acc_last. The SPM answers zeros; only the addresses are judged.
 module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int SPMB = 1, parameter int ACCR = 1, parameter string FILE = "")
   (output logic done, output int errors);
   localparam int LB = DIM;
@@ -539,7 +564,7 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
   logic [4*22-1:0] a_req_addr;
   logic [7:0] w_req_v;
   logic [8*22-1:0] w_req_addr;
-  logic s_req_v, acc_valid, acc_rescale, acc_overwrite, acc_use_cs, acc_last, sem_inc_valid, fault_valid;
+  logic s_req_v, acc_valid, acc_rescale, acc_overwrite, acc_use_cs, acc_last, acc_done, sem_inc_valid, fault_valid;
   logic [21:0] s_req_addr;
   logic [10:0] acc_row;
   logic [DIM*32-1:0] acc_part, acc_cs;
@@ -568,19 +593,34 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
     if (dut.u_dec.ctx_push) saw_ctx <= 1'b1;
     if (cause_exp == 4'd0 && q_valid && q_ready) q_valid <= 1'b0;          // a legal instruction is taken once
   end
+  // the ACC's acc_done: exactly ACC_LAT cycles after the acc_last row (ACC_LAT = the MXU's default, acc.md; none until a row is the last)
+  localparam int ACC_LAT = 8;
+  logic [ACC_LAT-1:0] dsr = '0;
+  always @(posedge clk) dsr <= rst_n ? {dsr[ACC_LAT-2:0], acc_valid && acc_last} : '0;
+  assign acc_done = dsr[ACC_LAT-1];
+  int n_done = 0, n_last = 0, bad_row = 0, n_rows = 0;
+  always @(posedge clk) begin
+    if (!rst_n) begin n_done <= 0; n_last <= 0; n_rows <= 0; end
+    else begin
+      if (acc_done) n_done <= n_done + 1;
+      if (acc_valid && acc_last) n_last <= n_last + 1;
+      if (acc_valid) n_rows <= n_rows + 1;
+    end
+    if (rst_n && acc_valid && int'(acc_row) >= ACCR) bad_row++;
+  end
   mxu #(.DIM(DIM), .ACC_ROWS(ACCR), .SPM_BYTES(SPMB)) dut (
     .clk, .rst_n, .q_valid, .q_ready, .q_instr, .q_regs, .q_wval, .sem_rd_idx, .sem_rd_val(32'd0),
     .dtab_req, .dtab_idx, .dtab_gnt, .dtab_rvalid, .dtab_data,
     .a_req_v, .a_req_addr, .a_req_ready(1'b1), .a_rsp_data('0), .w_req_v, .w_req_addr, .w_req_ready(1'b1), .w_rsp_data('0),
     .s_req_v, .s_req_addr, .s_req_ready(1'b1), .s_rsp_data('0),
     .acc_valid, .acc_row, .acc_part, .acc_ncols, .acc_rescale, .acc_overwrite, .acc_use_cs, .acc_rowscale, .acc_cs, .acc_last,
-    .acc_done(1'b0), .sem_inc_valid, .sem_inc_idx, .sem_inc_amt, .fp_flags, .fault_valid, .fault_cause, .fault_addr);
+    .acc_done, .sem_inc_valid, .sem_inc_idx, .sem_inc_amt, .fp_flags, .fault_valid, .fault_cause, .fault_addr);
   always @(posedge clk) begin
     dtab_gnt <= dtab_req && !dtab_gnt && !dtab_rvalid;
     dtab_rvalid <= dtab_gnt;
     if (dtab_gnt) dtab_data <= (dut.u_dec.dst == 4'd1) ? td_a : td_w;
   end
-  int spm_touch = 0, bad_lane = 0;
+  int spm_touch = 0, bad_lane = 0, tw;
   always @(posedge clk) if (|a_req_v || |w_req_v || s_req_v || acc_valid || sem_inc_valid) spm_touch++;
   always @(posedge clk) begin
     for (int l = 0; l < 4; l++) if (a_req_v[l] && int'(a_req_addr[22*l +: 22]) + LB > SPMB) bad_lane++;
@@ -592,15 +632,22 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
     $readmemh(FILE, mem);
     fcheck(N);
     for (int k = 0; k < N; k++) begin
-      rst_n = 0; q_valid = 0; spm_touch = 0; bad_lane = 0; saw_ctx = 1'b0;
+      rst_n = 0; q_valid = 0; spm_touch = 0; bad_lane = 0; bad_row = 0; saw_ctx = 1'b0;
       repeat (3) @(posedge clk);
       {cause_exp, addr_exp, td_w, td_a, q_instr, q_regs, q_wval} = mem[k];
       #1 rst_n = 1; q_valid = 1;
       repeat (40) @(posedge clk);
       if (cause_exp == 4'd0) begin
+        // run to completion: the acc_done of the one instruction has come and the in-flight FIFO is empty (or it faulted / timed out)
+        tw = 0;
+        while (!(n_done != 0 && dut.inf_cnt == 0) && !fault_valid && tw < 20000) begin @(posedge clk); tw++; end
+        repeat (DIM + 20) @(posedge clk);
         if (fault_valid) begin errors++; $display("legal case %0d (%s): fault cause %0d at %h", k, FILE, fault_cause, fault_addr); end
         else if (!saw_ctx) begin errors++; $display("legal case %0d (%s): no context was pushed", k, FILE); end
+        else if (!(n_done == 1 && dut.inf_cnt == 0)) begin errors++; $display("legal case %0d (%s): did not drain (%0d acc_done, inf_cnt %0d, %0d rows)", k, FILE, n_done, dut.inf_cnt, n_rows); end
+        if (n_last != 1 || n_rows == 0) begin errors++; $display("legal case %0d (%s): %0d acc_last rows, %0d rows", k, FILE, n_last, n_rows); end
         if (bad_lane != 0) begin errors++; $display("legal case %0d (%s): %0d lane requests outside the SPM", k, FILE, bad_lane); end
+        if (bad_row != 0) begin errors++; $display("legal case %0d (%s): %0d ACC rows at or above ACCR %0d", k, FILE, bad_row, ACCR); end
       end else begin
         if (!fault_valid || fault_cause !== cause_exp) begin
           errors++; $display("fault case %0d (%s): valid %b cause %0d expected %0d", k, FILE, fault_valid, fault_cause, cause_exp);
@@ -644,7 +691,8 @@ endmodule
     assign erv[32*I +: 32] = 32'd0; \
   end
 // instances: *s = 30 % random grant stalls, *r = ready needs a valid lane, *l = other SPM_LAT / CS_DEPTH (T-6), *d = late acc_done
-// (T-5 / H-2), *x = sparse SPM and 2048 ACC rows (T-7). CHKP: the ideal instances check the period bound of the M = 1 instruction (T-10).
+// (T-5 / H-2), *x = sparse SPM and 2048 ACC rows (T-7). CHKP / CHKC: the ideal instances (t8, t16, t32, t8x, t16x) check the period bound of the
+// M = 1 instruction (T-10) and the total cycle count (TR-7), for SPM_LAT 2 (t16x: 3) and ACC_LAT 8 only (see the header). t8r: SPM_LAT 5, CS_DEPTH 3 (TR-4).
 // Debug defines: -DQUICK (8 x 8 only), -DONLY16, -DONLY32 (the instance of that size and its faults only), -DNOSLOW (no DIM 16 stall / RDYV runs).
 module tb_mxu;
   localparam int NI = 13;
@@ -659,14 +707,15 @@ module tb_mxu;
 `else
   localparam logic [NI-1:0] SELM = '1;
 `endif
-  `INST(0,  t8,   (`P8,   .STALL_PCT(0),  .CHKP(1)))
-  `INST(1,  t16,  (`P16,  .STALL_PCT(0),  .CHKP(1)))
+  `INST(0,  t8,   (`P8,   .STALL_PCT(0),  .CHKP(1), .CHKC(1)))
+  `INST(1,  t16,  (`P16,  .STALL_PCT(0),  .CHKP(1), .CHKC(1)))
   `INST(2,  t8s,  (`P8,   .STALL_PCT(30), .ACC_LAT(24)))
   `INST(3,  t16s, (`P16,  .STALL_PCT(30)))
   `INST(4,  t8b,  (`P8,   .STALL_PCT(0),  .A_BLOCK(40)))
-  `INST(5,  t32,  (`P32,  .STALL_PCT(0),  .CHKP(1)))
+  `INST(5,  t32,  (`P32,  .STALL_PCT(0),  .CHKP(1), .CHKC(1)))
   // M-23: SPM whose ready is low for a request with no valid lane (the MXU must never wait for the grant of an empty beat)
-  `INST(6,  t8r,  (`P8,   .STALL_PCT(30), .RDYV(1)))
+  // TR-4: and SPM_LAT 5 with CS_DEPTH 3 (a depth that is not a power of two: the FIFO pointers wrap by compare, not by width)
+  `INST(6,  t8r,  (`P8,   .STALL_PCT(30), .RDYV(1), .SPM_LAT(5), .CS_DEPTH(3)))
   `INST(7,  t16r, (`P16,  .STALL_PCT(0),  .RDYV(1)))
   // T-6: SPM_LAT 1 and 3 with CS_DEPTH 2 (the column-scale FIFO fills: EXP_CS_FULL counts it)
   `INST(8,  t8l,  (`P8,   .STALL_PCT(0),  .SPM_LAT(1), .CS_DEPTH(2), .EXP_CS_FULL(1)))
@@ -674,8 +723,8 @@ module tb_mxu;
   // T-5 / H-2: acc_done ACC_LAT + 0 .. 60 cycles after the last row: the in-flight FIFO fills with different entries
   `INST(10, t8d,  (`P8,   .STALL_PCT(0),  .DONE_EXTRA(60), .EXP_INF_FULL(1)))
   // T-7: operands above 2 MiB, ACC bases above 1024
-  `INST(11, t8x,  (`P8X,  .STALL_PCT(0)))
-  `INST(12, t16x, (`P16X, .STALL_PCT(0),  .SPM_LAT(3)))
+  `INST(11, t8x,  (`P8X,  .STALL_PCT(0),  .CHKP(1), .CHKC(1)))
+  `INST(12, t16x, (`P16X, .STALL_PCT(0),  .SPM_LAT(3), .CHKP(1), .CHKC(1)))
   logic df8, df16;
   int ef8, ef16;
 `ifdef QUICK
