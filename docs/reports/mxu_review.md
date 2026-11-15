@@ -4,8 +4,9 @@ Part **S** (below) reviews the spec. Part **R** ([further down](#part-r-bit-exac
 reviews the RTL of commit 2cc2d4b against an independent bit-exact oracle. Part **I**
 ([further down](#part-i-implementability-of-the-rtl-commit-db5464f)) reviews the RTL of commit db5464f for synthesis and structure.
 Part **H** ([further down](#part-h-control-hazards-and-stalls-commit-517ed44)) reviews the control of commit 517ed44 under random
-stalls, delays and faults. Part **T** ([at the end](#part-t-quality-of-the-mxu-tests-commit-4b87648)) reviews the author's tests
-(`tb_mxu_array`, `tb_mxu`, `gen_mxu_vectors.py`, the vector lock) with the reviewer's own mutants.
+stalls, delays and faults. Part **T** ([further down](#part-t-quality-of-the-mxu-tests-commit-4b87648)) reviews the author's tests
+(`tb_mxu_array`, `tb_mxu`, `gen_mxu_vectors.py`, the vector lock) with the reviewer's own mutants. Part **TR**
+([at the end](#part-tr-review-of-the-part-t-test-changes-commit-914ee30)) reviews the author's answer to part T (commit 914ee30, tests only).
 
 Scope of this part (**S**): `docs/spec/mxu.md` against the frozen architecture: microarch.md §2.2 and §5, numerics.md N-3 / N-5 /
 N-8, arith.md "Integration contract" items 1-5, isa.md §3-5 (and §8, which (a) needs), isa_ref.md `MXU_MM`, memmap.md §4. No RTL was
@@ -1690,3 +1691,349 @@ Reproduce (each under `scripts/memrun`):
 - **Overlap of the mutant sets.** Of my 31 survivors, 3 have an author counterpart with the same verdict: `ncols_pack`
   (equivalent), `inf_mem_always` (H-2), and the `RS_DEPTH` throttle (H-1, part H). 2 have a miter counterpart outside `make unit`
   (above). The other 26 have no counterpart among the author's 106 mutants.
+
+## Part TR: review of the part T test changes (commit 914ee30)
+
+Scope: the author's answer to part T, commit 914ee30 on branch `tests/mxu-part-t-fixes`. It changes tests only:
+- `tb/unit/tb_mxu.sv`;
+- `scripts/gen_mxu_vectors.py`;
+- the `mxu-vec` rule;
+- `scripts/mxu_vectors.lock`;
+- the mutant list.
+
+The RTL is unchanged since 517ed44. The question: can a wrong RTL still pass the new tests, and can a correct RTL fail them?
+
+- I read the diff, part T, the numbers of the status.md entry of 2026-11-15 and the mxu.md §6 row "review part T additions". I did not
+  use the author's reasoning in the status entry.
+- No file of the author was edited. My scripts are `scripts/mxu_review/tr_*`; outputs are in `build/mxu_review_tr/`, logs in
+  `logs/tr_*`.
+- Every heavy run went under `scripts/memrun`. With 16 GB, 3 parallel `make unit` workers were the limit (about 6.5 GB free at the
+  start), not 5. Later, three question 5 processes ran next to them.
+- I wrote each mutant's prediction in `tr_mutants.py` before its first run. No checker of mine imports `arith_ref.py` or reuses
+  `gen_mxu_vectors.py`. The directed cases encode the TD and instruction layout themselves.
+
+Labels and severities are as in part T.
+
+### Summary
+
+**The new checks work.** 23 of my 38 new one-change mutants are killed by `make unit`, every one as predicted. The new checks are
+load-bearing:
+- the `sem_inc` sequence check;
+- the `acc_last` check;
+- the per-cycle `fp_flags` ring;
+- the DIM 16 fault file;
+- the `SPM_LAT` 1 / 3 and `CS_DEPTH` 2 instances;
+- the M = 3 / 7 / 23 chains.
+
+Disabling each one lets mutants through that nothing else catches (Q2). The 10 author mutants re-run in full mode are killed in quick
+and in full mode.
+
+**15 mutants survive `make unit`.**
+- 2 are equivalent.
+- 1 is a slowdown: +5.2 % cycles, no bound.
+- 12 are defects of the tests:
+  - 10 are confirmed as real defects by a check independent of the author's code: directed fault cases, part H's random environment,
+    or the unmutated testbench in a legal parameter set the tests do not run.
+  - 2 are real by construction (DIM 32 / a 4 MiB SPM, not simulated).
+
+**No correct RTL fails a shipped instance.** The unmutated RTL passes every legal environment I ran (Q3):
+- `ACC_LAT` 5 / 24 / 255;
+- an `acc_done` earlier than `ACC_LAT`;
+- `SPM_LAT` 1-5;
+- `CS_DEPTH` 2-4;
+- `DONE_EXTRA` up to 2,000;
+- stalls, RDYV, the sparse SPM;
+- DIM 32 variants;
+- the whole `tb_mxu` with `+BANK=1` / `+BANK=2`.
+
+Three checks are tied to this RTL or to its defaults, not to the spec:
+- **The flag check:** it is exact to the cycle, and a registered `fp_flags`, legal by the completion contract, fails it.
+- **The period bounds (9 / 13 cycles):** they are measurements at `SPM_LAT` 2 and `ACC_LAT` 8, and fail at `SPM_LAT` >= 3 or
+  `ACC_LAT` 24.
+- **The FIFO-full coverage counters:** they read internal signals and kill correct but slower depth variants.
+
+None of them can fail the shipped instances, which run only the configuration they were measured at. They will fail on a legal
+redesign.
+
+| # | Sev | Topic | Status |
+|---|---|---|---|
+| TR-1 | M | Legal-boundary tests have no near-boundary *illegal* case for W, and A's smallest overrun is 32 B: W extent without its last row, BF16 W in elements, A overrun <= 31 B survive | confirmed (directed cases on the whole MXU) |
+| TR-2 | M | Carries are never exercised: no A operand crosses a 64 KiB boundary, no pass crosses a multiple of 256 ACC rows, in any program. Three carry mutants survive | confirmed (part H random environment) |
+| TR-3 | L | The legal-at-the-end cases mostly do not reach their boundary within their 40-cycle window (DIM 16: no ACC row at all) | measured |
+| TR-4 | L | Parameter values between the tested ones: `CS_DEPTH` 3, `SPM_LAT` >= 4 are never run; mutants wrong only there survive | confirmed (unmutated testbench at those values) |
+| TR-5 | L | DIM 32 column scales have one fold tile, so `CS_SHIFT` 1 vs 2 is not distinguished; BF16 `KTF` rounding and the 2^31 wait have no case | confirmed (KTF, wait); by construction (DIM 32) |
+| TR-6 | L | Exact-cycle flag check and coverage counters are stricter than the spec | measured (mutants) |
+| TR-7 | L | Period bounds: config-specific, M = 1 only (a +5 % slowdown at M >= 2 passes), vacuous in the sparse programs | measured |
+| TR-8 | L | Unguarded checks: the final values of semaphores 32-63 (incl. the wrap preload) are not compared; `fcheck` is the only guard of a short `exp.hex` outside `make unit` | measured (testbench mutants) |
+
+### Q1: new mutants (`tr_mutants.py`)
+
+**Method.** 38 distinct mutants of `rtl/core/mxu*.sv`, each a copy of `rtl/` with one textual change, judged by the real recipe:
+
+    make unit RTL_DIR=<copy>/rtl UNIT_TB="tb/unit/tb_mxu_array.sv tb/unit/tb_mxu.sv" BUILD=<worker copy>
+
+This includes the vector locks and the greps for PASS and for vector-file warnings. The 4 flag mutants of `mxu_array` are also run
+with `tb_mxu` alone (`<name>@mxu`), to see whether the new flag check catches them without `tb_mxu_array`.
+- 3 workers. Baseline (unmutated) 545 s under that load; the author measured 354 s alone.
+- Whole run: 7,849 s wall, peak 2.24 GB per worker.
+- 43 runs, **43 as predicted**.
+- `results.tsv` lists, per run, which checks fired in which instance (column 7). It is parsed from the messages, so a check
+  suppressed by the `errors < 12` limit can be missing.
+
+**Killed (23).** "Only" marks a mutant killed by one check alone.
+
+| Area | Mutant | Killed by |
+|---|---|---|
+| retire | `tr_inf_head_newest` (newest in-flight entry retired) | sequence, early, final semaphores |
+| retire | `tr_pop_row_or_done` (retired at the row and at `acc_done`) | early-retirement check, row count |
+| retire | `tr_pop_keep_last` (last entry never retired) | TIMEOUT |
+| retire | `tr_zinc_with_pop` (M = 0 completes in the cycle of the previous `acc_done`, one `sem_inc` lost) | sequence, order |
+| retire | `tr_sem_amt_b2`, `tr_sem_idx_b4` (`sinc` bit 2, `ssem` bit 4) | **only** the `sem_inc` sequence (the T-9 values) |
+| retire | `tr_inf_room3` (in-flight FIFO used to depth 3: correct, slower) | **only** the coverage counter `EXP_INF_FULL` |
+| acc_last | `tr_last_first_row`, `tr_last_every_pass_jlast` | the `acc_last` check (all instances) |
+| flags | `tr_flags_reg1` (`fp_flags` one cycle late) | **only** the per-cycle flag ring |
+| flags | `tr_flags_validonly` (flags dropped in cycles without an output row) | flag ring, OR |
+| flags | `tr_arr_mask_le`, `tr_arr_mask_stage`, `tr_arr_valid_stage`, `tr_arr_row_drop_last` | `tb_mxu_array` (14 s) |
+| flags @mxu | `tr_arr_mask_le` (column N flagged) | flag ring (the BF16 Inf instructions, Q4) |
+| flags @mxu | `tr_arr_valid_stage`, `tr_arr_row_drop_last` | flag ring (`drop_last`: `t8` only) |
+| legal | `tr_rs_ext_2m`, `tr_cs_ext_2n` (controls: rowscale / cs extents halved) | fault files |
+| legal | `tr_acc_nt7` (ACC check rounds N / DIM with DIM 8's constant) | **only** `mxu_fault_16.hex` (case 49, T-1) |
+| legal | `tr_acc_ge16` (ACC comparator on the boundary at DIM 16) | `tf16` legal cases, rows 250-255 at DIM 16 |
+| legal | `tr_kt_bf16_ceil` (BF16 K tiles one short at K = n·2D + 1) | every instance (T-3 cases); 1,893 s (TIMEOUTs) |
+| fifo | `tr_cs_full_le` (one tile more than `CS_DEPTH`) | ACC data (`t8l`, `t16l`) |
+| fifo | `tr_cs_depth_m1` (one cs slot unused: correct, slower) | **only** the coverage counter `EXP_CS_FULL` |
+| period | `tr_gapx_m7_short` (boundary gap one short after M = 7) | ACC hazard (`t8`, T-4) |
+
+**Survivors (15), with classification:**
+
+| Mutant | Change | Why it survives | Independent check | Class |
+|---|---|---|---|---|
+| `tr_w_ext_norow` | W extent without the length of its last row | every illegal W case overruns by >= 480 B (whole rows) | directed case: last row 32 B past the end, no fault (DIM 8, 16) | defect of the tests (TR-1) |
+| `tr_w_bf16_elem` | BF16 W row counted in elements | no BF16 W fault case | directed: BF16 row 32 B past the end, no fault | defect (TR-1) |
+| `tr_a_range_tol31` | A overrun of 1-31 B not a fault | smallest A overrun in the list is 32 B | directed: A 16 B past the end, no fault | defect (TR-1) |
+| `tr_ktf_bf16` | BF16 scale-array rows one short at K = 128 n + 1 | no BF16 cs case with that K | directed: K = 129, 2 scale rows from `SPM - 64`, no fault | defect (TR-5) |
+| `tr_wait_signed` | wait compares signed values | the T-9 case wraps 2^32, where signed equals serial | `mxu_dec` alone: `sem 0x7FFFFFFF` vs `wval 0x80000000` starts | defect (TR-5) |
+| `tr_a_carry16` | A row adder drops the carry into bit 16 | no A operand crosses 64 KiB (`tr_vec_scan.py`) | killed by hz (NaN flags from wrong A rows) | defect (TR-2) |
+| `tr_accrow_carry8` | ACC row counter drops the carry into bit 8 | no pass crosses a multiple of 256 rows | killed by hz (row 256 sent as 0) | defect (TR-2) |
+| `tr_accbase_carry8` | pass start `acc_base + j·M` drops that carry | never crossed (sparse bases 1030, 1500, 2016, 1100) | killed by hz (row 275 sent as 19) | defect (TR-2) |
+| `tr_cs_rd_pow2` | cs read pointer wraps at 2^bits | equivalent at `CS_DEPTH` 2 and 4, the only depths run | `CS_DEPTH` 3: 188 / 248 / 50 errors | defect (TR-4) |
+| `tr_atag_cap4` | A tag at latency 4 when `SPM_LAT` >= 5 | instances run `SPM_LAT` 1, 2, 3 | `SPM_LAT` 5: 2,046 / 3,744 errors | defect (TR-4) |
+| `tr_cs_shift32` | DIM 32 uses one scale row per 4 passes, not 2 | DIM 32 cs case: K = 256, one fold tile, 2 passes | by construction: pass 2 of a K > 256 case reads row 0 | defect (TR-5), not simulated |
+| `tr_a_swap2021` | A address bits 20 and 21 swapped | sparse A window 0x3E0000 has bits 17-21 all set; dense all clear | by construction: an A operand in [1 MiB, 2 MiB) of the 4 MiB product SPM is misaddressed | defect (L), not simulated |
+| `tr_gap_plus1_m2` | one idle cycle more after passes with 2 <= M < `ACC_LAT` | the period bound is on M = 1 only | `t8` 2,016 -> 2,120 cycles (+5.2 %), `t8x` 295 -> 300, DIM 16 unchanged | slowdown, open (TR-7) |
+| `tr_sem_amt0` | `sem_inc` with amount 0 for `ssem != 0`, `sinc = 0` | no such instruction | adds 0 | equivalent |
+| `tr_acc_last_unqual` | `acc_last` not qualified by `acc_valid` | contract: payload only in the `acc_valid` cycle (mxu.md §5) | — | equivalent |
+| `tr_arr_mask_stage@mxu` | column mask of row i from the wave behind | with `tb_mxu` alone: no two adjacent waves differ in `ncols` *and* carry dead-column flags | killed by `tb_mxu_array` | not a `make unit` gap |
+
+The hz baseline is 36 runs, 0 failed, on the same seeds and configurations (`logs/tr_hz_base.log`).
+
+### Q2: test-side mutants (`tr_tb.py --tbm`, `tr_tbm.sh`, `tr_fcheck.sh`)
+
+**Method.**
+- `tr_tb.py` writes a patched copy of `tb_mxu.sv` plus its own top. Base patches change no check: a `TOUT` cycle limit, a `DLAT`
+  `acc_done` delay, and the instruction in the flag message.
+- A testbench mutant (TBM) adds one patch that disables or breaks one check.
+- Each TBM is run on the unmutated RTL, and on the RTL mutants the check is there for, with the intact and with the broken
+  testbench on the same instances.
+- 3,846 s, 0.97 GB.
+
+| Check broken | Unmutated RTL | Mutants that then pass (killed with the intact testbench) | Verdict |
+|---|---|---|---|
+| `sem_inc` `{idx, amt}` sequence | passes | `tr_sem_amt_b2`, `tr_sem_idx_b4`, author's `inf_mem_always` (still killed: `tr_inf_head_newest`, `tr_zinc_with_pop`) | load-bearing; its break is caught by nothing |
+| no `sem_inc` before its `acc_done` | passes | none (`ex_pop_at_last_row`, `tr_pop_row_or_done`, `tr_last_first_row` are killed by the sequence / `acc_last` checks too) | redundant for these mutants |
+| per-cycle flag ring | passes | `tr_flags_reg1`, `tr_flags_validonly`, `ex_flags_late`, `ex_flags_sticky`, `ex_flags_nomask` | load-bearing (all 3 flag survivors of part T); silent break |
+| whole-run flag OR | passes | none | redundant with the ring |
+| `acc_done` one cycle early | passes | none | the environment's own delay is not cross-checked (as expected of a model) |
+| `DONE_EXTRA` ignored | **fails** (`EXP_INF_FULL`) | — | caught by the coverage counter |
+| `acc_done` in-order rule removed | **fails** (hang, TIMEOUT) | — | caught |
+| CHKP period bound | passes | `ex_gap_plus1`, `bf_one_buffer` | load-bearing; silent break |
+| semaphore preload (`exp.hex` row 7) | passes | `dec_wait_unsigned` | load-bearing; silent, because `sem[41]` is never compared (TR-8) |
+| `acc_last` check | passes | `tr_last_first_row` (still killed: `tr_last_every_pass_jlast`, `ex_last_every_pass`, through the row count) | load-bearing for the first; silent |
+| legal mode of `mxu_fault_tc` | passes | `dec_a_range_ge`, `dec_w_range_ge` (still killed: `dec_rs_range_ge` by `t8x`, `dec_acc_ge` and `tr_acc_ge16` by rows 250-255) | the only guard of the A and W comparators; silent |
+
+**`fcheck` against corrupted copies of `build/mxu`** (`tr_fcheck.sh`, 128 s). Each copy was judged by the lock, by the intact
+checkers run directly (no lock) and with `fcheck` off.
+- **The lock fails every corrupted copy.** So under `make unit`, `fcheck` is redundant.
+- **On a direct `vvp` run** (the way review scripts run it) `fcheck` is the only guard in three cases:
+  - **`exp.hex` with 7 rows:** without `fcheck` the testbench **passes**. Rows 7-11 read X, so the semaphore preload is silently
+    skipped and the wrap test of T-9 becomes vacuous. Only the `$readmemh` warning grep of `make unit` would see it.
+  - **`exp.hex` with 13 rows:** also passes without `fcheck`; only the same warning grep sees it.
+  - **A row of `flg.hex` with a leading zero dropped:** passes without `fcheck` and raises no warning. It is harmless (same value);
+    only `fcheck` and the lock see it.
+- A short `flg.hex`, a short fault file, a digit dropped from `ins.hex` and two swapped `ins.hex` rows fail either way.
+
+**Checks nothing exercises:**
+- the final values of semaphores 32-63, including the wrap preload's semaphore 41 (TR-8);
+- `CHKP` and the flag ring in the sparse programs, which have no `maxp` instruction (largest bounded gap 0) and raise no flag
+  (flags 0);
+- the early-retirement check and the whole-run flag OR, which no mutant of the three sets needs alone.
+
+### Q3: other legal environments (`tr_env.sh`, `tr_tb.py`)
+
+**The unmutated RTL passes everything the spec allows.** 1,744 + 5,020 s; 0.53 / 2.23 GB.
+
+| Environment | Result |
+|---|---|
+| `ACC_LAT` 5 and 24 (DIM 8 / 16, with and without 30 % stalls) | pass |
+| `ACC_LAT` 255 (`t8`) | **TIMEOUT** at the testbench's 40,000-cycle limit (9 of 15 `sem_inc`). With `TOUT` 2,000,000: pass (`t8`, `t16`, `t8s`). A limit of the testbench, not of the RTL |
+| `acc_done` delay below `ACC_LAT` (9/8, 24/8, 24/1 with stalls, 24/8 + `DONE_EXTRA` 60): legal by mxu.md §5 | pass |
+| `SPM_LAT` 1-5 (DIM 8 / 16, ideal and 30 % stalls, `ACC_LAT` 24 in the DIM 16 stall run) | pass |
+| `CS_DEPTH` 3 at `SPM_LAT` 1-3, with stalls; `CS_DEPTH` 2 with stalls | pass. `CS_DEPTH` 3 fills (`EXP_CS_FULL` 1 passes) |
+| `CS_DEPTH` 4 with `EXP_CS_FULL` 1 | **fails**: the FIFO is never full. Expected: it is the configuration of part T's finding T-6 |
+| `DONE_EXTRA` 400 / 2,000 (`TOUT` raised for 2,000), `EXP_INF_FULL` at 400 | pass. In-flight FIFO full with differing heads 391-2,193 cycles |
+| sparse SPM with `SPM_LAT` 1 / 5, `ACC_LAT` 24, stalls, `CS_DEPTH` 2 / 3, late `acc_done` | pass |
+| RDYV with `SPM_LAT` 1 / 3 / 5, `CS_DEPTH` 2 / 3, `ACC_LAT` 24 | pass |
+| DIM 32: `SPM_LAT` 3 + `ACC_LAT` 24 + stalls; `SPM_LAT` 1 + `CS_DEPTH` 2 + `DONE_EXTRA` 60 | pass |
+| the whole `tb_mxu` (13 instances + both fault runs), no bank model / `+BANK=1` / `+BANK=2` | pass: 528 / 2,188 / 2,228 s. With `+BANK=2`, up to 109 W beats per run took more than one cycle; none fell in the bounded instruction |
+
+**The period bound.**
+
+| Configuration | Bounded M = 1 instruction, DIM 8 / DIM 16 (cycles) |
+|---|---|
+| `SPM_LAT` 1 | 9 / 12 |
+| `SPM_LAT` 2 (shipped) | 9 / 13 |
+| `ACC_LAT` 5 | 9 / 13 |
+| `SPM_LAT` 3 / 4 / 5 | 10 / 14, 11 / 15, 12 / 16 |
+| `ACC_LAT` 24 | 25 / 25 |
+| 30 % stalls | up to 12 / 21 |
+| `A_BLOCK` 40 | 41 at DIM 8 |
+
+So:
+- 9 is not the gap rule's minimum (`ACC_LAT + 1`): it stays 9 at `ACC_LAT` 5. It is the loader at `SPM_LAT` <= 2, and grows by one
+  per cycle of `SPM_LAT`.
+- 13 is the two-buffer skew bound of §7.
+
+**Both bounds are measurements of this RTL in one configuration** (`SPM_LAT` 2, `ACC_LAT` 8, ideal ports). mxu.md §7 calls them
+estimates; they are not spec properties. Only the ideal instances check them, so no shipped instance can fail, and the header says
+"measured maximum, no margin". They are regression bounds: a legal RTL that is one cycle slower fails, which is their purpose.
+
+**The exact flag timing.**
+- What the spec states for the array (mxu.md §3, `mxu_array.sv`): PE row `i` of a wave at `T + i + 3`, all flags of a wave out no
+  later than its row.
+- What it states for the port: mxu.md §4.5 only says that the exit stage "ORs the array flags into `fp_flags`"; §5 and microarch.md
+  give "pulse, valid-qualified".
+- What it requires for completion (acc.md ACC-6): flags no later than `acc_done` / `sem_inc`.
+
+So a registered `fp_flags` meets the port contract, and `tr_flags_reg1` (one cycle late) is a legal implementation that `tb_mxu`
+kills. **The per-cycle check tests this RTL's timing, not the contract.** Either state the exact port timing in mxu.md §5 (then the
+check is right), or check per wave a window from the PE-row cycle up to its `acc_done` (TR-6).
+
+**The coverage counters are stricter than the spec too.**
+- They read `dut.lst == 3'd1` (the enum value of `L_CALC`), `dut.cs_cnt` and `dut.inf_cnt == 3'd4` (the FIFO depth as a
+  literal).
+- They kill `tr_inf_room3` and `tr_cs_depth_m1`, which are correct and only slower.
+- A re-encoded FSM state or a resized FIFO changes their meaning without a compile error.
+
+### Q4: the vectors
+
+**(a) The "legal at the end" cases are decoder-level. Is that enough?**
+
+What decides it is the comparators, and they are tested from the legal side: the legal mode is the only guard of
+`dec_a_range_ge` / `dec_w_range_ge` (Q2). The gaps are elsewhere:
+- **The illegal side** has no near-boundary W case and no A overrun below 32 B (TR-1, three survivors).
+- **The 40-cycle windows** (`--tbm legal_diag`, a diagnostic patch) do not reach the boundary the case is about:
+
+  | Case | DIM 8 | DIM 16 |
+  |---|---|---|
+  | A (FP8 K = 64 / 48, two rows) | reaches the end of the extent | reaches it |
+  | W trans | reaches it | reaches it |
+  | scales (one 64 B row) | reaches it | reaches it |
+  | W non-trans | only N tile 0 is requested (highest lane end `SPM - 56`) | `SPM - 32` |
+  | rowscale (16 values) | highest lane `SPM - 8`: the last lane is never requested | same |
+  | ACC, rows `ACCR - 2 .. ACCR - 1` | reaches row 255 | **no ACC row is presented** |
+  | ACC, ragged N, NT = 5 | rows up to 247 only | none |
+  | ACC, M = `ACCR` | 7 rows | none |
+
+  The fault checker never checks `acc_row < ACCR` in legal mode anyway.
+- **End-to-end coverage:**
+  - ACC end: rows 250-255 at DIM 8 / 16 and 2016-2047 in the sparse programs;
+  - rowscale end: the 4 MiB SPM;
+  - S-10 scales: the end of the dense SPM;
+  - A and W: never at an SPM end.
+
+  The address path does not treat the end of the SPM specially, so data at the end matter little. The exception is the `RANGE` sums
+  against 2^22: for A, W and cs they are exercised only with a 256 KiB SPM.
+- **Verdict:** enough for the comparators once TR-1 is added. The lane check of the legal mode is weaker than its description
+  ("every lane inside the SPM"). Run each legal case until its context has drained (drive `acc_done`), and check `acc_row < ACCR`
+  there.
+
+**(b) Does the BF16 Inf / NaN case reach INV from a dead column?** Yes, but thinly.
+- With the column mask removed (`ex_flags_nomask`, `tr_arr_mask_le`), the attributed flag check fails in exactly 2 cycles per DIM,
+  `fp_flags 1, expected 0`.
+- The cycles are in instructions 34 and 35: the trans and non-trans BF16 Inf cases.
+- No other instruction exposes the mask at the `tb_mxu` level.
+- A column mask taken from the neighbouring wave survives `tb_mxu` (`tr_arr_mask_stage@mxu`); `tb_mxu_array` kills it.
+
+**(c) DIM 32.**
+
+| Shape | Case | Covered |
+|---|---|---|
+| FP8 non-trans | #1 | yes |
+| BF16 trans | #2 | yes |
+| BF16 non-trans | #3 | yes |
+| RESCALE | #5 | yes |
+| column scales | #4: K = 256, one fold tile, 2 passes on scale row 0 | **no**: one fold tile cannot distinguish `CS_SHIFT` 1 (shipped) from 2 |
+
+`tr_cs_shift32` survives. A DIM 32 cs case with K > 256 (two fold tiles, 4 passes) would separate them. All DIM 32 operands are
+below 64 KiB.
+
+**(d) Does the 256 KiB SPM hide what the 128 KiB one tested?** No. I regenerated the vectors of 290b896 (128 KiB) and scanned both
+with `tr_vec_scan.py`:
+- **What moved:** the S-10 scales at the very end, and the fault cases at `SPM`, `SPM - 64` and `SPM + 64`, all moved with the size.
+- **What was never covered:** A and W addresses never reached bit 17 at 128 KiB either.
+- **What the new size adds:**
+  - DIM 16 A / W reach bit 17;
+  - one W operand crosses 2^17 (DIM 16 #36);
+  - more NaN garbage between operands.
+- **What neither size covers:** at DIM 8, A and W stay below 2^17 (A at most `0x152e5`); an A crossing of 64 KiB and an ACC crossing
+  of 256 rows (TR-2).
+
+### Q5: the author's mutants, quick and full mode
+
+**Selection:** 10 of the 55 `kill` mutants, drawn with `random.Random(20261115).sample` (`tr_q5.sh`, 3 parallel processes, about
+1,900-2,240 s, 2.24 GB each):
+
+`a_mask_tail`, `a_pitch`, `addr_32bit`, `align_w_base`, `cs_row_per_pass`, `csp_4n`, `lane_valid_k`, `m_from_td`, `overwrite_t0`,
+`word_rs_without_rescale`
+
+**Result: all 10 are KILLED in `--quick` and in full mode, 0 unexpected.** A quick kill can in principle differ from a full kill:
+`-DQUICK` lowers the cycle limit to 6,000, so a slow-but-correct mutant could be killed in quick mode only. None of these 10 is of
+that kind. The first failing instance differs between the modes (e.g. `cs_row_per_pass`: quick `bad S addr 262144` in `t8`, full
+`ACC[1030]` in `t8x`), which only reflects the order in which the checkers print.
+
+### Proposals
+
+1. **TR-1:** add illegal cases just past the boundary to `build_fault`, at both DIM (my cases in `tr_dec_cases.py` can serve):
+   - a trans W whose last row runs 32 B past the end;
+   - the same in BF16;
+   - an FP8 A 16 B past the end;
+   - a BF16 K = 129 scale array of 2 rows from `SPM - 64`.
+2. **TR-2:** place one dense A operand across 0x10000. Give one pass of a sparse or dense program a row range across a multiple of
+   256: e.g. `acc_base = 1020`, M = 8, and `acc_base + j·M` crossing 1024.
+3. **TR-3:** run each legal fault-file case to completion (drive `acc_done`), and check `acc_row < ACCR` and every lane there.
+4. **TR-4:** add `CS_DEPTH` 3 and `SPM_LAT` 4 or 5 to one instance each (the vectors serve).
+5. **TR-5:**
+   - a DIM 32 column-scale case with K > 256;
+   - a BF16 cs case with K = 128 n + 1;
+   - a wait across 2^31 (preload `0x7FFFFFFE`).
+6. **TR-6:** decide whether the exact flag cycle is port contract (write it into mxu.md §5) or a property of this RTL (then check a
+   window up to `acc_done`). Count the coverage events at the ports or in an `ifdef` of the RTL rather than through hard-coded
+   internal encodings.
+7. **TR-7:** record the cycle counts of the ideal instances in `exp.hex` with a small margin (T-10's open item; `tr_gap_plus1_m2`
+   costs 5.2 % and passes). Give the sparse programs a bounded instruction, or say that CHKP does not apply there. State that 9 / 13
+   hold for `SPM_LAT` <= 2 and `ACC_LAT` <= 8 only.
+8. **TR-8:** compare all 64 final semaphores (or every semaphore a program touches), so that a lost preload fails.
+
+### Reproduce (each under `scripts/memrun`)
+
+| Command | Time, peak |
+|---|---|
+| `python3 scripts/mxu_review/tr_mutants.py run --jobs 3` | 7,849 s with 3 workers; 2.24 GB per worker |
+| `scripts/mxu_review/tr_env.sh [acc spl csd stall dx sparse rdyv bank d32]` | 1,744 s without `bank` / `d32`; `bank d32` 5,020 s, 2.23 GB |
+| `scripts/mxu_review/tr_tbm.sh` | 3,846 s, 0.97 GB |
+| `scripts/mxu_review/tr_fcheck.sh` | 128 s |
+| `python3 scripts/mxu_review/tr_dec_cases.py [RTL]` | seconds; results in `build/mxu_review_tr/dec_results.txt` |
+| `scripts/mxu_review/tr_hz.sh NAME ...` | 172 s for 3 mutants; baseline `hz_run.py` on seeds 900-905, 88 s |
+| `scripts/mxu_review/tr_q5.sh NAME ...` | about 1,900-2,240 s per process |
+| `python3 scripts/mxu_review/tr_vec_scan.py [VECDIR]` | operand extents and carry events of the programs |
+| `python3 scripts/mxu_review/tr_tb.py --run NAME [--rtl SPEC] [--tbm NAME] [--faults] [--plus +BANK=n] INST ...` | one environment or testbench mutant |
