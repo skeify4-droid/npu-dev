@@ -84,7 +84,11 @@ $(BUILD)/arith/.stamp: scripts/gen_arith_vectors.py scripts/arith_hand_cases.py 
 # expectations against numerics.mxu_mm(dim=DIM) and fails when they differ. Then build/mxu must equal the committed lock
 # scripts/mxu_vectors.lock (rows and SHA-256 of every file, counts.svh included; scripts/mxu_lock.py). After an intended
 # change of the generator, arith_ref.py, numerics.py or NumPy: scripts/gen_mxu_vectors.py --lock, commit the lock.
+# A missing or edited file is regenerated first (as arith-vec does, review T-12), then compared with the lock: only the generator's
+# own output can pass.
 mxu-vec: $(BUILD)/mxu/.stamp
+	@$(PY) scripts/mxu_lock.py verify $(BUILD)/mxu >/dev/null 2>&1 || { echo "mxu-vec: output missing or differs from the lock, regenerating"; \
+	  $(PY) scripts/gen_mxu_vectors.py $(BUILD)/mxu >/dev/null && touch $<; }
 	@$(PY) scripts/mxu_lock.py verify $(BUILD)/mxu
 $(BUILD)/mxu/.stamp: scripts/gen_mxu_vectors.py sw/npumodel/arith_ref.py sw/npumodel/numerics.py
 	$(PY) scripts/gen_mxu_vectors.py $(BUILD)/mxu >/dev/null && touch $@

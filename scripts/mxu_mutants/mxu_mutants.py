@@ -176,8 +176,8 @@ mut("spur_pop", X, "assign inf_pop = acc_done && (inf_cnt != 3'd0);", "assign in
 # I-7: the registers moved out of the async-reset processes must still load only at their enable
 mut("s_cfg_always", X, "    if (tok_take) begin\n      s_t <= tk_t;", "    if (1'b1) begin\n      s_t <= tk_t;", exp="kill",
     note="I-7: the per-pass configuration follows the token register every cycle instead of loading at the take")
-mut("inf_mem_always", X, "    if (inf_push) inf_mem[inf_wr] <= inf_in;", "    inf_mem[inf_wr] <= inf_in;", exp="equiv",
-    note="I-7: the in-flight FIFO entry is written every cycle. Only visible with the FIFO full (the write slot is then the head) and a different sync word in the head and in ctx_sync; tb_mxu fills the FIFO for one cycle at a time and never with different words (measured 2026-11-14), so it survives: a gap of tb_mxu (mxu.md section 9), listed as equiv so that the run stays clean")
+mut("inf_mem_always", X, "    if (inf_push) inf_mem[inf_wr] <= inf_in;", "    inf_mem[inf_wr] <= inf_in;", exp="kill_full",
+    note="I-7: the in-flight FIFO entry is written every cycle. Only visible with the FIFO full (the write slot is then the head) and a different sync word in the head and in ctx_sync. Killed since review part T (T-5 / H-2) by the t8d instance of tb_mxu (acc_done ACC_LAT + 0 .. 60 cycles late: the FIFO is full for 40 cycles with a differing head; sem_inc sequence check), not by --quick")
 # I-10: the guards (guard_check.py)
 mut("guard_dim_off", X, "if (DIM != 8 && DIM != 16 && DIM != 32 && DIM != 64) begin : g_bad_dim", "if (1'b0) begin : g_bad_dim", exp="equiv_guard",
     note="duplicated: mxu_array's own geometry check stops every DIM the guard stops, so the three tools still fail (the guard only moves the error to the top)")

@@ -12,6 +12,15 @@ otherwise): (1) the arith_ref PE chain per K tile + `acc_update` per ACC row (th
 model `numerics.mxu_mm(A, W, mode, cs, acc, rowscale, dim=DIM)` on the logical A x W. The column scales are generated per
 fold tile (256 FP8 / 128 BF16 deep, mxu.md M-13) and the SPM image replicates each one for the `64 / DIM` MXU passes it covers.
 
+Files per program (build/mxu/<pre>*.hex, <pre> = mxu_<dim>_ for the dense programs, mxu_<dim>x_ for the sparse one):
+  spm acc0 acc1 dtab prog   the images and the instruction stream
+  exp   [0] OR of the PE flags, [1..5] final semaphores 1..5, [6] ordering pair {A, B}, [7] semaphore preload {idx, value},
+        [8..11] SPM windows {base, size} (the spm.hex rows are the windows back to back; dense programs: one window at 0)
+  ins   one row per instruction: {maxp, nrows, ssem, sinc} (tb_mxu checks the sem_inc sequence, the acc_last row, the period
+        of an M = 1 instruction with maxp > 0, and that no sem_inc comes before the acc_done of its rows)
+  flg   one row per ACC row (wave) in stream order: the flags of the PE rows 0 .. DIM-1 (4 bits each, row 0 lowest), already
+        masked by the column mask; tb_mxu checks fp_flags in every cycle against them (mxu.md 3: PE row i at T + i + 3)
+
 Usage: gen_mxu_vectors.py [--lock] [OUTDIR]   (default build/mxu)
   --lock   after generating, (re)write scripts/mxu_vectors.lock (row count and SHA-256 of every file, scripts/mxu_lock.py).
            Do this after an intended change of the generator, arith_ref.py, numerics.py or NumPy, and commit the lock.
@@ -36,8 +45,9 @@ OUT = _ARGS[0] if _ARGS else os.path.join(ROOT, "build", "mxu_perf" if PERF else
 os.makedirs(OUT, exist_ok=True)
 RNG = np.random.default_rng(20261108)
 WL_WORDS = 128
+MAXP = {8: 9, 16: 13}                                        # period bound of the M = 1 instruction of the main programs (cycles between ACC rows): the measured maximum of the ideal instance, no margin (mxu.md 7: 13 at DIM 16)
 PERF_SPM = 1 << 20                                          # SPM size of the --perf cases
-SPM_BYTES = {8: 1 << 17, 16: 1 << 17, 32: 1 << 16}       # SPM size of the tb_mxu models (a power of two)
+SPM_BYTES = {8: 1 << 18, 16: 1 << 18, 32: 1 << 16}     # SPM size of the tb_mxu models (a power of two)
 META_W = 16
 NANIN, OVF, INV = R.NANIN, R.OVF, R.INV
 
@@ -252,17 +262,17 @@ def build(dim):
 
 # ------------------------------------------------------------------ whole-instruction cases (tb_mxu)
 def chain(a_words, w_words, bf16):
-    """one PE column over DIM PE rows: (partial sum, OR of the PE flags)"""
-    ps, fl = 0, 0
+    """one PE column over DIM PE rows: (partial sum, flags of each PE row)"""
+    ps, fls = 0, []
     for a, w in zip(a_words, w_words):
         if bf16:
             dd, fd = R.bf16_dot2([a & 0xFFFF, a >> 16], [w & 0xFFFF, w >> 16])
         else:
             dd, fd = R.fp8_dot4([(a >> (8 * k)) & 255 for k in range(4)], [(w >> (8 * k)) & 255 for k in range(4)])
         y, fa = R.fp32_add(ps, dd)
-        fl |= (fd & NANIN) | (fa & (OVF | INV)) | (fd & (OVF | INV))
+        fls.append((fd & NANIN) | (fa & (OVF | INV)) | (fd & (OVF | INV)))
         ps = y
-    return ps, fl
+    return ps, fls
 
 
 def f32bits(x):
@@ -307,33 +317,73 @@ def golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc
                                                                    M * N, m, n, got, want))
 
 
-def build_top(dim, decode_only=False, perf=None):
+class Mem:
+    """The SPM image as windows (base, bytearray); a dense program is one window at 0. Slice assignment maps to the window."""
+    def __init__(self, wins):
+        self.w = [(b, bytearray(b"\xff\x7f" * (n // 2))) for b, n in wins]   # NaN-valued garbage (E4M3 and BF16), base even
+
+    def __setitem__(self, sl, data):
+        for b, buf in self.w:
+            if b <= sl.start and sl.stop <= b + len(buf):
+                buf[sl.start - b: sl.stop - b] = data
+                return
+        raise AssertionError("write outside every window: %x" % sl.start)
+
+    def image(self):
+        return b"".join(bytes(buf) for _, buf in self.w)
+
+
+# SPM windows of the sparse program (T-7): every SPM address bit 17 .. 21 is set in one operand window and clear in another
+SPARSE_WIN = {"a": (0x3E0000, 1 << 16), "w": (0x2A0000, 1 << 16), "cs": (0x150000, 1 << 16), "rs": (0x3FF000, 1 << 12)}
+SPARSE_SPM = 1 << 22                                    # the RTL's SPM_BYTES default (22-bit lane addresses)
+SEM_PRE = (41, 0xFFFFFFFD)                              # semaphore 41 starts 3 below 2^32 (the wait across the wrap, T-9)
+
+
+def build_top(dim, variant="main", perf=None):
     """A list of MXU_MM instructions on a DIM x DIM MXU with their SPM image, DTAB, initial / expected ACC and flags.
+    variant: "main" (DIM 8 / 16: the full set; DIM 32: the M = 1 period instruction and a few of every kind), "sparse" (SPM of 4 MiB
+    as four windows, 2048 ACC rows, operands above 2 MiB and ACC bases above 1024).
     perf = (K, N, pitch, trans, bf16): only the tile-period measurement instruction (--perf), see PERF_CASES."""
     LB = dim
     KB = 4 * dim
-    SPM = PERF_SPM if perf else SPM_BYTES[dim]
-    spm = bytearray(b"\xff\x7f" * (SPM // 2))      # NaN-valued garbage everywhere (E4M3 and BF16): any unmasked tail shows up
-    top = [0]
-    end = [SPM]                                     # operands placed at the end of the SPM grow downwards from here
+    sparse = variant == "sparse"
+    if perf:
+        SPM = PERF_SPM
+    elif sparse:
+        SPM = SPARSE_SPM
+    else:
+        SPM = SPM_BYTES[dim]
+    if sparse:
+        wins = {k: v for k, v in SPARSE_WIN.items()}
+        mem = Mem(list(wins.values()))
+        cur = {k: [b, b, b + n] for k, (b, n) in wins.items()}       # kind -> [window base, top, end]
+    else:
+        wins = {"a": (0, SPM)}
+        mem = Mem([(0, SPM)])
+        one = [0, 0, SPM]
+        cur = {k: one for k in ("a", "w", "cs", "rs")}
+    spm = mem
 
-    def alloc(nbytes, at_end=False, align=64):
+    def alloc(nbytes, at_end=False, align=64, kind="a"):
         """64 B aligned base (the alignment rule of every config, M-10); at_end: the extent ends in the last 64 B granule."""
+        c = cur[kind]
         if at_end:
-            base = (end[0] - nbytes) // 64 * 64
-            end[0] = base
-            assert top[0] <= end[0]
+            base = (c[2] - nbytes) // 64 * 64
+            c[2] = base
+            assert c[1] <= c[2], "SPM full (%s, %d bytes)" % (kind, nbytes)
             return base
-        base = (top[0] + align - 1) // align * align
-        top[0] = base + nbytes
-        assert top[0] <= end[0]
+        base = (c[1] + align - 1) // align * align
+        c[1] = base + nbytes
+        assert c[1] <= c[2], "SPM full (%s, %d bytes, top %d, end %d)" % (kind, nbytes, c[1], c[2])
         return base
 
-    ACC_ROWS = 256
+    ACC_ROWS = 2048 if sparse else 256
     acc = [[f32bits(RNG.uniform(-8, 8)) for _ in range(dim)] for _ in range(ACC_ROWS)]
     acc0 = [r[:] for r in acc]
     tds, instrs, flags_or = [], [], 0
     sem_cnt = {}
+    waves = []                  # per ACC row in stream order: the flags of PE rows 0 .. dim-1 (column mask applied)
+    meta = []                   # per instruction: (maxp, nrows, ssem, sinc)
 
     def td(dtype, n0, n1, s1):
         v = dtype | (1 << 5) | (n0 << 16) | (n1 << 32) | (1 << 48) | (1 << 64) | (s1 << 80)
@@ -341,22 +391,24 @@ def build_top(dim, decode_only=False, perf=None):
         return len(tds) - 1
 
     def case(M, K, N, bf16, trans, accm, cs, rs, acc_row, pad_a=0, pad_w=0, wsem=0, wval=0, ssem=0, sinc=0, special=False,
-             m_reg=False, cs_end=False, decoy=None, a_align=64, w_align=64):
+             m_reg=False, cs_end=False, decoy=None, a_align=64, w_align=64, rs_end=False, maxp=0, inj=None):
         nonlocal flags_or
         eb = 2 if bf16 else 1
         gen = bf16_clean if bf16 else fp8_clean
         spec = bf16_code if bf16 else fp8_code
         g = spec if special else gen
         A = [[g() for _ in range(K)] for _ in range(M)]
+        for (m_, k_), v_ in (inj or {}).items():
+            A[m_][k_] = v_                                              # operand values the test needs (Inf, NaN, overflow)
         W = [[gen() for _ in range(N)] for _ in range(K)]               # logical K x N
         a_pitch = (K * eb + 63) // 64 * 64 + pad_a
-        a_base = alloc(M * a_pitch, align=a_align)
+        a_base = alloc(M * a_pitch, align=a_align, kind="a")
         for m in range(M):
             for k in range(K):
                 spm[a_base + m * a_pitch + k * eb: a_base + m * a_pitch + (k + 1) * eb] = A[m][k].to_bytes(eb, "little")
         if trans:
             w_pitch = (K * eb + 63) // 64 * 64 + pad_w
-            w_base = alloc(N * w_pitch, align=w_align)
+            w_base = alloc(N * w_pitch, align=w_align, kind="w")
             for n in range(N):
                 for k in range(K):
                     spm[w_base + n * w_pitch + k * eb: w_base + n * w_pitch + (k + 1) * eb] = W[k][n].to_bytes(eb, "little")
@@ -365,7 +417,7 @@ def build_top(dim, decode_only=False, perf=None):
             w_pitch = (N * eb + 63) // 64 * 64 + pad_w
             # a guard of one K tile of rows behind W stays NaN-valued garbage: a lane requested for a k-row >= K reads NaN there (and
             # 0 x NaN flags), whatever the next operand is
-            w_base = alloc(K * w_pitch + (2 if bf16 else 4) * dim * w_pitch, align=w_align)
+            w_base = alloc(K * w_pitch + (2 if bf16 else 4) * dim * w_pitch, align=w_align, kind="w")
             for k in range(K):
                 for n in range(N):
                     spm[w_base + k * w_pitch + n * eb: w_base + k * w_pitch + (n + 1) * eb] = W[k][n].to_bytes(eb, "little")
@@ -383,21 +435,24 @@ def build_top(dim, decode_only=False, perf=None):
             CSP = (4 * N + 63) // 64 * 64               # row pitch of the scale array (M-11)
             cs_fold = [[f32bits(2.0 ** int(RNG.integers(-3, 4)) * RNG.uniform(0.75, 1.25)) for _ in range(N)] for _ in range(KTF)]
             cs_vals = [cs_fold[t // rep_] for t in range(KT)]        # the scale row of MXU pass t (what the MXU must apply)
-            cs_base = alloc((KTF - 1) * CSP + 4 * N, at_end=cs_end)  # exactly the bytes the DMA writes: nothing behind the last row
+            cs_base = alloc((KTF - 1) * CSP + 4 * N, at_end=cs_end, kind="cs")  # exactly the bytes the DMA writes: nothing behind the last row
             for r_ in range(KTF):
                 for n in range(N):
                     spm[cs_base + CSP * r_ + 4 * n: cs_base + CSP * r_ + 4 * n + 4] = cs_fold[r_][n].to_bytes(4, "little")
         if rs:
             rs_vals = [f32bits(RNG.uniform(0.25, 1.5)) for _ in range(M)]
-            rs_base = alloc(4 * M)
+            rs_base = alloc(4 * M, at_end=rs_end, kind="rs")
             for m in range(M):
                 spm[rs_base + 4 * m: rs_base + 4 * m + 4] = rs_vals[m].to_bytes(4, "little")
+        assert acc_row + NT * M <= ACC_ROWS, "ACC rows of this case run past ACC_ROWS"
         acc_init = [[acc[acc_row + (n // dim) * M + m][n % dim] for n in range(N)] for m in range(M)]
-        # expected: per N tile j, K tile t in order
+        # expected: per N tile j, K tile t in order; one wave per (j, t, m)
+        nw0 = len(waves)
         for j in range(NT):
             nc = min(dim, N - j * dim)
             for t in range(KT):
                 for m in range(M):
+                    wf = [0] * dim
                     for c in range(nc):
                         n = j * dim + c
                         aw, ww = [], []
@@ -408,12 +463,16 @@ def build_top(dim, decode_only=False, perf=None):
                             sh = 16 if bf16 else 8
                             aw.append(sum(v << (sh * q) for q, v in enumerate(av)))
                             ww.append(sum(v << (sh * q) for q, v in enumerate(wv)))
-                        ps, fl = chain(aw, ww, bf16)
-                        flags_or |= fl
+                        ps, fls = chain(aw, ww, bf16)
+                        for i in range(dim):
+                            wf[i] |= fls[i]
                         r = acc_row + j * M + m
                         y, _ = R.acc_update(acc[r][c], ps, rs_vals[m] if (rs and accm == 2) else 0,
                                             cs_vals[t][n] if cs else 0, accm == 2 and t == 0, bool(cs), accm == 0 and t == 0)
                         acc[r][c] = y
+                    waves.append(wf)
+                    for f in wf:
+                        flags_or |= f
         assert rs or accm != 2, "RESCALE needs a rowscale vector"
         if M:
             golden_check(dim, bf16, accm, M, K, N, A, W, cs_fold, rs_vals, acc_init, acc, acc_row)
@@ -425,8 +484,17 @@ def build_top(dim, decode_only=False, perf=None):
             # the TD's n1 is a decoy: the register wins
             tds[a_td] = (tds[a_td] & ~(0xFFFF << 32)) | (((M + 7 if decoy is None else decoy) & 0xFFFF) << 32)
         instrs.append((ins, regs, wval))
-        if ssem:
+        meta.append((maxp, len(waves) - nw0, ssem, sinc))
+        if ssem and sinc:
             sem_cnt[ssem] = sem_cnt.get(ssem, 0) + sinc
+
+    def result(order, sem_pre=None):
+        sc = dict(sem_cnt)
+        if sem_pre:
+            sc[sem_pre[0]] = (sc.get(sem_pre[0], 0) + sem_pre[1]) & 0xFFFFFFFF
+        return dict(dim=dim, spm=mem.image(), wins=[(b, len(buf)) for b, buf in mem.w], tds=tds, instrs=instrs, acc0=acc0, acc1=acc,
+                    acc_rows=ACC_ROWS, flags=flags_or & 0xF, sem=sc, spm_bytes=SPM, order=order, waves=waves, meta=meta,
+                    sem_pre=sem_pre)
 
     D = dim
     if perf:
@@ -435,12 +503,26 @@ def build_top(dim, decode_only=False, perf=None):
         pad = pitch - ((K if trans else N) * eb + 63) // 64 * 64
         assert pad >= 0, "pitch %d is smaller than the row" % pitch
         case(1, K, N, bf16, trans, 0, False, False, 100, pad_w=pad, ssem=1, sinc=1, a_align=256, w_align=2048)
-        return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
-                    sem=sem_cnt, spm_bytes=SPM, order=(0, 0))
-    if decode_only:       # one M = 1 instruction, 4 passes: the tile period measurement on a larger array
-        case(1, 8 * D, 2 * D, False, True, 0, False, False, 100, ssem=1, sinc=1)
-        return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or & 0xF,
-                    sem=sem_cnt, spm_bytes=SPM, order=(0, 0))
+        return result((0, 0))
+    if sparse:
+        # T-7: operands above 2 MiB (A 0x3E0000, W 0x2A0000, scales 0x150000, rowscale 0x3FF000 up to the end of the 4 MiB SPM) and ACC rows
+        # above 1024, the last case ends exactly at ACC_ROWS = 2048
+        case(5, 4 * D + 3, D + D // 2, False, True, 0, True, False, 1030, ssem=1, sinc=1)                    # FP8 trans OVERWRITE + cs, 2 N tiles
+        case(3, 4 * D, D, False, False, 1, False, False, 1032, wsem=1, wval=1)                              # FP8 non-trans ACCUM onto rows of #1
+        case(D // 4 + 1, 2 * D + 3, D + D // 4, True, True, 2, True, True, 1500, ssem=2, sinc=3, pad_a=64)   # BF16 RESCALE + cs + rowscale
+        case(16, 2 * D + 1, D + 2, True, False, 0, False, False, 2048 - 16 * 2)                              # BF16 non-trans, rows end at ACC_ROWS
+        case(16, 4 * D, D, False, True, 2, False, True, 1100, rs_end=True, ssem=3, sinc=1)                    # RESCALE, rowscale 64 B ending at the SPM end
+        return result((0, 0))
+    if dim == 32:
+        # one M = 1 instruction, 4 passes: the tile period measurement on a larger array (maxp: 26 cycles, against 21.5 measured, mxu.md 7)
+        case(1, 8 * D, 2 * D, False, True, 0, False, False, 100, ssem=1, sinc=1, maxp=26)
+        # T-6: one of every kind at DIM 32 (they cost simulation time: Icarus takes about 0.06 s per cycle here)
+        case(1, 4 * D, D, False, False, 0, False, False, 110)                                                # FP8 non-trans
+        case(2, 2 * D, D, True, True, 0, False, False, 120)                                                  # BF16 trans
+        case(1, 2 * D, D, True, False, 1, False, False, 120)                                                 # BF16 non-trans ACCUM
+        case(1, 8 * D, D, False, True, 0, True, False, 130)                                                  # column scales, 2 passes on one scale row
+        case(2, 4 * D, D, False, True, 2, False, True, 140, ssem=2, sinc=1)                                  # RESCALE with rowscale
+        return result((0, 0))
     case(0, 4 * D, D, False, True, 0, False, False, 20, ssem=5, sinc=1)                                     # M = 0 from the TD, first in the queue (S-7)
     case(5, 256 + 6 * D + 3, D + D // 2, False, True, 0, True, False, 0, ssem=1, sinc=1)                   # FP8 trans OVERWRITE + cs, 2 fold tiles (2 scale rows)
     case(3, 4 * D, D, False, False, 1, False, False, 2, wsem=1, wval=1)                                     # FP8 non-trans ACCUM onto rows of #1
@@ -467,14 +549,39 @@ def build_top(dim, decode_only=False, perf=None):
         case(Mb, 10, D, False, True, 1, False, False, B + Mb - 1)              # again a long pass, row 0 on the previous (M = 1) row
         case(2, 10, D, False, True, 1, False, False, B + Mb - 2)               # M = 2 on rows Mb-2, Mb-1 of the long pass
         case(3, 10, D, False, True, 1, False, False, B + Mb - 4)               # M = 3 starting 2 rows before the previous start
+    # T-4 (review part T): an M between 3 and ACC_LAT - 1 (7 = ACC_LAT - 1 at ACC_LAT 8, 23 at the ACC_LAT 24 instance) followed by M = 1
+    # on its last row: the boundary gap ACC_LAT - 2 holds for every M >= 2, a gap one cycle short for M = 3 .. ACC_LAT - 1 is a hazard
+    for Mb in (3, 7, 23):
+        case(Mb, 10, D, False, True, 1, False, False, 150)
+        case(1, 10, D, False, True, 1, False, False, 150 + Mb - 1)
+    # ---- review part T
+    # T-8: BF16 A with Inf / NaN / overflow and an N tail (trans and non-trans): INV / OVF at the MXU port, dead columns masked
+    # +Inf and -Inf in one PE column (INV in the sum), max-finite (OVF against W with a large exponent), NaN (NAN_IN); Inf against the zero W of a
+    # dead column is INV there, which the column mask must drop (microarch.md: columns < N only)
+    inj = {(0, 0): 0x7F80, (0, 2): 0xFF80, (1, 0): 0x7F7F, (2, 1): 0x7FC0, (2, 3): 0x7F80}
+    case(4, 2 * D + 3, D + 3, True, True, 0, False, False, 60, special=True, inj=inj)
+    case(3, 2 * D + 3, D + 3, True, False, 1, False, False, 60, special=True, inj=inj)
+    # M = 1 period of the ideal instances (T-10): 8 passes, bound MAXP[D] (measured max + 0), only tb_mxu instances with CHKP = 1 check it
+    case(1, 8 * D, 4 * D, False, True, 0, False, False, 70, maxp=MAXP[dim])
+    # T-3: K = n KTILE + 1 (a last K pass of one element) and K = 1, FP8 and BF16, trans and non-trans; T-9: sinc 8 .. 15, ssem 32 .. 63
+    case(2, 4 * D + 1, D + 2, False, True, 0, False, False, 160, ssem=40, sinc=9)
+    case(2, 2 * D + 1, D, True, False, 0, False, False, 170, ssem=63, sinc=15)
+    case(2, 1, D + 1, True, True, 0, False, False, 190, ssem=33, sinc=11)
+    case(3, 4 * D + 1, D, True, True, 0, False, False, 195)                                                 # BF16 trans, K = 4 D + 1 (n = 2 tiles of 2 D)
+    # T-9: a wait across 2^32. Semaphore 41 starts at 2^32 - 3 (exp.hex row 7); three producers add 2 each (2^32 - 1, 1, 3) and the consumer
+    # waits for 2: an unsigned compare starts it at once, the serial-number compare only after the third
+    case(1, 1, D, False, True, 0, False, False, 180, ssem=41, sinc=2)
+    case(1, 1, D, False, True, 0, False, False, 181, ssem=41, sinc=2)
+    case(1, 1, D, False, True, 0, False, False, 182, ssem=41, sinc=2)
+    case(2, 8 * D + 1, D, False, True, 0, False, False, 185, wsem=41, wval=2, ssem=32, sinc=8)
+    # T-2: rows end exactly at ACC_ROWS (NT = 2, M = 3: rows 250 .. 255)
+    case(3, 4 * D, 2 * D, False, True, 0, False, False, 250)
     # several N tiles and K passes: the last pass of the instruction (j = 1, t = 1) is followed by M = 1 on its last row
     case(D + 1, 4 * D + 5, D + 3, False, True, 1, False, False, 150)           # NT = 2, KT = 2
     case(1, 4 * D + 5, D + 3, False, True, 1, False, False, 150 + 2 * (D + 1) - 1)
     case(1, 4 * D + 5, D + 3, False, True, 1, False, False, 150 + 2 * (D + 1) - 1, ssem=5, sinc=1)    # the testbench waits for the last one (semaphore 5)
-    flags_or &= 0xF
     # the first increment of semaphore 3 (the case before the M = 0) must come before the first one of semaphore 4
-    return dict(dim=dim, spm=bytes(spm), tds=tds, instrs=instrs, acc0=acc0, acc1=acc, acc_rows=ACC_ROWS, flags=flags_or,
-                sem=sem_cnt, spm_bytes=SPM, order=(3, 4))
+    return result((3, 4), SEM_PRE)
 
 
 def write_top(tc, counts, outdir=None, pre=None):
@@ -493,9 +600,16 @@ def write_top(tc, counts, outdir=None, pre=None):
     wr("prog", prog)
     wr("acc0", [format(sum(v << (32 * c) for c, v in enumerate(r)), "0%dx" % (dim * 8)) for r in tc["acc0"]])
     wr("acc1", [format(sum(v << (32 * c) for c, v in enumerate(r)), "0%dx" % (dim * 8)) for r in tc["acc1"]])
-    # misc: [flags, sem1 .. sem5, ordering pair {A, B}: the first increment of sem[A] comes before the first one of sem[B] (0: none)]
+    # misc: [flags, sem1 .. sem5, ordering pair {A, B}: the first increment of sem[A] comes before the first one of sem[B] (0: none),
+    # semaphore preload {idx, value} (idx 0: none), four SPM windows {base, size} (size 0: unused)]
+    pre_ = tc["sem_pre"] or (0, 0)
+    wins = list(tc["wins"]) + [(0, 0)] * (4 - len(tc["wins"]))
     wr("exp", [format(tc["flags"], "x")] + [format(tc["sem"].get(i, 0), "x") for i in range(1, 6)] +
-       [format(tc["order"][0] * 64 + tc["order"][1], "x")])
+       [format(tc["order"][0] * 64 + tc["order"][1], "x"), format((pre_[0] << 32) | pre_[1], "x")] +
+       [format((b << 32) | n, "x") for b, n in wins])
+    # per instruction {maxp, nrows, ssem, sinc} and per ACC row the flags of the PE rows (see the module doc)
+    wr("ins", [hexw([(mp, 8), (nr, 24), (ss if si else 0, 6), (si if ss else 0, 4), (0, 22)]) for mp, nr, ss, si in tc["meta"]])
+    wr("flg", [format(sum(f << (4 * i) for i, f in enumerate(w)), "0%dx" % dim) for w in tc["waves"]])
 
 
 def build_fault(dim):
@@ -587,7 +701,7 @@ def build_fault(dim):
     # ---- RANGE: ACC first (address | 1 << 63), then the SPM operands A, W, cs, rs (address = R[reg])
     add(RANGE, (ACCR - 1) | B63, acc=ACCR - 1)                        # 2 rows from the last ACC row
     add(RANGE, ACCR | B63, acc=ACCR)
-    add(RANGE, (ACCR - 9) | B63, acc=ACCR - 9, w_over=dict(n1=40))   # NT * M rows: 5 N tiles at DIM 8, 3 at DIM 16
+    add(RANGE, (ACCR - 5 * 2 + 1) | B63, acc=ACCR - 5 * 2 + 1, w_over=dict(n1=4 * dim + dim // 2))   # NT * M rows: N = 4 DIM + DIM / 2 (NT = 5, not a multiple of DIM), M = 2: 5 * 2 rows from ACCR - 9 (T-1, T-2)
     add(RANGE, ((1 << 64) - 1) | B63, acc=(1 << 64) - 1)              # the sum must not wrap
     add(RANGE, B63, m_idx=4, m=(1 << 16) + 1)                         # M from the register is not truncated to 16 bits (S-7)
     add(RANGE, B63, m_idx=4, m=1 << 63)
@@ -609,6 +723,19 @@ def build_fault(dim):
     add(RANGE, SPM, a_base=SPM, w_base=SPM + 64)                      # A before W
     add(RANGE, SPM, w_base=SPM, cs_idx=6, cs=SPM + 64)                # W before cs
     add(RANGE, SPM + 64, cs_idx=6, cs=SPM + 64, accm=2, rs_idx=5, rs=SPM + 128, m_idx=4, m=1)   # cs before rs
+    add(RANGE, SPM - 64, a_base=SPM - 64, a_over=dict(dtype=1, n0=48, n1=1, s1=128), w_over=dict(dtype=1, n0=48, s1=128))   # T-2: BF16 K = 48 is 96 B from 64 B before the end (the same in FP8 is legal, below)
+    # ---- legal instructions (cause 0: no fault, a context is pushed, every lane inside the SPM) whose extents end exactly at the end of
+    # the SPM / the ACC (T-2): the comparators of the checks must not move onto the boundary
+    add(0, 0, a_base=SPM - 64, a_over=dict(n0=64, n1=1, s1=64), w_over=dict(n0=64))                    # A: FP8 K = 64, one row ends at SPM
+    add(0, 0, a_base=SPM - 64, a_over=dict(n0=48, n1=1, s1=64), w_over=dict(n0=48))                    # A: K = 48 FP8 (96 B in BF16 faults above)
+    add(0, 0, a_base=SPM - 128, a_over=dict(n0=64, n1=2, s1=64), w_over=dict(n0=64))                   # A: two rows, the second ends at SPM
+    add(0, 0, w_base=SPM - 64 * dim, w_over=dict(n0=64, n1=dim), a_over=dict(n0=64))                   # W trans: dim rows of 64 B end at SPM
+    add(0, 0, trans=0, w_base=SPM - 4096, a_over=dict(n0=64), w_over=dict(n0=64, n1=64))               # W non-trans: K = 64 rows x N = 64 B end at SPM
+    add(0, 0, accm=2, rs_idx=5, rs=SPM - 64, m_idx=4, m=16)                                            # rowscale: 16 values = 64 B end at SPM
+    add(0, 0, cs_idx=6, cs=SPM - 64, w_over=dict(n1=16))                                               # scales: one row of 64 B (N = 16) ends at SPM
+    add(0, 0, acc=ACCR - 2)                                                                            # ACC: M = 2, NT = 1: rows ACCR - 2, ACCR - 1
+    add(0, 0, acc=ACCR - 5 * 2, w_over=dict(n1=4 * dim + dim // 2))                                    # ACC: NT = 5 (ragged N), M = 2: ends at ACCR
+    add(0, 0, m_idx=4, m=ACCR, acc=0, w_over=dict(n1=dim))                                             # ACC: M = ACCR rows, NT = 1
     add(OP, 0)                                                        # patched below
     out[-1] = (out[-1][0] & ~(0xFF << 120) | (0x61 << 120),) + out[-1][1:]
     return out
@@ -661,7 +788,9 @@ def main():
         write_fault(dim, counts)
     for dim in (8, 16):
         write_top(build_top(dim), counts)
-    write_top(build_top(32, decode_only=True), counts)
+    write_top(build_top(32), counts)
+    for dim in (8, 16):
+        write_top(build_top(dim, "sparse"), counts, pre="mxu_%dx_" % dim)
     for dim in (8, 16):
         P, n = build(dim)
         exp, flg = P.expected()
