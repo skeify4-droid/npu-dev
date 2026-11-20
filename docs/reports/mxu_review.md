@@ -2037,3 +2037,337 @@ that kind. The first failing instance differs between the modes (e.g. `cs_row_pe
 | `scripts/mxu_review/tr_q5.sh NAME ...` | about 1,900-2,240 s per process |
 | `python3 scripts/mxu_review/tr_vec_scan.py [VECDIR]` | operand extents and carry events of the programs |
 | `python3 scripts/mxu_review/tr_tb.py --run NAME [--rtl SPEC] [--tbm NAME] [--faults] [--plus +BANK=n] INST ...` | one environment or testbench mutant |
+
+## Part TR2: review of the part TR test changes (commit 929d820)
+
+Scope: the author's answer to part TR, commit 929d820 on branch `tests/mxu-part-tr-fixes` (diff against eb2afdf). It changes tests and
+spec text only: `tb/unit/tb_mxu.sv`, `scripts/gen_mxu_vectors.py`, `scripts/mxu_vectors.lock`, `scripts/mxu_mutants/mxu_mutants.py`,
+mxu.md §5 / §6 / §7. The RTL is unchanged. The questions: can a wrong RTL still pass the new tests, and can a correct RTL fail them?
+
+- I read the diff, the RTL and the new spec text first, wrote my mutants with their predictions, and read part TR and the status.md
+  entry "2026-11-15 (evening), review part TR" only after my findings were in (comparison at the end).
+- No file of the author was edited. My scripts are `scripts/mxu_review/t2_*`; outputs are in `build/mxu_review_t2/`, logs in
+  `logs/t2_*`. TR's scripts are reused by import (`tr_mutants.py`, `tr_tb.py`, `tr_dec_cases.py`, `tr_vec_scan.py`), not edited.
+- Every heavy run went under `scripts/memrun`. With about 12-13 GB free, 4 `make unit` workers (2.24 GB each) ran together, later 3
+  author-mutant processes next to 3 whole-`tb_mxu` bank runs.
+- Directed checks encode the TD and instruction layout themselves (`tr_dec_cases.row`); no checker of mine imports `arith_ref.py`.
+  Variant vector sets are made by a patched *copy* of the generator (`t2_vec.py`), which is the author's model, so they only add
+  instructions or move operands; the expectations of a variant come from that copy.
+
+Labels and severities as in part T: H / M / L; confirmed (an independent check shows it), measured, by construction.
+
+### Summary
+
+**TR's fixes work where they aim.** Every TR survivor that the author addressed is killed, and my mutants aimed at the same places from
+other angles mostly die too: the W / S tag pipelines and the cs write pointer at `SPM_LAT` 5 / `CS_DEPTH` 3 (`t8r`), both rowscale FIFO
+pointers (`RS_DEPTH` is never a power of two), the DIM 32 scale-row index, the ACC row counter's carry into bit 9, the controls of the
+fault rows. The 26 author mutants I re-ran (the 14 `trf_*`, the two with changed expectations and 10 drawn at random) behave as their
+expectations say in `--quick` mode (full mode: see Q6).
+
+**32 new mutants, 31 run** (one did not compile: a use before declaration in my own text). 11 killed, 20 survive; **29 of 31 as
+predicted**. Of the 20 survivors:
+- 11 are defects of the tests, all confirmed by an independent check (directed fault and wait cases, or three added instructions):
+  legality just past the boundary for operands TR did not touch (TR2-4), the wait compare (TR2-5), long counters (TR2-6);
+- 4 are carries that no program reaches (TR2-7, by construction from the vector scan), 1 of them equivalent at DIM 8 / 16;
+- 2 are equivalent (`t2_wait_le`: outside isa.md's range; `t2_push_no_bypass`: the lost cycle is always hidden);
+- 3 are slowdowns of 0-0.9 % that CHKC's +2 % cannot see (`t2_gapx_plus1`, `t2_gap_bigm_plus1`) or that cost nothing on these
+  programs (`t2_rs_depth_small`);
+- 1 is a DIM 32 probe that no case reaches (`t2_cs_col32`, NT = 1 in the DIM 32 cs case).
+
+**A correct RTL can fail the new tests**, in configurations their own text says are covered:
+- **CHKP with the shared-bank model depends on where the bounded instruction lands** (TR2-1). The header says CHKP "stays" under
+  `+BANK` because the instruction is placed conflict-free. Moving it to other placements that obey the same rules (A 256 B, W 2 KiB
+  aligned, same pitch) gives 10 > 9 / 14 > 13 cycles under `+BANK=2` in 6 of 10 placements (all pass `+BANK=1`): A and W lanes
+  collide across ports. Any program change ahead of it moves it.
+- **CHKC fails at `CS_DEPTH` 2** (+4 % to +16 %), a legal value not in the stated conditions (TR2-2).
+- **A registered ACC stream** (row, payload, `acc_last` one cycle later together; legal by acc.md) fails the flag check, because the
+  new mxu.md §5 text pins the flags to `T`, and through "the wave's own row is on `acc_*`" also pins the `acc_*` latency (TR2-9).
+
+**`tb_mxu` no longer elaborates in Verilator 5.052**: TR-6's `dut.L_CALC` (an enum item through the hierarchy) is an internal error
+there; with a literal the testbench builds and gives the same cycle count to one cycle (TR2-11).
+
+**One kill was lost silently.** TR-6 replaced the in-flight coverage counter's literal (`inf_cnt == 4`) with the RTL's own
+`inf_room`. That counter now fires for a FIFO of any depth, so TR's `tr_inf_room3` (depth 3, mxu.md says 4), which only that counter
+killed, passes it; it still fails `make unit`, but only through CHKC with +2.1 % to +3.1 % against the +2 % bound (TR2-3). The
+author's re-run covered TR's 12 survivors only.
+
+| # | Sev | Topic | Status |
+|---|---|---|---|
+| TR2-1 | M | CHKP under `+BANK=2` holds for the generator's placement only: 6 of 10 rule-conforming placements of the bounded instruction give +1 cycle (cross-port A / W bank collisions) | measured |
+| TR2-2 | L | CHKC: conditions incomplete (`CS_DEPTH` 2: +4-16 %; `t16x`'s count belongs to its `SPM_LAT` 3, 4.6 % slack at `SPM_LAT` 2), one-sided (a stale high count passes), resolution 7-47 cycles (one cycle per instruction boundary passes) | measured |
+| TR2-3 | L | The renamed in-flight coverage counter no longer distinguishes FIFO depths; `tr_inf_room3` now survives it and is caught only by CHKC's thin margin | confirmed (old counter kills it, new one does not) |
+| TR2-4 | M | Legality: W overrun 1-31 B, BF16 non-trans W, non-trans W past the end, A `RANGE` with M from `m_reg`: no illegal case; 4 survivors | confirmed (directed cases, DIM 8 and 16) |
+| TR2-5 | L | Wait: `wval` 0 and a semaphore far ahead of its target (2^30 .. 2^31) are never run; 2 survivors | confirmed (decoder wait check) |
+| TR2-6 | L | No instruction with data has M > 128, more than 16 K tiles (max 10) or non-trans FP8 NT > 4 (max 2); `mxu_fault_tc` does not count rows of its M = 256 case; 3 counter-width survivors | confirmed (three added instructions kill all three) |
+| TR2-7 | L | Carries still unreached: pass start `a_base + t·KB` into bit 16 (TR-2's comment attributes the K-tile carry to it; in this RTL it is the row adder's), W lanes across 2^16 / 2^17 at DIM 8 / 16, `acc_base + j·M` across a multiple of 512 | by construction (vector scan) |
+| TR2-8 | L | `tr_a_swap2021` (TR) still survives; a fifth sparse window is cheap and kills it with unchanged cycle counts | confirmed (variant vectors) |
+| TR2-9 | L | Contracts: microarch.md §5's MXU `fp_flags` row contradicts mxu.md §3 / §5 and the RTL; mxu.md §5 cites ACC-6 for the MXU's ordering rule; the exact-`T` wording also fixes the `acc_*` latency | measured (variant RTL) |
+| TR2-10 | L | Test side: the drain of TR-3 is load-bearing in the fault runs (9 mutants), its `acc_last` count and the post-40-cycle lane check are not; two TR patches (`legal_off`, `legal_diag`) no longer apply | measured |
+| TR2-11 | L | TR-6's hierarchical enum constant `dut.L_CALC` crashes Verilator 5.052; the DIM 64 run of `tb_mxu` that mxu.md §9 plans for Verilator is blocked by it | confirmed (lint with and without it) |
+
+### Q1: new mutants (`t2_mutants.py`)
+
+**Method.** 32 one-change mutants of `rtl/core/mxu*.sv`, predictions written before any run, judged by the real recipe through TR's
+machinery (`tr_mutants.py`, imported; work directory `build/mxu_review_t2/`):
+
+    make unit RTL_DIR=<copy>/rtl UNIT_TB="tb/unit/tb_mxu_array.sv tb/unit/tb_mxu.sv" BUILD=<worker copy>
+
+4 workers, 5,199 s wall, 2.24 GB per worker; baseline (unmutated) 586 s under that load, PASS. No mutant repeats one of part T, part
+TR or the author's list. `results.tsv` column 7 is the checks that fired per instance (parsed from the messages, so a check suppressed
+by the testbench's `errors < 12` limit or one with an unparsed message can be missing; e.g. CHKC failures are not parsed).
+
+**Killed (11).**
+
+| Area | Mutant | Killed by |
+|---|---|---|
+| legal (control) | `t2_ktf_fp8` (FP8 scale rows one short at K = 256 n + 1) | `tf8`, `tf16` (the K = 257 case) |
+| legal (control) | `t2_cs_norows16` (earlier scale rows forgotten, DIM 16 only) | `tf16` (K = 257 and the TR-1 BF16 K = 129 case) |
+| legal (control) | `t2_rs_m_td` (rowscale extent from the TD's n1, not `m_reg`) | `tf8`, `tf16` (17-value case) |
+| carry | `t2_accrow_carry9` (row counter drops the carry into bit 9: 1023 -> 512) | ACC data, `t8x`, `t16x` (TR-2 pass 1020 .. 1027) |
+| fifo | `t2_cs_wr_pow2` (cs write pointer wraps at 2^bits) | ACC data, `t8r` (`CS_DEPTH` 3, TR-4) |
+| fifo | `t2_rs_rd_pow2`, `t2_rs_wr_pow2` (rowscale pointers wrap at 2^bits; `RS_DEPTH` 12 / 9 / 15 ...) | ACC data (every instance with RESCALE) |
+| fifo | `t2_wtag_cap4`, `t2_stag_cap4` (W / scale-port tag at latency 4 when `SPM_LAT` >= 5) | flags / ACC data, `t8r` (`SPM_LAT` 5, TR-4) |
+| wait (control) | `t2_wait_strict` (a wait met with equal values never starts) | TIMEOUT in every instance (wsem 1 / wval 1 is met exactly) |
+| dim32 | `t2_cs_shift32_m1` (DIM 32: a new scale row every pass) | ACC data, `t32` (TR-5's K = 512) |
+
+**Survivors (20), with classification.**
+
+| Mutant | Change | Why it survives | Independent check | Class |
+|---|---|---|---|---|
+| `t2_w_range_tol31` | W overrun of 1-31 B not a fault | TR-1's W cases overrun by exactly 32 B | directed: trans FP8 K = 65, last row from `SPM - 64` (1 B past): no fault, 13-14 SPM actions | defect (TR2-4) |
+| `t2_w_nt_bf16_elem` | BF16 non-trans W row counted in elements | every BF16 W `RANGE` case is trans | directed: non-trans BF16 N = 48 row from `SPM - 64` (32 B past): no fault | defect (TR2-4) |
+| `t2_w_nt_norow` | non-trans W extent one k-row short | no illegal non-trans W case at all | directed: FP8 K = 64 rows from `SPM - 4096 + 64` (64 B past): no fault | defect (TR2-4) |
+| `t2_a_m_td` | A extent with the TD's n1 when M comes from `m_reg` | no A `RANGE` case with `m_reg`; tb_mxu's decoys stay far from the end | directed: M = 16 from `m_reg`, TD n1 = 1, 64 B past: no fault, the queue keeps popping | defect (TR2-4) |
+| `t2_wait_wval0` | `wval` 0 taken as "no wait" | no wait has `wval` 0 | decoder: sem `0xFFFFFFFD` (3 behind 0) starts | defect (TR2-5) |
+| `t2_wait_31bit` | serial compare on 31 bits | every wait's difference is < 6 or > 2^32 - 6 | decoder: sem 2^30 + 1 vs 1 and 2^31 - 1 vs 0 wait forever | defect (TR2-5) |
+| `t2_lastp_7bit` | a pass ends at row 127 when M >= 128 | only the fault file's legal M = 256 case has M > 128, and its checker counts no rows | three added instructions (`t2_vec.py big`): `acc_last` errors, 1,029 / 2,053 errors | defect (TR2-6) |
+| `t2_lasttile_4bit` | instruction ends early when KT >= 17 | no instruction has more than 10 K tiles | `big`: `acc_last` on row 1 of the 18-pass instruction | defect (TR2-6) |
+| `t2_wnt_j2bit` | non-trans FP8 column tile j taken mod 4 | non-trans FP8 NT <= 2 with data; the NT = 8 legal fault case checks addresses only (they alias downwards) | `big`: ACC data, 70 / 134 errors | defect (TR2-6) |
+| `t2_a_start_carry16` | pass start `a_base + t·KB` drops the carry into bit 16 | `CARRY_A` starts at 0xFF40, t·KB <= 96: the start never carries; its carries are the row adder's | vector scan: no pass start crosses 64 KiB | defect, by construction (TR2-7) |
+| `t2_w_tr_carry17` | trans W lane address drops the carry into bit 17 (predicted **kill**: wrong) | no W operand crosses 2^17 (DIM 16 #36 of the 128 KiB vectors did in part TR; not any more) | vector scan | defect, by construction (TR2-7) |
+| `t2_w_nt_carry16` | non-trans W lane address drops the carry into bit 16 | no W operand crosses 2^16 at DIM 8 / 16 | vector scan | defect, by construction (TR2-7) |
+| `t2_accbase_carry9` | `acc_base + j·M` drops the carry into bit 9 | TR-2's 1272 + 4 j carries into bit 8 only | vector scan | defect, by construction (TR2-7) |
+| `t2_a_lane_carry16` | A lane offset drops the carry into bit 16 | at DIM 8 / 16 `s_addr` is K-tile aligned and the lane offsets stay in bits 0-5 | — | equivalent at DIM <= 16; DIM 32 not reached |
+| `t2_cs_col32` | DIM 32 scale column tile j > 0 at the wrong offset | the DIM 32 cs case has N = 32 | — | not simulated (probe) |
+| `t2_wait_le` | `<=` 2^31 in the serial compare | differs only at a difference of exactly 2^31, outside isa.md §3's `|value - target| < 2^31` | decoder: sem 2^31 vs 0 starts (the reference `isa.sem_ready` says wait) | equivalent within the contract |
+| `t2_push_no_bypass` | the loader hands the next token one cycle after the take (predicted **kill**: wrong) | a pass is always longer than the lost cycle: identical cycle counts in all five ideal instances | dense run: 2281 / 2367 / 378 / 437 / 569 cycles | equivalent (timing) |
+| `t2_gapx_plus1` | boundary gap `ACC_LAT - 1` | +17 / +8 / 0 / +4 / +3 cycles (+0.75 % at `t8`) | dense run | slowdown below CHKC (TR2-2) |
+| `t2_gap_bigm_plus1` | one idle cycle after every pass with M >= `ACC_LAT` | +3 / +4 / 0 / +3 / +3 cycles | dense run | slowdown below CHKC |
+| `t2_rs_depth_small` | rowscale FIFO 3 lanes smaller | `rs_want` waits for room; 0 cycles lost on these programs | dense run | equivalent on these programs |
+
+`t2_ctx_after_tok` (the next context only after the last token is taken) did not compile (`tok_v` is declared after `ctx_ready`); I
+did not replace it: gating `ctx_take` alone re-executes a context (`L_IDLE` tests `ctx_v`), and a correct version needs two edits.
+
+The two wrong predictions: `t2_w_tr_carry17` (I guessed that the linear allocator puts a trans W across 0x20000; the scan shows none)
+and `t2_push_no_bypass` (I guessed a cycle per stream-bound pass; a pass's own rows always hide it).
+
+**Directed confirmations** (`t2_dec_cases.py RTL`, seconds each): the unmutated RTL passes all 12 fault / legal cases (6 per DIM) and the
+12 wait pairs; each of the 7 legality / wait survivors fails them. **Added instructions** (`t2_vec.py big`: non-trans FP8 N = 8D + 3,
+K = 68D + 1 trans FP8 (18 K tiles), M = 130; `t8` / `t16` without CHKC): the unmutated RTL passes (2,665 / 2,859 cycles, +384 / +492),
+the three counter mutants fail.
+
+### Q2: test-side mutants (`t2_tb.py --tbm`, `t2_tbm.py`, `t2_fcheck.sh`)
+
+`t2_tb.py` is TR's `tr_tb.py` (imported) plus: a `SEED` parameter (seeds Icarus' single `$urandom` stream; no check changed), `var:` RTL
+variants, `t2:` mutants, and the testbench mutants below. **TR's patches:** every one still applies once except `legal_off` (its first
+anchor, `if (cause_exp == 4'd0) begin\n if (fault_valid)`, now has the drain loop in between) and `legal_diag` (both anchors changed:
+`int spm_touch = 0, bad_lane = 0, tw;`, and the reset line now clears `bad_row`). `t2_tb.py` re-anchors `legal_off`; `legal_diag` is
+replaced by `legal_rows` (rows, `acc_last`, `acc_done` per legal case).
+
+| Check broken | Unmutated RTL | Mutants that then pass (killed with the intact testbench) | Verdict |
+|---|---|---|---|
+| CHKC off (`chkc_off`) | passes | `trf_gap_plus1_m2` (+5.3 % at `t8`), `gap_x_every_pass` (+6.0 % / +8.9 % at `t8` / `t8x`) | load-bearing; silent break |
+| CHKC at +10 % (`chkc_10pct`) | passes | the same two | the margin decides it: any margin above +5.3 % lets both pass |
+| 64 semaphores back to rows 1-5 (`sem64_off`), compare off (`semhex_off`) | passes | none (`tr_sem_idx_b4`, `tr_sem_amt_b2`, `tr_inf_head_newest`, `trf_wait_signed` die by the sequence / wait checks) | redundant for RTL mutants; its value is that a lost preload is now loud: `preload_off` **fails** (`sem[41] = 6 exp 3`), TR-8 fixed |
+| second preload ignored (`preload2_off`) | **fails** (TIMEOUT: semaphore 42 never reaches 2^31) | — | loud |
+| in-flight counter back to `inf_cnt == 4` (`cov_inf_cnt4`) | passes | — (it *kills* `tr_inf_room3`, which the current counter passes) | TR2-3 |
+| `EXP_INF_FULL` off (`cov_inf_off`) | passes | none (`inf_mem_always` dies by TIMEOUT; `tr_inf_room3` passes the current counter anyway) | not load-bearing for any mutant now |
+| `EXP_CS_FULL` off (`cov_cs_off`) | passes | `tr_cs_depth_m1` (one cs slot unused, +50 % at `t8l` / `t16l`; no CHKC instance) | still the only guard; silent break |
+| drain of TR-3 (`drain_off`, fault runs only, 256 RTLs: all of tq / tr / t2 and the author's `mxu.sv` / `mxu_dec.sv` mutants) | passes | 9: `au:cs_cnt_leak`, `au:swap_early`, `tq:ag_accrow_jdim`, `tq:bf_free_every_beat`, `tq:bf_swap_buf0`, `tq:ex_cs_pop_lasti`, `tq:ex_last_every_pass`, `tr:tr_last_every_pass_jlast`, `tr:tr_pop_keep_last` | load-bearing in the fault runs; every one of the 9 is also killed by `t8` / `t16` alone (`build/mxu_review_t2/drain9_dense.txt`) |
+| drain parts: `acc_last` count (`drain_nolast`), lanes after cycle 40 (`drain_window40`) | passes | none of the 9 | not load-bearing |
+| drain parts: "did not drain" (`drain_nodone`) / `acc_row < ACCR` (`drain_norow`) | passes | `tr_pop_keep_last` / `ag_accrow_jdim` | each load-bearing for one |
+| `fcheck` of `sem.hex` off | passes | — | see the corruptions |
+| `fcheck` with 12 rows of `exp.hex` | **fails** (`exp.hex has 14 rows`) | — | loud |
+
+**Corrupted vector files** (`t2_fcheck.sh`, 147 s; lock / intact testbench / `fcheck` off): `sem.hex` 63 or 65 rows, a wrong value, `exp.hex`
+with 13 or 12 rows, a zero cycle count: the lock and the testbench fail each (without `fcheck` a short `exp.hex` still fails: row 13 reads
+X, the second preload is skipped and semaphore 42 hangs). Two pass the testbench and fail only the lock: a dropped leading zero in
+`sem.hex` (same value) and a **doubled cycle count** in row 12 (CHKC is an upper bound, so a stale or inflated count loosens it
+silently; TR2-2).
+
+### Q3: other legal environments (`t2_env.sh`, `t2_vec.py`)
+
+The unmutated RTL, through `tb_mxu`'s checkers (929d820), in environments the shipped instances do not run.
+
+| Environment | Result |
+|---|---|
+| `SPM_LAT` 1 .. 5 on `t8`, `t16`, `t32`, `t8x`, `t16x` (ideal ports, bounds unchecked) | pass. Cycles and period below |
+| CHKP + CHKC at `SPM_LAT` 1, `ACC_LAT` 5, `acc_done` 1 cycle after `acc_last` (`DLAT` 1), `DONE_EXTRA` 2 | pass (all faster or within 0.4 %) |
+| CHKP + CHKC at `SPM_LAT` 3 | fails, as the header says (period 10 / 14, cycles +8 % / +5 %) |
+| **CHKP + CHKC at `CS_DEPTH` 2** (nominal `SPM_LAT`) | **fails CHKC**: `t8` 2,647 (+16.0 %), `t16` 2,623 (+10.8 %), `t32` 394 (+4.2 %), `t8x` 453 (+3.7 %), `t16x` 597 (+4.9 %). The period bound holds (9 / 13 / 22 / 9 / 14). `CS_DEPTH` is not among the stated conditions (TR2-2) |
+| CHKP + CHKC at `CS_DEPTH` 3 / 4 | pass (`t16` 2,371, `t16x` 570 at depth 3) |
+| `ACC_LAT` 5 / 24, `DONE_EXTRA` 60 / 400 on the five programs; `ACC_LAT` 24 with stalls, `SPM_LAT` 4 / 5, `CS_DEPTH` 3 on the sparse and DIM 32 programs | pass |
+| legal variant `sem_reg` (`sem_inc` one cycle after `acc_done`) | pass (`t8`, `t16`, `t8d`, `t8x`, both fault runs, CHKP / CHKC on) |
+| legal variant `acc_reg` (the whole ACC stream one register later, `fp_flags` unchanged) | **fails**: 36 flag errors in each of `t8`, `t16`, `t8d` (flags one cycle "early" relative to their row); nothing else. See TR2-9 |
+| the bounded instruction moved (`t2_vec.py shift<S>`: A 256 B, W 2 KiB aligned, pitch unchanged), `t8` + `t16` with CHKP | `+BANK=0` and `+BANK=1`: pass for all 10 placements. **`+BANK=2`: 6 of 10 fail** (TR2-1) |
+| the whole `tb_mxu` (13 instances + both fault runs) with `+BANK=0 / 1 / 2` and seeds | pass, all 4 runs: `+BANK=0` seed 0, `+BANK=1` seed 0, `+BANK=2` seeds 0 and 23 (seed 11, and seed 23 with `+BANK=0 / 1`, not run: stopped by request; the seed only moves the stall instances). CHKC is off with a bank model; CHKP holds under all three (largest bounded row gap 9 / 13 / 22 / 9 / 14 for `t8` / `t16` / `t32` / `t8x` / `t16x`). The shipped placement costs, against row 12: `+BANK=1` `t8` 2,332 (+2.2 %), `t16` 2,391 (+1.0 %), the others unchanged; `+BANK=2` `t8` 2,435 (+6.8 %), `t16` 2,443 (+3.2 %), `t32` 379 (+0.3 %), `t8x` 448 (+2.5 %), `t16x` 579 (+1.8 %). So CHKC could not stay on with a bank model, and the shipped placement is one of the placements that pass CHKP under `+BANK=2` (TR2-1: 6 of 10 moved placements fail) |
+| Verilator 5.052 (`--lint-only --timing -DQUICK`, and `--binary`) | **fails to elaborate `tb_mxu`**: `%Error: Internal Error: tb/unit/tb_mxu.sv:347:26: V3Width.cpp:3388: EnumItemRef can't deref back to an Enum`, i.e. TR-6's `dut.lst == dut.L_CALC`. The eb2afdf testbench, and the current one with `dut.L_CALC` replaced by `3'd1` (`build/mxu_review_t2/vl/`), lint cleanly (3 s, 0.5 GB); that copy built with `--binary -j 4` passes `t8` + `tf8` in 0.6 s with 2,280 cycles (Icarus 2,281: CHKC is simulator-stable to a cycle). TR2-11 |
+
+**Period and cycles of the bounded instruction and the whole run**, ideal ports (my measurement; mxu.md §7 states the same period table):
+
+| `SPM_LAT` | DIM 8 period / `t8` cycles | DIM 16 period / `t16` cycles | `t32` | `t8x` | `t16x` |
+|---|---|---|---|---|---|
+| 1 | 9 / 2,244 | 12 / 2,241 | 21 / 365 | 9 / 431 | 12 / 519 |
+| 2 (shipped; `t16x` ships 3) | 9 / **2,281** | 13 / **2,367** | 22 / **378** | 9 / **437** | 13 / 544 |
+| 3 | 10 / 2,464 | 14 / 2,494 | 23 / 391 | 10 / 460 | 14 / **569** |
+| 4 | 11 / 2,659 | 15 / 2,622 | 24 / 404 | 11 / 485 | 15 / 594 |
+| 5 | 12 / 2,859 | 16 / 2,750 | 25 / 417 | 12 / 510 | 16 / 620 |
+
+So the §7 statement (9 / 9 / 10 / 11 / 12 and 12 / 13 / 14 / 15 / 16) matches, and the recorded counts are exactly the shipped
+configurations. **CHKC's resolution** is 2 % of the recorded count: 45 / 47 / 7 / 8 / 11 cycles. A defect that costs one cycle per
+instruction boundary (`t2_gapx_plus1`, +17 cycles at `t8`) or per long pass (`t2_gap_bigm_plus1`, +3) passes; `tr_inf_room3` costs
++58 / +73 / +8 cycles and is caught with 0.1-1.1 % to spare.
+
+**`+BANK=2` and the bounded instruction** (`t2_vec.py shift<S>` allocates S bytes of A space before it; its A stays 256 B aligned, its
+W 2 KiB aligned; DIM 8 W pitch 64 B, DIM 16 128 B, as shipped):
+
+| S | A / W at DIM 8 | DIM 8 period (bound 9) | A / W at DIM 16 | DIM 16 period (bound 13) |
+|---|---|---|---|---|
+| 0 (shipped) | 0x12100 / 0x12800 | 9 | 0x21d00 / 0x22000 | 13 |
+| 256 | 0x12200 / 0x12800 | **10** | 0x21e00 / 0x22000 | 13 |
+| 512 | 0x12300 / 0x12800 | **10** | 0x21f00 / 0x22000 | 13 |
+| 768 | 0x12400 / 0x12800 | **10** | 0x22000 / 0x22800 | **14** |
+| 1024 | 0x12500 / 0x12800 | **10** | 0x22100 / 0x22800 | **14** |
+| 1280 | 0x12600 / 0x12800 | **10** | 0x22200 / 0x22800 | **14** |
+| 1536 | 0x12700 / 0x12800 | **10** | 0x22300 / 0x22800 | **14** |
+| 1792 | 0x12800 / 0x13000 | 9 | 0x22400 / 0x22800 | 13 |
+| 2048 | 0x12900 / 0x13000 | 9 | 0x22500 / 0x22800 | 13 |
+| 4096 | 0x13100 / 0x13800 | 9 | 0x22d00 / 0x23000 | 13 |
+
+With `+BANK=1` (own banks per port) every placement gives 9 / 13, so the W beats themselves are conflict-free and the extra cycle is an
+A lane meeting a W lane in the same bank. mxu.md §7's rules are per port (its own table has "conflict-free, shared banks, worst" at
+39.75 against 39.5). (A W pitch of 1,024 / 1,088 B, `wpad960`, also fails `+BANK=1` at DIM 16 with 17 cycles; 1,088 B is not a table
+pitch, so I do not count it.)
+
+### Q4: the contracts
+
+**`fp_flags` (mxu.md §5 against `mxu_array.sv`, acc.md ACC-6, microarch.md §5).**
+- mxu.md §5 and §3 agree with the RTL: PE row `i` at `T + i + 3`, `ARR_LAT = DIM + 2`, the last row in the cycle the wave's row is on
+  `acc_*`, column mask, valid-qualified per PE row, not registered, not sticky. `tb_mxu` checks the same instants (`c - DIM + 1 + i`
+  from the row's exit cycle `c = T + DIM + 2`).
+- **microarch.md §5 contradicts both** (the author did not edit it): "`mxu_pe` flags at the bottom of each column ... masked for
+  `REG_DOT + 64·REG_OUT` cycles plus the A skew after reset". The RTL ORs every PE row (not the bottom of a column), and qualifies with
+  the valid chain instead of a post-reset mask window. mxu.md §5 cites this row as its source ("valid-qualified (microarch.md §5)").
+- ACC-6 is the ACC's own flag rule. The MXU's completion rule is microarch.md's "a block drives an instruction's flags no later than
+  that instruction's completion `sem_inc`"; mxu.md §5's "legal by ACC-6 alone" cites the wrong one (the conclusion holds: `T + DIM + 2`
+  is `ACC_LAT` before `acc_done`).
+- **The wording fixes more than the flags.** "So the last PE row reports in the cycle `T + DIM + 2` in which the wave's own row is on
+  `acc_*`" makes the `acc_*` latency `ARR_LAT` port contract too. `var:acc_reg` (one output register on the whole ACC stream, legal for
+  the ACC: acc.md is relative to the stream) fails only the flag check. At DIM 64, `acc_part` is 2,048 bits and the flag OR spans 4,096
+  PEs; an output register on either is the first timing fix one reaches for, and each now needs a spec change.
+
+**The bound statements of §7 against my measurement.** The `SPM_LAT` 1-5 table matches (Q3). Two stated conditions are incomplete:
+`CS_DEPTH` (2 fails CHKC by 4-16 %), and the bank model (the header and §7 say CHKP stays valid under `+BANK` because the instruction is
+placed conflict-free; that is true for the generator's placement and 3 others of my 9, not for the rule).
+
+**The drain model of `mxu_fault_tc` (TR-3)** is a legal environment: `acc_done` exactly `ACC_LAT` (8, a literal equal to the MXU's
+default) after `acc_last` is ACC-8, ready always high and zero data are allowed. What it hides:
+- the number and identity of the rows: it checks one `acc_last`, `acc_row < ACCR` and a drain, not that the M = 256 case presents 256
+  rows (`t2_lastp_7bit` presents 128 per pass and passes) or the right ones (`t2_wnt_j2bit` aliases addresses downwards and passes);
+- one instruction after a reset: nothing follows it, so the M-22 gap and the in-flight FIFO at the ACC / SPM end are never exercised
+  there (`tb_mxu`'s rows 250-255 / 2016-2047 cover the gap end-to-end).
+
+### Q5: the vectors
+
+`tr_vec_scan.py` and the instruction lists (build/mxu, 929d820):
+
+- **Operand windows / address bits.** A and W at DIM 8 never set bit 17 (dense, 256 KiB); the sparse windows set it. A crosses 2^16 in
+  the TR-2 operand at DIM 8 / 16 and 2^17 only by chance at DIM 16 (#34). **No W operand crosses 2^16 or 2^17 at DIM 8 / 16** (DIM 32
+  #5 crosses 2^16). A bits 20 and 21 are equal in every A operand (TR's `tr_a_swap2021`).
+- **Carries.** A row adder into bit 16: yes (TR-2). Pass start `a_base + t·KB`: never carries (the generator comment "the K tile
+  offset t * 4 DIM does at 0xFFC0 + 64" describes a row address, which this RTL forms with the row adder). ACC row counter: 1023 -> 1024
+  (bits 8-10 at once). Pass start: into bit 8 only (1272 + 8 = 1280); never into bit 9 / 10.
+- **ACC ranges.** Rows 256-1019 are never used; no pass crosses a multiple of 512 or starts across one; row 2047 is reached (2016-2047).
+- **Sizes.** M <= 48 with data (256 in the legal fault case, no data); K tiles <= 10; NT <= 5, non-trans FP8 NT <= 2.
+- **Semaphores.** `ssem` 1-5, 32, 33, 34, 40, 41, 42, 63; `wsem` 1, 4, 41, 42. Waits met with equal values (1 / 1, 4 / 2: yes), across
+  2^32 and 2^31 (yes); `wval` 0 and a large lead (>= 2^30): never (TR2-5).
+- **A fifth sparse window** (`t2_vec.py a5`: a second A window at 0x1C0000, bits 21 / 20 = 0 / 1, used by sparse instructions 4-7;
+  `exp.hex` row 14; `t2_tb.py --tbm win5` reads it): about 10 generator lines and 6 testbench lines. The unmutated RTL passes `t8x` /
+  `t16x` with **unchanged** cycle counts (437 / 569), so `IDEAL_CYCLES` stays valid; `tr_a_swap2021` fails (441 / 793 errors). A port bit
+  20 then takes both values on the A port.
+- **`exp.hex` rows and readers.** Rows 1-5 are still written (`sem[1..5]`) and no longer read by `tb_mxu` (sem.hex replaced them);
+  the generator docstring and the `tb_mxu` declaration say so. Readers: `tb_mxu` (rows 0, 6, 7, 8-11, 12, 13), `tr_tb.py`
+  (`preload_off`: row 7, `flag_or_off`: row 0), `tr_fcheck.sh` (row count only), `tq_lock.sh` (row count; its message "exp one row short
+  (the ordering pair)" is stale: the last row is now the second preload; the check itself still works). Consistent.
+
+### Q6: the author's mutants, quick and full mode
+
+**Selection:** the 14 `trf_*`, the two with changed expectations (`gap_x_every_pass`, `w_gnt_wait`) and 10 of the 64 other `tb`-mode
+mutants drawn with `random.seed(20261115); random.sample` (`align_w_base`, `cs_tile_col`, `gap_cnt`, `inf_mem_always`, `lane_valid_k`,
+`range_rs`, `rs_lane`, `trans_k_tail`, `word_rs_without_rescale`, `zero_sem_mux`).
+
+**`--quick`** (319 s, 0.11 GB): **26 of 26 as expected, 0 unexpected.** `gap_x_every_pass` is killed by CHKC already at `t8` (2,417 against
+2,281, +6.0 %); `trf_gap_plus1_m2` likewise (2,401, +5.3 %). The `kill_full` ones (`w_gnt_wait`, `inf_mem_always`, `gap_cnt` excepted:
+killed in quick by an ACC hazard, and the 5 `trf_*` that need `t8x` / `t8r` / `t32`) survive quick, as allowed.
+
+**Full mode:** **26 of 26 as expected, 0 unexpected**; every one is killed. The `kill_full` ones fall to instances `--quick` skips: `w_gnt_wait` to an 8 x 8 `RDYV` instance, `trf_accrow_carry8` / `trf_accbase_carry8` to `t8x`, `trf_cs_shift32` to `t32`, `trf_cs_rd_pow2` to an 8 x 8 instance's data (`ACC[0][0]`), `inf_mem_always` to `t8d` (its note). Of the last five (run in a second sitting; the per-mutant lines were overwritten, the totals and these killers kept), `trf_atag_cap4` fails an 8 x 8 flag check, `trf_flags_validonly` a `t16` flag check, `trf_gap_plus1_m2` CHKC on `t8x` (447 against 437, +2.3 %; like `gap_x_every_pass` it depends on the 2 % margin).
+
+**The two changed expectations.** `gap_x_every_pass` (`equiv` -> `kill`) is now a slowdown that CHKC sees (+6.0 % `t8`, +8.9 % `t8x`, +3.2 % `t16x`; +1.1 % at
+`t16`); correct, as the author says, and its kill depends on the 2 % margin (`chkc_10pct` lets it pass). `w_gnt_wait` (`kill` ->
+`kill_full`) needs the `RDYV` instances, which `--quick` never runs: correct.
+
+### Comparison with part TR and status.md (read after the above)
+
+- TR-1 .. TR-8 are done as the status entry says, and TR's twelve survivors die (I re-ran them only through the author's `trf_*`
+  copies, all killed). My TR2-4 continues TR-1 to the operands TR's list did not name.
+- TR-6: the author chose the first alternative (exact timing as port contract). TR2-9 is what that choice costs; microarch.md was left
+  "not edited", which the status entry says.
+- TR-6 counters: the status entry says the counters now use "the RTL's own full signal". It did not re-run `tr_inf_room3` /
+  `tr_cs_depth_m1`; the first lost its counter kill (TR2-3).
+- TR-7: the status entry says the bounded instructions were placed conflict-free "because with the first layout the `+BANK=2` run found
+  14 cycles against 13 at DIM 16". TR2-1 shows that the fix moved the instruction to one of the placements that happen to work.
+- TR's Q3 listed `CS_DEPTH` 2 with stalls as passing; that was before CHKC existed, so TR2-2's `CS_DEPTH` 2 failure is new with TR-7.
+
+### Proposals
+
+1. **TR2-1:** give CHKP under a bank model its own bound (e.g. +1 cycle for `+BANK=2`, the §7 table's shared-bank worst case), or skip
+   CHKP like CHKC when `bank_mode == 2`, and remove "placed conflict-free" as the reason it holds. Alternatively pin the instruction with
+   `alloc_at` (as TR-2's `CARRY_A`) so that it cannot move when earlier cases change.
+2. **TR2-2:** add `CS_DEPTH` 4 (and any other parameter of the instance) to the stated conditions of CHKC, or skip CHKC unless the
+   instance has exactly the recorded parameters (record them next to the count in `exp.hex`). Make CHKC two-sided (fail also below
+   -2 %), so that a stale count shows up after a program or RTL change; keep +2 %.
+3. **TR2-3:** count the in-flight FIFO full against the spec depth (4, mxu.md §4.5), e.g. `dut.inf_cnt == 3'd4` with a static check
+   that the depth is 4, or an `ifdef` port; re-run every mutant a changed check was there for (`tr_inf_room3`, `tr_cs_depth_m1`).
+4. **TR2-4:** add to `build_fault`, both DIM (my rows in `t2_dec_cases.py`): trans FP8 W 1 B past the end; non-trans BF16 W 32 B past;
+   non-trans FP8 W one row past; A with M = 16 from `m_reg` (TD n1 = 1) 64 B past, with its legal control.
+5. **TR2-5:** a wait with `wval` 0 on a semaphore just below 2^32 (preload `0xFFFFFFFD`, one producer of 4), and one met with a large lead
+   (preload 2^30, `wval` 1).
+6. **TR2-6:** the three instructions of `t2_vec.py big` (non-trans FP8 NT = 9, 18 K tiles, M = 130); +384 / +492 cycles, re-measure
+   `IDEAL_CYCLES`. Count the rows of each legal fault case (NT·KT·M is known to the generator) in `mxu_fault_tc`.
+7. **TR2-7:** place one trans W across 0x20000 at DIM 16 and one across 0x10000 at DIM 8 (pinned like `CARRY_A`), a dense A whose K
+   tile start crosses 0x10000 (`a_base` 0xFFC0, K >= 2 tiles), and a sparse pass with `acc_base + j·M` across 1536.
+8. **TR2-8:** the fifth window of `t2_vec.py a5`.
+9. **TR2-9:** edit microarch.md §5 to the mxu.md §3 rule; cite microarch.md's ordering rule instead of ACC-6; state the flag timing
+   relative to the wave's ACC row (`c - DIM + 1 + i`, as `tb_mxu` checks) so that a delay of the whole output stage stays legal, or say
+   explicitly that `acc_*` leaves at `T + ARR_LAT`.
+10. **TR2-10:** drop or keep the `acc_last` count of `mxu_fault_tc` as documentation (no mutant needs it); re-anchor TR's `legal_off` /
+    `legal_diag` patches if `tr_tb.py` is to be reused (`t2_tb.py` does).
+11. **TR2-11:** compare `dut.lst` with a parameter or a `localparam` exported by `mxu` (or keep the counter on `cs_cnt` / `t_cs_en` only),
+    and lint `tb_mxu` with Verilator in `make lint` so that the planned DIM 64 run stays possible.
+
+### Reproduce (each under `scripts/memrun`; `source env.sh` first: the generator needs the venv's NumPy)
+
+| Command | Time, peak |
+|---|---|
+| `python3 scripts/mxu_review/t2_mutants.py run --jobs 4` | 5,199 s with 4 workers; 2.24 GB per worker |
+| `python3 scripts/mxu_review/t2_dec_cases.py [RTL]` | seconds |
+| `python3 scripts/mxu_review/t2_vec.py big a5 shift256 ...` | about 5 s per variant, 0.06 GB |
+| `scripts/mxu_review/t2_env.sh spl chk csd acc var` | 2,104 s, 1.21 GB |
+| `scripts/mxu_review/t2_env.sh layout` (`LAYOUTS=...`) | 2,600 s, 0.25 GB |
+| `BANKS=.. SEEDS=.. scripts/mxu_review/t2_env.sh bank` | 697 s for `+BANK=0`; 2,570 to 2,580 s for each `+BANK=1 / 2` run (three streams in parallel, 1.6 to 1.7 GB each) |
+| `python3 scripts/mxu_review/t2_tbm.py drain [intact TBM ...] --jobs 2` (`ONLY=` to limit) | 1,816 s for intact + `drain_off` on 256 RTLs; 518 s for 5 TBMs on 12; 0.23 GB |
+| `python3 scripts/mxu_review/t2_tbm.py dense --jobs 2` | 1,699 s, 1.21 GB |
+| `scripts/mxu_review/t2_fcheck.sh` | 147 s, 0.06 GB |
+| `python3 scripts/mxu_review/t2_rerun_tr.py run --no-baseline tr_inf_room3 tr_cs_depth_m1` | 1,394 s, 2.22 GB |
+| `python3 scripts/mxu_mutants/mxu_mutants.py tb [--quick] NAME ...` (Q6 list in `build/mxu_review_t2/q6_names.txt`) | quick 319 s, 0.11 GB; full 520 s per mutant alone, three streams in parallel at 2.25 GB each (about 5,400 s of wall time for the 26) |
+| `python3 scripts/mxu_review/t2_tb.py --run NAME [--rtl rtl / t2:NAME / var:NAME / tr: / tq: / au:] [--tbm NAME] [--faults] [--vec DIR] [--plus +BANK=n] INST ...` | one environment or testbench mutant |
