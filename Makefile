@@ -29,7 +29,7 @@ ARITH_LINT_VAR := cvt_fp32_fp:-GFMT=1 cvt_fp32_fp:-GFMT=2 cvt_fp32_fp:-GFMT=3 cv
 CORE_LINT_VAR := mxu:-GDIM=16 mxu:-GDIM=64 mxu_array:-GROWS=16,-GCOLS=16 mxu_array:-GROWS=64,-GCOLS=64 mxu_wpack:-GDIM=64
 UNIT_TB   := $(wildcard tb/unit/tb_*.sv)
 
-.PHONY: help lint unit arith-vec mxu-vec pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean
+.PHONY: help lint lint-tb unit arith-vec mxu-vec pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean
 help:
 	@echo "targets: lint unit pytest models fetch-models sweep numerics hbm links isa formal e2e syn cdc-sta clean"
 
@@ -60,6 +60,14 @@ lint:
 	  echo "== lint $$top $$opts"; \
 	  verilator --lint-only -Wall --top-module $$top $$opts $(ARITH_SV) || exit 1; \
 	done
+	@$(MAKE) --no-print-directory lint-tb
+
+# tb_mxu must elaborate in Verilator (review TR2-11: a hierarchical enum item was an internal error of 5.052 and blocked the planned DIM 64
+# run). Elaboration only (the testbench is not -Wall clean); -DQUICK = one 8 x 8 instance (0.5 GB; the full testbench, 13 instances, takes
+# 70 s and 7.5 GB). Needs counts.svh of `make mxu-vec`.
+lint-tb: mxu-vec
+	@echo "== lint tb_mxu (Verilator elaboration, -DQUICK)"
+	@verilator --lint-only --timing -Wno-fatal -Wno-lint -Wno-style -DQUICK -I$(BUILD)/mxu --top-module tb_mxu tb/unit/tb_mxu.sv $(ISA_PKG) $(CORE_SV) $(ARITH_SV) || exit 1
 
 # Test vectors of the arith testbenches (exact reference sw/npumodel/arith_ref.py -> build/arith/*.hex and counts.svh, about
 # 15 s). Regenerated when a generator input changed (stamp) or when an expected output file is missing (`--check`). Then

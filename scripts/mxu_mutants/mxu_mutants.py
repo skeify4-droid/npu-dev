@@ -253,6 +253,56 @@ mut("trf_gap_plus1_m2", X, "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC
     "gap_cnt <= (s_Mrows >= 16'(ACC_LAT)) ? 8'd0 : 8'(ACC_LAT) - 8'(s_Mrows) + 8'(s_Mrows > 16'd1);",
     note="TR-7: one idle cycle more after passes with 2 <= M < ACC_LAT: +5 % cycles at t8, caught by CHKC (the M = 1 period bound does not see it)")
 
+# ------------------------------------------------------------------------------------------- review part TR2 (2026-11-20, test fixes TR2-1 .. TR2-11)
+# Mutants for the checks of the TR2 fixes (the RTL changes are the review's own ideas, written again here; `kill_full`: needs an instance or a
+# program that `--quick` (DIM 8 dense + its faults) does not run). The CHKC configuration / two-sided checks are RTL-independent: see
+# scripts/mxu_mutants/chkc_check.py. TR2-9 / TR2-11 are text and lint.
+# TR2-3: the in-flight coverage counter counts against the spec depth (4), the depth guard fires above it
+mut("tr2f_inf_room3", X, ".inf_room(inf_cnt < 3'd4)", ".inf_room(inf_cnt < 3'd3)", exp="kill_full",
+    note="TR2-3: in-flight FIFO used to depth 3: correct and slower; killed by EXP_INF_FULL (t8d) counting inf_cnt against the spec depth 4, not by the RTL's own full flag (which this mutant moves)")
+mut("tr2f_inf_room5", X, ".inf_room(inf_cnt < 3'd4)", ".inf_room(inf_cnt < 3'd5)", exp="kill_full",
+    note="TR2-3: in-flight FIFO of depth 5 (inf_cnt is 3 bits): not the spec depth of mxu.md 4.5; the testbench fails when the FIFO holds more than 4 (t8d fills it)")
+mut("tr2f_cs_depth_m1", X, "if (!t_cs_en || cs_cnt < CS_DEPTH[$clog2(CS_DEPTH):0]) lst <= L_RUN;", "if (!t_cs_en || cs_cnt < CS_DEPTH[$clog2(CS_DEPTH):0] - 1) lst <= L_RUN;", exp="kill_full",
+    note="TR2-3 / TR2-11: one cs slot unused: correct and slower; killed by EXP_CS_FULL (t8l / t16l), whose counter now reads the loader state by name (`dut.lst.name()`)")
+# TR2-4: legality at the end of the SPM for the operands TR-1 did not touch
+mut("tr2f_w_tol31", D, "f_r_w   = (w_ext > 96'(SPM_BYTES));", "f_r_w   = (w_ext > 96'(SPM_BYTES) + 96'd31);",
+    note="TR2-4: a W overrun of 1 .. 31 B is no fault (trans FP8 K = 65: 1 B past)")
+mut("tr2f_w_nt_bf16_elem", D, "wk_b   = bf16 ? {w_elem, 1'b0} : {1'b0, w_elem};", "wk_b   = (bf16 && i_trans) ? {w_elem, 1'b0} : {1'b0, w_elem};",
+    note="TR2-4: the last row of a BF16 non-trans W counted in elements (N = 48: 32 B past the end)")
+mut("tr2f_w_nt_norow", D, "w_rows = i_trans ? vN : vK;", "w_rows = i_trans ? vN : vK - 16'd1;", note="TR2-4: a non-trans W extent one k-row short")
+mut("tr2f_a_m_td", D, "a_m1   = MW'(vM - 64'd1);", "a_m1   = MW'(64'(a_n1) - 64'd1);", note="TR2-4: the A extent from the TD's n1 although M comes from R[m_reg]")
+# TR2-5: waits
+mut("tr2f_wait_wval0", D, "assign sem_ok = (f_wsem == 6'd0) ||", "assign sem_ok = (f_wsem == 6'd0) || (q_wval == 32'd0) ||", note="TR2-5: wval 0 taken as no wait (a wait on 2^32 - 3 for 0)")
+mut("tr2f_wait_31bit", D, "(32'($signed(sem_rd_val - q_wval)) < 32'h8000_0000)", "(31'(sem_rd_val - q_wval) < 31'h4000_0000)",
+    note="TR2-5: serial compare on 31 bits: a semaphore 2^31 - 1 ahead of its target never satisfies the wait")
+mut("tr2f_wait_le", D, "(32'($signed(sem_rd_val - q_wval)) < 32'h8000_0000)", "(32'($signed(sem_rd_val - q_wval)) <= 32'h8000_0000)", exp="equiv",
+    note="TR2-5: differs only at a difference of exactly 2^31, outside isa.md 3's |value - target| < 2^31")
+# TR2-6: counters wider than any earlier case
+mut("tr2f_lastp_7bit", X, "assign a_lastp = (s_m == s_Mrows - 16'd1);", "assign a_lastp = (s_m[6:0] == 7'(s_Mrows - 16'd1));",
+    note="TR2-6: a pass ends at row 127 when M >= 128: the legal M = 256 fault case now counts its rows (quick), the sparse M = 130 instruction sees it in the data")
+mut("tr2f_lasttile_4bit", X, "assign last_tile = (l_j == c_NT - 16'd1) && (l_t == c_KT - 16'd1);", "assign last_tile = (l_j == c_NT - 16'd1) && (l_t[3:0] == 4'(c_KT - 16'd1));",
+    exp="kill_full", note="TR2-6: the instruction ends early at KT >= 17 (the sparse programs' 18-tile instruction)")
+mut("tr2f_wnt_j2bit", X, "kbeat * 64'(c_w_pitch) + 64'(l_j) * 64'(DIM));", "kbeat * 64'(c_w_pitch) + 64'(l_j[1:0]) * 64'(DIM));", exp="kill_full",
+    note="TR2-6: non-trans FP8 column tile j taken mod 4 (the sparse programs' NT = 9 instruction)")
+# TR2-7: carries
+mut("tr2f_a_start_carry16", X, "s_addr <= tk_a_base + 22'(64'(tk_t) * 64'(KB));", "s_addr <= {tk_a_base[21:16], 16'(tk_a_base[15:0] + 16'(64'(tk_t) * 64'(KB)))};",
+    note="TR2-7: the pass start a_base + t 4 DIM drops the carry into bit 16 (CARRY_A now starts at 0xFFC0)")
+mut("tr2f_w_tr_carry17", X, "wl_lane_addr[l] = 22'(64'(t_w_base) + (64'(l_idx) * 64'd8 + 64'(l)) * 64'(c_w_pitch) + 64'(l_g) * 64'(LB));",
+    "wl_lane_addr[l] = {t_w_base[21:17], 17'(64'(t_w_base[16:0]) + (64'(l_idx) * 64'd8 + 64'(l)) * 64'(c_w_pitch) + 64'(l_g) * 64'(LB))};",
+    note="TR2-7: the trans W lane address drops the carry into bit 17 (the pinned trans W across 0x20000)")
+mut("tr2f_w_nt_carry16", X, "wl_lane_addr[l] = 22'(64'(c_w_base) + kbeat * 64'(c_w_pitch) + 64'(l_j) * 64'(DIM));",
+    "wl_lane_addr[l] = {c_w_base[21:16], 16'(64'(c_w_base[15:0]) + kbeat * 64'(c_w_pitch) + 64'(l_j) * 64'(DIM))};",
+    note="TR2-7: the non-trans FP8 W lane address drops the carry into bit 16 (the pinned non-trans W across 0x30000)")
+mut("tr2f_accbase_carry9", X, "s_accrow <= tk_acc_base + 11'(64'(tk_j) * 64'(tk_M));", "s_accrow <= {tk_acc_base[10:9], 9'(tk_acc_base[8:0] + 9'(64'(tk_j) * 64'(tk_M)))};",
+    exp="kill_full", note="TR2-7: the pass start acc_base + j M drops the carry into bit 9 (sparse acc_base 1532, M = 4: pass 1 at 1536)")
+mut("tr2f_a_lane_carry16", X, "assign a_lane_addr[22*l +: 22] = s_addr + 22'(l * LB);", "assign a_lane_addr[22*l +: 22] = {s_addr[21:16], 16'(s_addr[15:0] + 16'(l * LB))};",
+    exp="equiv", note="TR2-7: equivalent at DIM <= 16 (s_addr is KB-aligned, the lane offsets stay in bits 0 .. 5); DIM 32 has no A row at 0x..FFC0")
+mut("tr2f_cs_col32", X, "64'd4 * 64'(DIM) * 64'(l_j));", "64'd4 * 64'((DIM == 32) ? 16 : DIM) * 64'(l_j));", exp="kill_full",
+    note="TR2-7: DIM 32 scale column tile j > 0 at the wrong offset (the DIM 32 column-scale case with NT = 2)")
+# TR2-8: the second A window
+mut("tr2f_a_swap2021", X, "assign a_lane_addr[22*l +: 22] = s_addr + 22'(l * LB);", "assign a_lane_addr[22*l +: 22] = {s_addr[20], s_addr[21], s_addr[19:0]} + 22'(l * LB);",
+    exp="kill_full", note="TR2-8: A address bits 20 and 21 swapped: the sparse A windows 0x3E0000 (1 / 1) and 0x1C0000 (0 / 1) differ in them")
+
 
 def build(m):
     name, file, old, new, exp, note = m

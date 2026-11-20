@@ -18,15 +18,21 @@
 // sequence ({idx, amt} of every instruction with a semaphore, in order) and that no sem_inc comes before the acc_done of its rows; acc_last
 // on exactly the last row of every instruction (ins.hex); the final value of every one of the 64 semaphores (sem.hex: the preloaded ones
 // and 32 .. 63 included); the period of an M = 1 instruction with a bound (CHKP) and the total cycle count against the recorded one
-// (CHKC, exp.hex row 12, +2 % allowed); no fault, no ACC hazard, the program finished within the time limit; the row counts of every
-// vector file; counters that say the FIFO-full paths were taken (EXP_CS_FULL, EXP_INF_FULL; read through names of the RTL, not encodings).
-// CHKC is skipped with a bank model (+BANK): the total then depends on the conflicts of the layout. CHKP stays (its instruction is placed
-// conflict-free, W 2 KiB aligned and A 256 B aligned, mxu.md 7).
-// CHKP and CHKC are regression bounds of this RTL, not properties of the spec: the period bounds (9 / 13 / 26 cycles dense, 9 / 14 sparse)
-// and the cycle counts were measured at SPM_LAT 2 (t16x: 3), ACC_LAT 8, ideal ports (STALL_PCT 0, no bank model, no DONE_EXTRA) and hold for
-// no other parameter set (the bound grows by about a cycle per SPM_LAT, and is ACC_LAT + 1 at ACC_LAT >= 24); only the instances that
-// set CHKP / CHKC check them. A legal but slower redesign fails them by design: re-measure (mxu.md 7) and update the generator.
-// SPARSE = 1: the SPM is the windows of exp.hex rows 8 .. 11 in a 4 MiB address space (garbage elsewhere); ACCR = 2048 rows.
+// (CHKC, exp.hex row 12, within 2 % either way); no fault, no ACC hazard, the program finished within the time limit; the row counts of every
+// vector file; counters that say the FIFO-full paths were taken (EXP_CS_FULL, EXP_INF_FULL: the column-scale one reads the loader state by
+// its name, the in-flight one counts against the spec depth of mxu.md 4.5, INF_DEPTH = 4, not against the RTL's own full flag).
+// CHKP and CHKC are regression bounds of this RTL, not properties of the spec. CHKP: the period bounds (9 / 13 / 26 cycles dense, 9 / 14
+// sparse) were measured at SPM_LAT 2 (t16x: 3), ACC_LAT 8, ideal ports (STALL_PCT 0, no DONE_EXTRA) and hold for no other parameter set (the
+// bound grows by about a cycle per SPM_LAT, and is ACC_LAT + 1 at ACC_LAT >= 24). It is checked with ideal ports and with +BANK=1 (own
+// banks per port: every placement of the instruction that follows the mxu.md 7 rules, A 256 B and W 2 KiB aligned, table pitch, gave the
+// same period) and NOT with +BANK=2: with shared banks an A lane can meet a W lane in the same bank, and whether it does depends on where
+// the allocator puts the instruction (6 of 10 placements cost one more cycle, review TR2-1), i.e. on every case ahead of it.
+// CHKC: the exp.hex row 12 of a program holds the count and the configuration it was measured in ({ACC_LAT, CS_DEPTH, SPM_LAT, count});
+// the check runs only when the instance has exactly that configuration (those three, STALL_PCT 0, DONE_EXTRA 0, A_BLOCK 0, RDYV 0, no
+// bank model) and prints a "skipped" line otherwise (a different CS_DEPTH changes the count by 4-16 %, a bank model by the conflicts of
+// the layout). It is two-sided: more than 2 % below the record fails too, so that a stale count (a faster RTL, a shorter program) is
+// re-measured and does not loosen the bound. A legal but slower redesign fails by design: re-measure (mxu.md 7), update the generator.
+// SPARSE = 1: the SPM is the windows of exp.hex rows 8 .. 11 and 14 in a 4 MiB address space (garbage elsewhere); ACCR = 2048 rows.
 `timescale 1ns/1ps
 `include "counts.svh"
 module mxu_tc #(
@@ -44,8 +50,8 @@ module mxu_tc #(
   parameter int DONE_EXTRA = 0,      // > 0: acc_done comes ACC_LAT + (0 .. DONE_EXTRA) cycles after the acc_last row (in order)
   parameter int SPARSE    = 0,       // 1: windowed SPM (see the header), SPMB = rows of spm.hex, the MXU's SPM_BYTES is SPM_TOP
   parameter int SPM_TOP   = 0,
-  parameter int CHKP      = 0,       // 1: the period bound (maxp of ins.hex) of an M = 1 instruction is checked (needs ideal ports, SPM_LAT 2 (t16x 3), ACC_LAT 8)
-  parameter int CHKC      = 0,       // 1: the total cycle count is at most 102 % of exp.hex row 12 (same conditions as CHKP)
+  parameter int CHKP      = 0,       // 1: the period bound (maxp of ins.hex) of an M = 1 instruction is checked (needs SPM_LAT 2 (t16x 3), ACC_LAT 8, ideal ports or +BANK=1; skipped with +BANK=2)
+  parameter int CHKC      = 0,       // 1: the total cycle count is within 2 % of exp.hex row 12, if the instance has the configuration recorded there
   parameter int EXP_CS_FULL  = 0,    // 1: the column-scale FIFO must have been full (a tile waited for a slot) at least once
   parameter int EXP_INF_FULL = 0,    // 1: the in-flight FIFO must have been full with a head that differs from the instruction behind it
   parameter int RDYV      = 0,       // 1: a port's ready is low while its request has no valid lane (M-23); +RDYV=n overrides
@@ -67,7 +73,7 @@ module mxu_tc #(
   logic [128+6*64+32-1:0] prog [0:NINS-1];
   logic [DIM*32-1:0]     acc0 [0:ACCR-1];
   logic [DIM*32-1:0]     acc1 [0:ACCR-1];
-  logic [63:0]           expv [0:13];           // flags, sem[1..5], ordering pair {A, B} (6 bits each), semaphore preload {idx, value}, 4 windows {base, size}, cycles, preload 2
+  logic [63:0]           expv [0:14];           // flags, sem[1..5], ordering pair {A, B} (6 bits each), semaphore preload {idx, value}, 4 windows {base, size}, {config, cycles}, preload 2, window 5
   logic [31:0]           semx [0:63];           // the final value of every semaphore
   logic [63:0]           insx [0:NINS-1];         // per instruction {maxp[7:0], nrows[23:0], ssem[5:0], sinc[3:0], 22'b0}
   logic [DIM*4-1:0]      flg  [0:NFLG-1];
@@ -163,16 +169,17 @@ module mxu_tc #(
   end
 
   // ---------------- SPM ports
-  int win_base [4];
-  int win_size [4];
-  int win_off  [4];
+  localparam int NWIN = 5;
+  int win_base [NWIN];
+  int win_size [NWIN];
+  int win_off  [NWIN];
   function automatic logic [7:0] rb(input int addr, input int garbage);
     if (!SPARSE) begin
       if (addr >= 0 && addr < SPMB) return spm[addr];
       return 8'hEE;
     end
     if (addr < 0 || addr >= SPMX) return 8'hEE;
-    for (int w = 0; w < 4; w++)
+    for (int w = 0; w < NWIN; w++)
       if (win_size[w] != 0 && addr >= win_base[w] && addr < win_base[w] + win_size[w]) return spm[win_off[w] + addr - win_base[w]];
     return addr[0] ? 8'h7F : 8'hFF;           // inside the SPM, outside every window: the NaN-valued garbage of the dense image
   endfunction
@@ -321,6 +328,7 @@ module mxu_tc #(
   logic [3:0] fexp [0:127];
   initial for (int i = 0; i < 128; i++) begin fobs[i] = 4'd0; fexp[i] = 4'd0; end
   // coverage of the FIFO-full paths
+  localparam int INF_DEPTH = 4;      // the in-flight instruction FIFO of mxu.md 4.5
   int cs_full_cyc = 0, inf_full_cyc = 0, inf_diff_cyc = 0;
   int fx;
   always @(posedge clk) begin
@@ -342,10 +350,12 @@ module mxu_tc #(
         end
       end
       // ---- coverage
-      // by the RTL's own names: the loader waits in L_CALC for a column-scale slot (t_cs_en, cs_cnt at the depth); the decoder's inf_room is
-      // low when the in-flight FIFO is full, whatever its depth and encoding
-      if (dut.lst == dut.L_CALC && dut.t_cs_en && dut.cs_cnt >= CS_DEPTH) cs_full_cyc++;
-      if (!dut.u_dec.inf_room) begin
+      // the loader waits in L_CALC for a column-scale slot (t_cs_en, cs_cnt at the depth): the state is read by its name (enum method, no
+      // encoding; the hierarchical enum item `dut.L_CALC` is an internal error of Verilator 5.052, TR2-11). The in-flight FIFO is counted
+      // as full at the depth of the SPEC (mxu.md 4.5: 4), not at the RTL's own full flag: a FIFO of any other depth must not satisfy it (TR2-3)
+      if (dut.lst.name() == "L_CALC" && dut.t_cs_en && dut.cs_cnt >= CS_DEPTH) cs_full_cyc++;
+      if (dut.inf_cnt > INF_DEPTH) begin errors++; if (errors < 12) $display("%s: the in-flight FIFO holds %0d entries, the spec depth is %0d", PRE, dut.inf_cnt, INF_DEPTH); end
+      if (dut.inf_cnt >= INF_DEPTH) begin
         inf_full_cyc++;
         if (dut.inf_head != dut.inf_in && dut.inf_head[9:4] != 6'd0 && dut.inf_head[3:0] != 4'd0) inf_diff_cyc++;
       end
@@ -360,7 +370,7 @@ module mxu_tc #(
           end
           if (rows_seen > 0 && !prev_last && ins_maxp[row_ins] != 0) begin
             if (cyc - last_row_cyc > maxgap) maxgap = cyc - last_row_cyc;
-            if (CHKP != 0 && cyc - last_row_cyc > ins_maxp[row_ins]) begin
+            if (CHKP != 0 && bank_mode != 2 && cyc - last_row_cyc > ins_maxp[row_ins]) begin
               errors++; $display("%s: pass period %0d cycles > %0d (instruction %0d)", PRE, cyc - last_row_cyc, ins_maxp[row_ins], row_ins);
             end
           end
@@ -448,9 +458,11 @@ module mxu_tc #(
     if (n != rows) begin errors++; $display("%s: %s.hex has %0d rows, %0d expected", PRE, name, n, rows); end
   endtask
   int wcum, nrb;
+  longint chkc_cnt;
+  logic chkc_conf;
   initial begin
     done = 0; errors = 0;
-    for (int i = 0; i < 4; i++) begin win_base[i] = 0; win_size[i] = 0; win_off[i] = 0; end
+    for (int i = 0; i < NWIN; i++) begin win_base[i] = 0; win_size[i] = 0; win_off[i] = 0; end
     $readmemh({PRE, "spm.hex"}, spm);
     $readmemh({PRE, "dtab.hex"}, dtab);
     $readmemh({PRE, "prog.hex"}, prog);
@@ -461,15 +473,15 @@ module mxu_tc #(
     $readmemh({PRE, "flg.hex"}, flg);
     $readmemh({PRE, "sem.hex"}, semx);
     fcheck("spm", SPMB, 2);                fcheck("dtab", NTD, 64);               fcheck("prog", NINS, (128 + 6*64 + 32) / 4);
-    fcheck("acc0", ACCR, DIM * 8);         fcheck("acc1", ACCR, DIM * 8);         fcheck("exp", 14, 0);
+    fcheck("acc0", ACCR, DIM * 8);         fcheck("acc1", ACCR, DIM * 8);         fcheck("exp", 15, 0);
     fcheck("ins", NINS, 16);               fcheck("flg", NFLG, DIM);               fcheck("sem", 64, 8);
     for (int r = 0; r < ACCR; r++) for (int c = 0; c < DIM; c++) accm[r*DIM + c] = acc0[r][32*c +: 32];
     // semaphore preload and SPM windows
     if (expv[7][37:32] != 6'd0) begin pre_idx = int'(expv[7][37:32]); pre_val = expv[7][31:0]; end
     if (expv[13][37:32] != 6'd0) begin pre_idx2 = int'(expv[13][37:32]); pre_val2 = expv[13][31:0]; end
     wcum = 0;
-    for (int w = 0; w < 4; w++) begin
-      win_base[w] = int'(expv[8+w][63:32]); win_size[w] = int'(expv[8+w][31:0]); win_off[w] = wcum; wcum += win_size[w];
+    for (int w = 0; w < NWIN; w++) begin                    // windows 1 .. 4: exp.hex rows 8 .. 11, window 5: row 14
+      win_base[w] = int'(expv[(w < 4) ? 8 + w : 14][63:32]); win_size[w] = int'(expv[(w < 4) ? 8 + w : 14][31:0]); win_off[w] = wcum; wcum += win_size[w];
     end
     // per instruction expectations: rows, period bound, semaphore, and how many acc_done pulses its sem_inc must wait for
     nrb = 0;
@@ -523,11 +535,19 @@ module mxu_tc #(
       errors++; $display("%s: sem[%0d] incremented (cycle %0d) before sem[%0d] (cycle %0d): out-of-order completion", PRE, expv[6][5:0], first_inc[expv[6][5:0]], expv[6][11:6], first_inc[expv[6][11:6]]);
     end
     if (rows_seen == 0) begin errors++; $display("%s: no rows reached the ACC", PRE); end
-    // total time of the ideal instances (TR-7): at most 2 % above the cycle count recorded in exp.hex row 12
-    if (CHKC != 0 && bank_mode == 0) begin                 // ideal ports only: with a bank model the total depends on which beats collide
-      if (expv[12] == 64'd0) begin errors++; $display("%s: no cycle count recorded in exp.hex row 12", PRE); end
-      else if (cyc * 100 > longint'(expv[12]) * 102) begin
-        errors++; $display("%s: %0d cycles, more than 2 %% above the recorded %0d", PRE, cyc, expv[12]);
+    // total time of the ideal instances (TR-7, TR2-2): within 2 % of the cycle count recorded in exp.hex row 12, if the instance has the
+    // configuration recorded with it (the count depends on all of these: SPM_LAT, CS_DEPTH, ACC_LAT, and with a bank model on the layout)
+    if (CHKC != 0) begin
+      chkc_cnt = longint'(expv[12][31:0]);
+      chkc_conf = (int'(expv[12][39:32]) == SPM_LAT) && (int'(expv[12][47:40]) == CS_DEPTH) && (int'(expv[12][55:48]) == ACC_LAT) &&
+                  STALL_PCT == 0 && DONE_EXTRA == 0 && A_BLOCK == 0 && rdyv_mode == 0 && bank_mode == 0;
+      if (chkc_cnt == 0) begin errors++; $display("%s: no cycle count recorded in exp.hex row 12", PRE); end
+      else if (!chkc_conf) $display("%s: CHKC skipped: this instance (SPM_LAT %0d, CS_DEPTH %0d, ACC_LAT %0d, stalls %0d, DONE_EXTRA %0d, A_BLOCK %0d, RDYV %0d, bank model %0d) is not the recorded one (SPM_LAT %0d, CS_DEPTH %0d, ACC_LAT %0d, ideal ports)",
+                                    PRE, SPM_LAT, CS_DEPTH, ACC_LAT, STALL_PCT, DONE_EXTRA, A_BLOCK, rdyv_mode, bank_mode, expv[12][39:32], expv[12][47:40], expv[12][55:48]);
+      else if (cyc * 100 > chkc_cnt * 102) begin
+        errors++; $display("%s: %0d cycles, more than 2 %% above the recorded %0d", PRE, cyc, chkc_cnt);
+      end else if (cyc * 100 < chkc_cnt * 98) begin
+        errors++; $display("%s: %0d cycles, more than 2 %% below the recorded %0d: a stale count, re-measure (gen_mxu_vectors.py IDEAL_CYCLES)", PRE, cyc, chkc_cnt);
       end
     end
     $display("%s: %0d ACC rows in %0d cycles, flags %h; cs FIFO full %0d cycles, in-flight FIFO full %0d (head differs %0d), largest bounded row gap %0d",
@@ -544,7 +564,8 @@ endmodule
 // taking instructions and touch neither the SPM nor the ACC. A line with cause 0 is a legal instruction (T-2: extents that end exactly at
 // the end of the SPM / the ACC): no fault, a context is pushed, and it runs until it has drained (TR-3: acc_done ACC_LAT cycles after the
 // acc_last row, as the ACC does, then the in-flight FIFO empty): every lane it requests lies inside the SPM, every ACC row is below ACCR,
-// exactly one acc_last. The SPM answers zeros; only the addresses are judged.
+// exactly one acc_last and exactly as many ACC rows as the case has (N tiles x K tiles x M, which the generator puts in the address field of
+// a cause-0 line, TR2-6). The SPM answers zeros; only the addresses and the row counts are judged.
 module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int SPMB = 1, parameter int ACCR = 1, parameter string FILE = "")
   (output logic done, output int errors);
   localparam int LB = DIM;
@@ -646,6 +667,7 @@ module mxu_fault_tc #(parameter int DIM = 8, parameter int N = 1, parameter int 
         else if (!saw_ctx) begin errors++; $display("legal case %0d (%s): no context was pushed", k, FILE); end
         else if (!(n_done == 1 && dut.inf_cnt == 0)) begin errors++; $display("legal case %0d (%s): did not drain (%0d acc_done, inf_cnt %0d, %0d rows)", k, FILE, n_done, dut.inf_cnt, n_rows); end
         if (n_last != 1 || n_rows == 0) begin errors++; $display("legal case %0d (%s): %0d acc_last rows, %0d rows", k, FILE, n_last, n_rows); end
+        else if (int'(addr_exp) != n_rows) begin errors++; $display("legal case %0d (%s): %0d ACC rows, %0d expected", k, FILE, n_rows, addr_exp); end
         if (bad_lane != 0) begin errors++; $display("legal case %0d (%s): %0d lane requests outside the SPM", k, FILE, bad_lane); end
         if (bad_row != 0) begin errors++; $display("legal case %0d (%s): %0d ACC rows at or above ACCR %0d", k, FILE, bad_row, ACCR); end
       end else begin

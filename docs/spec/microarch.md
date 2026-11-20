@@ -724,7 +724,7 @@ Conventions:
 | fault | out | valid 1, cause 4, addr 64 | pulse | legality faults of `MXU_MM` (isa.yaml, review finding S-9) to `core/seq` `fault_in`; the MXU stops taking instructions |
 | acc_* stream | out | row 11, part `DIM` x 32, ncols 7, rescale / overwrite / use_cs 1 each, rowscale 32, cs `DIM` x 32, last 1; in: `acc_done` | push, **no ready**; `acc_done` exactly `ACC_LAT` cycles after the `acc_last` row | one output row per cycle to the ACC, which does the read-modify-write; payload valid only in the `acc_valid` cycle; `ACC_LAT` from `acc_pkg`, checked at elaboration. [acc.md](acc.md) §3, §5 (review finding S-11) |
 | sem_inc | out | 6 + 4 | pulse | completion |
-| fp_flags | out | 4 | pulse, valid-qualified | `mxu_pe` flags at the bottom of each column, for rows `< M` and columns `< N` only, masked for `REG_DOT + 64·REG_OUT` cycles plus the A skew after reset (arith.md contract items 2-4) |
+| fp_flags | out | 4 | pulse, valid-qualified | the OR of the `mxu_pe` flags of **every PE row** (not only the bottom of a column), each qualified by the valid of the wave it belongs to and masked to the columns `< ncols` of its pass; PE row `i` of a wave reports `DIM - 1 - i` cycles before the wave's row is on `acc_*` (mxu.md §3 / §5, arith.md contract items 1-3). There is no post-reset mask window: after reset the valid chain is clear, so nothing is reported until real data has propagated (review TR2-9) |
 
 **VPU (`core/vpu`, incl. SFU and top-k)**
 
